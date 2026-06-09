@@ -133,12 +133,65 @@ def spectral_peel(cqt_mag: np.ndarray) -> np.ndarray:
     return np.maximum(result, 0.0)
 
 
+# Harmonic intervals (in semitones) stacked for HCQT pitch salience.
+# Each entry shifts the CQT up by that many semitones (1 octave = 12 bins).
+_HCQT_HARMONICS = [0, 12, 19, 24, 28]   # 1f, 2f, 3f, 4f, 5f
+_HCQT_CONTRAST_POWER = 2.0
+
+
+def _compute_hcqt_salience(cqt_mag: np.ndarray, n_bins: int) -> np.ndarray:
+    """Harmonic Constant-Q pitch salience (HCQT).
+
+    For each bin b the salience is the geometric mean of cqt_mag at the
+    fundamental and its 4 upper harmonics.  Bins whose harmonic falls outside
+    the range are excluded from the product instead of zeroed.
+    """
+    n_bins_actual, n_frames = cqt_mag.shape
+    accum = np.zeros((n_bins_actual, n_frames), dtype=np.float64)
+    count = np.zeros(n_bins_actual, dtype=np.float64)
+    for shift in _HCQT_HARMONICS:
+        # Shift the magnitude array down by 'shift' bins so harmonic h
+        # aligns back to the fundamental row.
+        if shift == 0:
+            accum += np.log1p(cqt_mag.astype(np.float64))
+            count += 1.0
+        elif shift < n_bins_actual:
+            slice_h = cqt_mag[shift:, :].astype(np.float64)
+            rows = slice_h.shape[0]
+            accum[:rows, :] += np.log1p(slice_h)
+            count[:rows] += 1.0
+    safe_count = np.maximum(count[:, np.newaxis], 1.0)
+    salience = np.exp(accum / safe_count) - 1.0  # geometric mean in linear
+    return salience.astype(np.float32)
+
+
+def _compute_spectral_flux_novelty(cqt_mag: np.ndarray, sr: int) -> np.ndarray:
+    """Per-bin spectral flux novelty: local energy minus 300 ms trailing mean.
+
+    The subtracted baseline is the mean of the previous ~300 ms window,
+    which is equivalent to adaptive background subtraction / spectral flux
+    with a long-lag reference.  Only positive changes are kept (onset energy).
+    """
+    lag_frames = max(1, int(round(0.300 * sr / HOP_SIZE)))
+    n_bins, n_frames = cqt_mag.shape
+    # Cumulative sum for efficient sliding window mean.
+    pad = np.zeros((n_bins, lag_frames), dtype=np.float64)
+    padded = np.concatenate([pad, cqt_mag.astype(np.float64)], axis=1)
+    cum = np.cumsum(padded, axis=1)
+    window_sum = cum[:, lag_frames:] - cum[:, :n_frames]
+    baseline = window_sum / float(lag_frames)
+    flux = np.maximum(0.0, cqt_mag.astype(np.float64) - baseline)
+    return flux.astype(np.float32)
+
+
 def compute_cqt(
     audio: np.ndarray, sr: int,
     fmin_midi: int = 12, n_bins: int = 83,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Compute CQT with spectral peeling.
-    Returns (cqt_db, cqt_sal, cqt_mag, cqt_peel_db, cqt_times, fmin_hz)."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+           np.ndarray, np.ndarray]:
+    """Compute CQT with spectral peeling, HCQT pitch salience, and flux novelty.
+    Returns (cqt_db, cqt_sal, cqt_mag, cqt_peel_db, cqt_times, fmin_hz,
+             cqt_hcqt_db, cqt_flux_db)."""
     fmin_hz = librosa.midi_to_hz(fmin_midi)
     cqt_raw = librosa.cqt(
         audio, sr=sr, hop_length=HOP_SIZE,
@@ -162,9 +215,29 @@ def compute_cqt(
     else:
         cqt_peel_db = np.full_like(cqt_mag, -80.0, dtype=np.float32)
 
+    # HCQT pitch salience.
+    hcqt_lin = _compute_hcqt_salience(cqt_mag, n_bins)
+    # Power-law contrast enhancement to make salience peaks more dominant.
+    # power=2.0 is a "square" transform (user requested stronger peaks).
+    if _HCQT_CONTRAST_POWER != 1.0:
+        hcqt_lin = np.power(np.maximum(hcqt_lin, 0.0), _HCQT_CONTRAST_POWER, dtype=np.float32)
+    hcqt_max = float(hcqt_lin.max())
+    if hcqt_max > 1e-8:
+        cqt_hcqt_db = librosa.amplitude_to_db(hcqt_lin, ref=hcqt_max).astype(np.float32)
+    else:
+        cqt_hcqt_db = np.full_like(cqt_mag, -80.0, dtype=np.float32)
+
+    # Spectral flux novelty (adaptive 300 ms baseline subtraction).
+    flux_lin = _compute_spectral_flux_novelty(cqt_mag, sr)
+    flux_max = float(flux_lin.max())
+    if flux_max > 1e-8:
+        cqt_flux_db = librosa.amplitude_to_db(flux_lin, ref=flux_max).astype(np.float32)
+    else:
+        cqt_flux_db = np.full_like(cqt_mag, -80.0, dtype=np.float32)
+
     cqt_times = librosa.frames_to_time(
         np.arange(cqt_db.shape[1]), sr=sr, hop_length=HOP_SIZE)
-    return cqt_db, cqt_sal, cqt_mag, cqt_peel_db, cqt_times, fmin_hz
+    return cqt_db, cqt_sal, cqt_mag, cqt_peel_db, cqt_times, fmin_hz, cqt_hcqt_db, cqt_flux_db
 
 
 # ---------------------------------------------------------------------------
