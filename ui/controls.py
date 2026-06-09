@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QPushButton, QLabel, QDoubleSpinBox,
     QComboBox, QSlider, QRadioButton, QButtonGroup,
-    QProgressBar, QFileDialog,
+    QProgressBar, QFileDialog, QApplication,
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -22,8 +22,7 @@ class ControlPanel(QWidget):
     load_requested = Signal(str, float, int)   # (wav_path, bpm, beats_per_bar)
     stem_changed = Signal(str)                  # new stem path
     duration_changed = Signal(str)              # "1/4", "1/8", "1/16", "1/32"
-    onset_sensitivity_changed = Signal(float)   # gain
-    chroma_sensitivity_changed = Signal(float)  # gain
+    polyphony_changed = Signal(int)              # max simultaneous notes (1–10)
     play_midi_requested = Signal()
     play_audio_requested = Signal()
     play_both_requested = Signal()
@@ -103,7 +102,7 @@ class ControlPanel(QWidget):
 
         vg.addWidget(QLabel("CQT source:"))
         self._cqt_source_combo = QComboBox()
-        for source in ["db", "spectral peel"]:
+        for source in ["db", "spectral peel", "pitch salience", "flux novelty"]:
             self._cqt_source_combo.addItem(source)
         self._cqt_source_combo.currentTextChanged.connect(self.cqt_source_changed.emit)
         vg.addWidget(self._cqt_source_combo)
@@ -124,25 +123,20 @@ class ControlPanel(QWidget):
             lambda btn: self.duration_changed.emit(btn.text()))
         layout.addWidget(dur_grp)
 
-        # ── Sensitivity sliders ───────────────────────────────────────────
+        # ── Polyphony slider ──────────────────────────────────────────
         sens_grp = QGroupBox("Sensitivity")
         sl = QGridLayout(sens_grp)
 
-        sl.addWidget(QLabel("Onset:"), 0, 0)
-        self._onset_slider = QSlider(Qt.Orientation.Horizontal)
-        self._onset_slider.setRange(1, 200)
-        self._onset_slider.setValue(100)
-        self._onset_slider.valueChanged.connect(
-            lambda v: self.onset_sensitivity_changed.emit(v / 100.0))
-        sl.addWidget(self._onset_slider, 0, 1)
-
-        sl.addWidget(QLabel("Chroma:"), 1, 0)
-        self._chroma_slider = QSlider(Qt.Orientation.Horizontal)
-        self._chroma_slider.setRange(1, 200)
-        self._chroma_slider.setValue(100)
-        self._chroma_slider.valueChanged.connect(
-            lambda v: self.chroma_sensitivity_changed.emit(v / 100.0))
-        sl.addWidget(self._chroma_slider, 1, 1)
+        sl.addWidget(QLabel("Polyphony:"), 0, 0)
+        self._polyphony_slider = QSlider(Qt.Orientation.Horizontal)
+        self._polyphony_slider.setRange(1, 10)
+        self._polyphony_slider.setValue(4)
+        self._polyphony_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._polyphony_slider.setTickInterval(1)
+        self._polyphony_label = QLabel("4")
+        self._polyphony_slider.valueChanged.connect(self._on_polyphony_slider)
+        sl.addWidget(self._polyphony_slider, 0, 1)
+        sl.addWidget(self._polyphony_label, 0, 2)
         layout.addWidget(sens_grp)
 
         # ── Actions ───────────────────────────────────────────────────────
@@ -193,6 +187,12 @@ class ControlPanel(QWidget):
         self._status.setObjectName("subkey")
         self._status.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(self._status)
+
+        self._debug = QLabel("Debug: hover a note in CQT view")
+        self._debug.setObjectName("subkey")
+        self._debug.setWordWrap(True)
+        self._debug.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop)
+        layout.addWidget(self._debug)
         layout.addStretch()
 
     # ── Public helpers ────────────────────────────────────────────────────
@@ -201,6 +201,9 @@ class ControlPanel(QWidget):
         self._progress.setValue(pct)
         self._progress.setFormat(f"{pct}%")
         self._status.setText(msg)
+
+    def set_debug_info(self, msg: str) -> None:
+        self._debug.setText(msg)
 
     def set_loaded(self, enabled: bool) -> None:
         self._btn_play_midi.setEnabled(enabled)
@@ -254,10 +257,21 @@ class ControlPanel(QWidget):
         self._btn_load.setEnabled(True)
         self._populate_stems(paths)
 
+    def _on_polyphony_slider(self, value: int) -> None:
+        self._polyphony_label.setText(str(value))
+        self.polyphony_changed.emit(value)
+
+    def polyphony(self) -> int:
+        return self._polyphony_slider.value()
+
     def _on_load(self) -> None:
         if self._wav_path:
-            # Show immediate feedback on click before background work begins.
+            # Paint progress immediately to avoid a perceived frozen click.
+            self._btn_load.setEnabled(False)
             self.set_progress(1, "Starting analysis ...")
+            self._progress.repaint()
+            self._status.repaint()
+            QApplication.processEvents()
             self.load_requested.emit(
                 self._wav_path, self._bpm_spin.value(), self.beats_per_bar())
 

@@ -115,8 +115,7 @@ class MainWindow(QMainWindow):
         self._controls.load_requested.connect(self._on_load)
         self._controls.stem_changed.connect(self._on_stem_changed)
         self._controls.duration_changed.connect(self._on_duration_changed)
-        self._controls.onset_sensitivity_changed.connect(self._on_onset_sens)
-        self._controls.chroma_sensitivity_changed.connect(self._on_chroma_sens)
+        self._controls.polyphony_changed.connect(self._on_polyphony_changed)
         self._controls.play_midi_requested.connect(self._on_play_midi)
         self._controls.play_audio_requested.connect(self._on_play_audio)
         self._controls.play_both_requested.connect(self._on_play_both)
@@ -130,6 +129,7 @@ class MainWindow(QMainWindow):
         self._cqt_view.bar_changed.connect(self._on_bar_changed_from_cqt)
         self._cqt_view.block_clicked.connect(self._on_cqt_clicked)
         self._cqt_view.block_right_clicked.connect(self._on_cqt_right_clicked)
+        self._cqt_view.block_hovered.connect(self._on_cqt_hovered)
         self._cqt_view.zoom_changed.connect(self._on_zoom_from_cqt)
 
         # Envelope view: onset editing + navigation + zoom
@@ -199,19 +199,12 @@ class MainWindow(QMainWindow):
             self._envelope_view.refresh()
             self._pitch_timer.start()
 
-    def _on_onset_sens(self, gain: float) -> None:
+    def _on_polyphony_changed(self, max_notes: int) -> None:
         if self._markers:
-            self._markers.set_sensitivity_gains(
-                gain, self._controls._chroma_slider.value() / 100.0)
+            self._markers.set_polyphony(max_notes)
             self._cqt_view.refresh()
             self._envelope_view.refresh()
-
-    def _on_chroma_sens(self, gain: float) -> None:
-        if self._markers:
-            self._markers.set_sensitivity_gains(
-                self._controls._onset_slider.value() / 100.0, gain)
-            self._cqt_view.refresh()
-            self._envelope_view.refresh()
+            self._pitch_timer.start()
 
     # ── Onset editing (envelope view) ─────────────────────────────────────
 
@@ -256,6 +249,33 @@ class MainWindow(QMainWindow):
                 self._markers.mark_as_rest(t)
             self._cqt_view.refresh()
             self._envelope_view.refresh()
+
+    def _on_cqt_hovered(self, t: float, midi: int) -> None:
+        if self._markers is None:
+            return
+        names = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+        note_name = f"{names[int(midi) % 12]}{(int(midi) // 12) - 1}"
+        dbg = self._markers.debug_pitch_features_at(t, midi)
+        if dbg is None:
+            self._controls.set_debug_info(
+                f"Hover: {note_name} ({int(midi)}) @ {t:.3f}s\n"
+                "No NNLS feature data for this note/window.")
+            return
+
+        top_txt = ", ".join([f"{n}:{s:.3f}" for n, s in dbg.get("top", [])])
+        oct_up_score = dbg.get("octave_up_score")
+        oct_txt = "-" if oct_up_score is None else f"{oct_up_score:.3f}"
+        self._controls.set_debug_info(
+            f"Hover: {note_name} ({int(midi)}) @ {t:.3f}s  block={dbg['block_t0']:.3f}-{dbg['block_t1']:.3f}s\n"
+            f"sustain={dbg['sustain']:.3f}  peel={dbg['peel']:.3f}  salience={dbg['salience']:.3f}\n"
+            f"fluxPenalty={dbg['flux']:.3f}  onsetNovelty={dbg['onset_delta']:.3f}\n"
+            f"model={dbg['model']:.3f}  gate={dbg['model_gate']:.3f}  "
+            f"active={dbg['active']}  rank={dbg['rank']}\n"
+            f"thresh: gain>={dbg['gain_threshold']:.3f}, onset>={dbg['onset_threshold']:.3f}  "
+            f"onsetWin={dbg['onset_window_ms'][0]:.0f}-{dbg['onset_window_ms'][1]:.0f}ms  "
+            f"fluxWin={dbg['flux_window_ms'][0]:.0f}-{dbg['flux_window_ms'][1]:.0f}ms  "
+            f"beatWin={dbg['beat_window_ms'][0]:.0f}-{dbg['beat_window_ms'][1]:.0f}ms\n"
+            f"top3={top_txt}  octave+12({dbg['octave_up_midi']})={oct_txt}")
 
     # ── Bar nav (synced between views) ────────────────────────────────────
 
