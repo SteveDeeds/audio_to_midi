@@ -1,0 +1,275 @@
+"""
+core/analysis.py
+================
+Low-level audio analysis: onset detection, chroma shifts, CQT computation,
+pitch detection.  Pure functions — no GUI dependencies.
+"""
+
+import numpy as np
+import librosa
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+SAMPLE_RATE = 44100
+HOP_SIZE = 512
+CHROMA_HOP = 512
+CHROMA_SHIFT_THRESH = 0.002
+CHROMA_COMPARE_LAG = 2
+CHROMA_ENERGY_GATE_DB = 62.0
+MIN_BLOCK_SAMPLES = 512
+PITCH_WORK_SR = 4000
+PITCH_ONSET_SEC = 0.18
+
+# Overtone offsets in semitones for spectral peeling
+_SPECTRAL_PEEL_OVERTONES = [12, 19, 24, 28]
+
+
+# ---------------------------------------------------------------------------
+# Audio loading
+# ---------------------------------------------------------------------------
+
+def load_audio(path: str) -> tuple[np.ndarray, int]:
+    """Load a WAV file as mono float32 at SAMPLE_RATE, peak-normalised."""
+    audio, sr = librosa.load(path, sr=SAMPLE_RATE, mono=True, dtype=np.float32)
+    peak = np.max(np.abs(audio))
+    if peak > 1e-6:
+        audio = audio / peak
+    return audio, sr
+
+
+# ---------------------------------------------------------------------------
+# Onset detection
+# ---------------------------------------------------------------------------
+
+def detect_onsets(audio: np.ndarray, sr: int) -> tuple[np.ndarray, np.ndarray]:
+    """Detect transient onsets via complex-domain spectral flux.
+    Returns (onset_sample_positions, onset_strengths)."""
+    onset_env = librosa.onset.onset_strength(y=audio, sr=sr, hop_length=HOP_SIZE)
+    onset_frames = librosa.onset.onset_detect(
+        onset_envelope=onset_env, sr=sr, hop_length=HOP_SIZE,
+        units="frames", backtrack=True,
+    )
+    onset_samples = librosa.frames_to_samples(onset_frames, hop_length=HOP_SIZE)
+    strengths = onset_env[np.minimum(onset_frames, len(onset_env) - 1)]
+    return onset_samples.astype(np.int64), strengths.astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Chroma shift detection
+# ---------------------------------------------------------------------------
+
+def detect_chroma_shifts(
+    audio: np.ndarray, sr: int,
+    threshold: float | None = CHROMA_SHIFT_THRESH,
+    chroma: np.ndarray | None = None,
+    rms_db: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Compute chroma cosine distances; return (sample_positions, strengths)."""
+    if chroma is None:
+        chroma = librosa.feature.chroma_cqt(
+            y=audio, sr=sr, hop_length=CHROMA_HOP, bins_per_octave=36)
+    if rms_db is None:
+        rms = librosa.feature.rms(
+            y=audio, hop_length=CHROMA_HOP, frame_length=2048, center=True)[0]
+        rms_db = librosa.amplitude_to_db(np.maximum(rms, 1e-8), ref=np.max)
+
+    shift_samples: list[int] = []
+    shift_strengths: list[float] = []
+    lag = max(1, int(CHROMA_COMPARE_LAG))
+    for i in range(lag, chroma.shape[1]):
+        if i >= len(rms_db):
+            continue
+        if rms_db[i] < -CHROMA_ENERGY_GATE_DB or rms_db[i - lag] < -CHROMA_ENERGY_GATE_DB:
+            continue
+        prev, curr = chroma[:, i - lag], chroma[:, i]
+        np_prev, np_curr = np.linalg.norm(prev), np.linalg.norm(curr)
+        if np_prev < 1e-6 or np_curr < 1e-6:
+            continue
+        cosine_dist = 1.0 - np.dot(prev, curr) / (np_prev * np_curr)
+        if threshold is None or cosine_dist > threshold:
+            shift_samples.append(i * CHROMA_HOP)
+            shift_strengths.append(float(cosine_dist))
+
+    return np.array(shift_samples, dtype=np.int64), np.array(shift_strengths, dtype=np.float32)
+
+
+# ---------------------------------------------------------------------------
+# CQT computation + spectral processing
+# ---------------------------------------------------------------------------
+
+def sharpen_local_maxima(cqt_mag: np.ndarray, reduction: float = 0.5) -> np.ndarray:
+    """Reduce non-local-maximum bins to sharpen the spectrum."""
+    result = cqt_mag.astype(np.float32).copy()
+    n_bins, n_frames = result.shape
+    for f in range(n_bins):
+        is_local_max = np.ones(n_frames, dtype=bool)
+        if f > 0:
+            is_local_max &= (result[f, :] >= result[f - 1, :])
+        if f < n_bins - 1:
+            is_local_max &= (result[f, :] >= result[f + 1, :])
+        result[f, ~is_local_max] *= reduction
+    return result
+
+
+def spectral_peel(cqt_mag: np.ndarray) -> np.ndarray:
+    """Remove harmonic series of every semitone from bottom to top.
+
+    Peeling is cascaded across harmonics: each upper harmonic is compared
+    against the previous lower harmonic level (not always the fundamental).
+    """
+    n_bins, _ = cqt_mag.shape
+    result = cqt_mag.astype(np.float32).copy()
+    for f0 in range(n_bins):
+        prev_harmonic = result[f0, :].copy()
+        for h_offset in _SPECTRAL_PEEL_OVERTONES:
+            h_idx = f0 + h_offset
+            if h_idx >= n_bins:
+                continue
+            curr_harmonic = result[h_idx, :].copy()
+            peel = np.minimum(curr_harmonic, prev_harmonic)
+            result[h_idx, :] -= peel
+            prev_harmonic = curr_harmonic
+    return np.maximum(result, 0.0)
+
+
+def compute_cqt(
+    audio: np.ndarray, sr: int,
+    fmin_midi: int = 12, n_bins: int = 83,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute CQT with spectral peeling.
+    Returns (cqt_db, cqt_sal, cqt_mag, cqt_peel_db, cqt_times, fmin_hz)."""
+    fmin_hz = librosa.midi_to_hz(fmin_midi)
+    cqt_raw = librosa.cqt(
+        audio, sr=sr, hop_length=HOP_SIZE,
+        fmin=fmin_hz, n_bins=n_bins, bins_per_octave=12,
+    )
+    cqt_mag = np.abs(cqt_raw).astype(np.float32)
+    cqt_db = librosa.amplitude_to_db(cqt_mag, ref=np.max)
+
+    mag_sharpened = sharpen_local_maxima(cqt_mag, reduction=0.5)
+    mag_peeled = spectral_peel(mag_sharpened)
+    mag_max = float(mag_peeled.max())
+    if mag_max > 1e-8:
+        cqt_sal = librosa.amplitude_to_db(mag_peeled, ref=mag_max).astype(np.float32)
+    else:
+        cqt_sal = np.full_like(cqt_mag, -80.0, dtype=np.float32)
+
+    # Peeled view in dB, referenced to raw CQT peak for visual comparability.
+    raw_ref = float(np.max(cqt_mag))
+    if raw_ref > 1e-8:
+        cqt_peel_db = librosa.amplitude_to_db(mag_peeled, ref=raw_ref).astype(np.float32)
+    else:
+        cqt_peel_db = np.full_like(cqt_mag, -80.0, dtype=np.float32)
+
+    cqt_times = librosa.frames_to_time(
+        np.arange(cqt_db.shape[1]), sr=sr, hop_length=HOP_SIZE)
+    return cqt_db, cqt_sal, cqt_mag, cqt_peel_db, cqt_times, fmin_hz
+
+
+# ---------------------------------------------------------------------------
+# Pitch detection
+# ---------------------------------------------------------------------------
+
+def hz_to_midi(hz: float) -> int | None:
+    if hz <= 0:
+        return None
+    midi_f = 69 + 12 * np.log2(hz / 440.0)
+    midi_note = int(round(midi_f))
+    return midi_note if 0 <= midi_note <= 127 else None
+
+
+def detect_block_pitch(block: np.ndarray, sr: int) -> tuple[int | None, float]:
+    """pYIN pitch detection with onset-focused + full-block blending."""
+    if len(block) < MIN_BLOCK_SAMPLES:
+        return None, 0.0
+
+    work = block.astype(np.float32)
+    work_sr = int(sr)
+    if sr > PITCH_WORK_SR:
+        work = librosa.resample(work, orig_sr=sr, target_sr=PITCH_WORK_SR)
+        work_sr = PITCH_WORK_SR
+
+    if len(work) < 64:
+        return None, 0.0
+
+    def _pyin_stats(sig, frame_length):
+        local_hop = max(32, min(256, frame_length // 8))
+        f0, voiced_flag, _ = librosa.pyin(
+            sig, fmin=librosa.note_to_hz("C0"), fmax=librosa.note_to_hz("C5"),
+            sr=work_sr, hop_length=local_hop, frame_length=frame_length,
+            fill_na=None,
+        )
+        voiced = f0[np.asarray(voiced_flag, dtype=bool)]
+        voiced = voiced[~np.isnan(voiced)]
+        conf = float(len(voiced)) / max(1, len(f0))
+        return voiced, conf
+
+    onset_len = min(len(work), int(PITCH_ONSET_SEC * work_sr))
+    onset_sig = work[:max(onset_len, 1)]
+    onset_frame = int(min(2048, max(512, 2 ** int(np.floor(np.log2(max(512, len(onset_sig))))))))
+    onset_voiced, onset_conf = _pyin_stats(onset_sig, onset_frame)
+
+    full_frame = int(min(4096, max(1024, 2 ** int(np.floor(np.log2(max(1024, len(work))))))))
+    full_voiced, full_conf = _pyin_stats(work, full_frame)
+
+    if len(onset_voiced) == 0 and len(full_voiced) == 0:
+        return None, max(onset_conf, full_conf)
+    if len(onset_voiced) == 0:
+        return hz_to_midi(float(np.median(full_voiced))), full_conf
+    if len(full_voiced) == 0:
+        return hz_to_midi(float(np.median(onset_voiced))), onset_conf
+
+    onset_hz = float(np.median(onset_voiced))
+    full_hz = float(np.median(full_voiced))
+    w_on = max(0.10, onset_conf)
+    w_full = max(0.10, full_conf)
+    blend_hz = (w_on * onset_hz + w_full * full_hz) / (w_on + w_full)
+    return hz_to_midi(blend_hz), max(onset_conf, full_conf)
+
+
+# ---------------------------------------------------------------------------
+# Key detection
+# ---------------------------------------------------------------------------
+
+_KEY_MAJOR_PROFILE = np.array([6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.91, 2.26, 2.55])
+_KEY_MINOR_PROFILE = np.array([6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17])
+_PITCH_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+
+
+def _correlate_profile(chroma_vector: np.ndarray, profile: np.ndarray, tonic: int) -> float:
+    rotated = np.roll(profile, tonic)
+    cc = chroma_vector - np.mean(chroma_vector)
+    pc = rotated - np.mean(rotated)
+    denom = (np.linalg.norm(cc) * np.linalg.norm(pc)) + 1e-9
+    return float(np.dot(cc, pc) / denom)
+
+
+def detect_key_from_chroma(chroma_vector: np.ndarray) -> str:
+    """Detect key from a 12-bin chroma vector.  Returns 'G (Em)' format."""
+    chroma_vector = np.asarray(chroma_vector, dtype=np.float32).reshape(-1)
+    chroma_vector = chroma_vector / (np.sum(chroma_vector) + 1e-9)
+
+    best_score, best_tonic, best_mode = -np.inf, 0, "major"
+    for tonic in range(12):
+        for profile, mode in [(_KEY_MAJOR_PROFILE, "major"), (_KEY_MINOR_PROFILE, "minor")]:
+            score = _correlate_profile(chroma_vector, profile, tonic)
+            if score > best_score:
+                best_score, best_tonic, best_mode = score, tonic, mode
+
+    tonic_name = _PITCH_NAMES[best_tonic % 12]
+    if best_mode == "major":
+        rel = _PITCH_NAMES[(best_tonic + 9) % 12]
+        return f"{tonic_name} ({rel}m)"
+    rel = _PITCH_NAMES[(best_tonic + 3) % 12]
+    return f"{tonic_name}m ({rel})"
+
+
+def detect_key_from_file(wav_path: str, sr: int = 44100) -> str:
+    """Detect key from a WAV file (typically the Piano stem)."""
+    try:
+        audio, _ = librosa.load(wav_path, sr=sr, mono=True)
+        chroma = librosa.feature.chroma_cqt(y=audio, sr=sr, hop_length=512, bins_per_octave=36)
+        return detect_key_from_chroma(np.mean(chroma, axis=1))
+    except Exception:
+        return "? (?)"
