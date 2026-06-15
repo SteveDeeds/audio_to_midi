@@ -48,12 +48,15 @@ class MidiPlayback:
         return self._thread is not None and self._thread.is_alive()
 
     def play(self, blocks: list, t_start: float,
-             audio_slice: np.ndarray | None = None, sr: int = 44100) -> None:
+             audio_slice: np.ndarray | None = None, sr: int = 44100,
+             channel: int | None = None) -> None:
         self.stop()
         self._stop_event.clear()
         sound = self._make_sound(audio_slice, sr) if audio_slice is not None else None
+        if channel is None:
+            channel = self.CHANNEL
         self._thread = threading.Thread(
-            target=self._run, args=(blocks, t_start, sound), daemon=True)
+            target=self._run, args=(blocks, t_start, sound, channel), daemon=True)
         self._thread.start()
 
     def stop(self) -> None:
@@ -88,7 +91,9 @@ class MidiPlayback:
             print(f"[Audio] Could not prepare sound: {exc}")
             return None
 
-    def _run(self, blocks, t_start, sound):
+    def _run(self, blocks, t_start, sound, channel=None):
+        if channel is None:
+            channel = self.CHANNEL
         port = self._midi_port
         if port is None:
             if sound is not None:
@@ -102,8 +107,10 @@ class MidiPlayback:
                 t0, t1, midi, *_ = entry
                 if midi is None:
                     continue
-                events.append((t0 - t_start, "on", midi))
-                events.append((t1 - t_start, "off", midi))
+                vel = int(entry[4]) if len(entry) >= 5 else self.VELOCITY
+                vel = max(1, min(127, vel))
+                events.append((t0 - t_start, "on", midi, vel))
+                events.append((t1 - t_start, "off", midi, 0))
             events.sort(key=lambda e: (e[0], 0 if e[1] == "off" else 1))
 
             active_notes: set[int] = set()
@@ -111,7 +118,7 @@ class MidiPlayback:
                 sound.play()
             wall_start = time.perf_counter()
 
-            for ev_time, ev_type, note in events:
+            for ev_time, ev_type, note, vel in events:
                 target = wall_start + ev_time
                 while True:
                     now = time.perf_counter()
@@ -124,15 +131,15 @@ class MidiPlayback:
                 if self._stop_event.is_set():
                     break
                 if ev_type == "on":
-                    port.note_on(note, self.VELOCITY, self.CHANNEL)
+                    port.note_on(note, vel, channel)
                     active_notes.add(note)
                 else:
-                    port.note_off(note, 0, self.CHANNEL)
+                    port.note_off(note, 0, channel)
                     active_notes.discard(note)
         finally:
             for note in list(active_notes):
                 try:
-                    port.note_off(note, 0, self.CHANNEL)
+                    port.note_off(note, 0, channel)
                 except Exception:
                     pass
             if sound is not None and self._stop_event.is_set():

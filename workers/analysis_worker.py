@@ -18,11 +18,13 @@ class LoadWorker(QThread):
     finished_ok = Signal(object)   # AudioMarkers
     error = Signal(str)
 
-    def __init__(self, wav_path: str, bpm: float, beats_per_bar: int):
+    def __init__(self, wav_path: str, bpm: float, beats_per_bar: int,
+                 bootstrap_from_profiles: bool = False):
         super().__init__()
         self.wav_path = wav_path
         self.bpm = bpm
         self.beats_per_bar = beats_per_bar
+        self.bootstrap_from_profiles = bool(bootstrap_from_profiles)
 
     def run(self) -> None:
         try:
@@ -31,6 +33,7 @@ class LoadWorker(QThread):
             markers = AudioMarkers(
                 self.wav_path, grid,
                 progress_callback=lambda p, m: self.progress.emit(p, m),
+                bootstrap_from_profiles=self.bootstrap_from_profiles,
             )
             self.finished_ok.emit(markers)
         except Exception as exc:

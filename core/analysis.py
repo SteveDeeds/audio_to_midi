@@ -184,6 +184,52 @@ def _compute_spectral_flux_novelty(cqt_mag: np.ndarray, sr: int) -> np.ndarray:
     return flux.astype(np.float32)
 
 
+def compute_stft(
+    audio: np.ndarray,
+    sr: int,
+    n_fft: int = 4096,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute a full-band STFT for percussive analysis.
+
+    Returns (stft_db, stft_mag, stft_times, stft_freqs).
+    """
+    stft_raw = librosa.stft(audio, n_fft=n_fft, hop_length=HOP_SIZE, center=True)
+    stft_mag = np.abs(stft_raw).astype(np.float32)
+    stft_db = librosa.amplitude_to_db(stft_mag, ref=np.max)
+    stft_times = librosa.frames_to_time(
+        np.arange(stft_mag.shape[1]), sr=sr, hop_length=HOP_SIZE)
+    stft_freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft).astype(np.float32)
+    return stft_db, stft_mag, stft_times, stft_freqs
+
+
+def compute_mel_spectrogram(
+    audio: np.ndarray,
+    sr: int,
+    n_fft: int = 4096,
+    n_mels: int = 256,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Compute a mel-band spectrogram for percussive display.
+
+    Returns (mel_db, mel_mag, mel_times, mel_freqs).
+    """
+    mel_mag = librosa.feature.melspectrogram(
+        y=audio,
+        sr=sr,
+        n_fft=n_fft,
+        hop_length=HOP_SIZE,
+        n_mels=n_mels,
+        fmin=20.0,
+        fmax=float(sr) / 2.0,
+        power=1.0,
+    ).astype(np.float32)
+    mel_db = librosa.amplitude_to_db(mel_mag, ref=np.max).astype(np.float32)
+    mel_times = librosa.frames_to_time(
+        np.arange(mel_mag.shape[1]), sr=sr, hop_length=HOP_SIZE)
+    mel_freqs = librosa.mel_frequencies(
+        n_mels=n_mels, fmin=20.0, fmax=float(sr) / 2.0).astype(np.float32)
+    return mel_db, mel_mag, mel_times, mel_freqs
+
+
 def compute_cqt(
     audio: np.ndarray, sr: int,
     fmin_midi: int = 12, n_bins: int = 83,

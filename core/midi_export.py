@@ -20,15 +20,33 @@ def build_midi(
     ticks_per_beat: int = 480,
     velocity: int = 100,
     channel: int = 0,
+    percussion: bool = False,
 ) -> None:
     """Write a MIDI file from (start_sec, end_sec, midi_note[, velocity]) tuples.
-    Uses absolute tick positioning to avoid drift accumulation."""
+    Uses absolute tick positioning to avoid drift accumulation.
+    
+    Args:
+        notes: List of (start_sec, end_sec, midi_note[, velocity]) tuples
+        bpm: Beats per minute
+        output_path: Output file path
+        ticks_per_beat: MIDI ticks per beat (default 480)
+        velocity: Default note velocity (default 100)
+        channel: MIDI channel (default 0; use 9 for percussion/drums on channel 10)
+        percussion: If True, set channel to 9 and bank to 0 (GM drums)
+    """
+    if percussion:
+        channel = 9
+    
     mid = MidiFile(ticks_per_beat=ticks_per_beat)
     track = MidiTrack()
     mid.tracks.append(track)
 
     tempo_us = mido.bpm2tempo(bpm)
     track.append(MetaMessage("set_tempo", tempo=tempo_us, time=0))
+    
+    # Set percussion bank if needed
+    if percussion:
+        track.append(Message("control_change", channel=channel, control=0, value=0, time=0))
 
     events: list[tuple[int, str, int, int]] = []
     for row in notes:

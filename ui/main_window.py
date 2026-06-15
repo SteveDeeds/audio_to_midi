@@ -6,11 +6,12 @@ controls panel, and background workers.
 """
 
 import os
+import time
 import numpy as np
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QSplitter, QLabel, QStatusBar, QFileDialog, QMessageBox,
+    QSplitter, QLabel, QStatusBar, QFileDialog, QMessageBox, QInputDialog,
 )
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
@@ -46,6 +47,8 @@ class MainWindow(QMainWindow):
         self._chord_results: list = []
         self._detected_key: str = ""
         self._player: MidiPlayback | None = None
+        self._playback_start_time: float = 0.0  # Wall clock time when playback started
+        self._playback_start_t: float = 0.0     # Audio time when playback started
 
         self._build_ui()
 
@@ -121,9 +124,13 @@ class MainWindow(QMainWindow):
         self._controls.play_both_requested.connect(self._on_play_both)
         self._controls.stop_requested.connect(self._on_stop)
         self._controls.export_midi_requested.connect(self._on_export_midi)
+        self._controls.save_model_requested.connect(self._on_save_model)
+        self._controls.load_model_requested.connect(self._on_load_model)
         self._controls.analyze_chords_requested.connect(self._on_analyze_chords)
         self._controls.view_mode_changed.connect(self._on_view_mode_changed)
         self._controls.cqt_source_changed.connect(self._on_cqt_source_changed)
+        self._controls.mode_changed.connect(self._on_mode_changed)
+        self._controls.accept_all_recommendations_requested.connect(self._on_accept_all_recommendations)
 
         # CQT view: pitch editing + navigation + zoom
         self._cqt_view.bar_changed.connect(self._on_bar_changed_from_cqt)
@@ -143,6 +150,11 @@ class MainWindow(QMainWindow):
         self._pitch_timer.setSingleShot(True)
         self._pitch_timer.setInterval(200)
         self._pitch_timer.timeout.connect(self._run_pitch_detection)
+        
+        # Playback position timer (updates playhead line)
+        self._playback_timer = QTimer(self)
+        self._playback_timer.setInterval(30)  # ~33 Hz for smooth playhead
+        self._playback_timer.timeout.connect(self._on_playback_tick)
 
     # ── Load ──────────────────────────────────────────────────────────────
 
@@ -152,7 +164,12 @@ class MainWindow(QMainWindow):
         self._controls.set_loaded(False)
         self._controls.set_progress(1, "Loading …")
 
-        self._load_worker = LoadWorker(wav_path, bpm, beats_per_bar)
+        self._load_worker = LoadWorker(
+            wav_path,
+            bpm,
+            beats_per_bar,
+            bootstrap_from_profiles=False,
+        )
         self._load_worker.progress.connect(self._controls.set_progress)
         self._load_worker.finished_ok.connect(self._on_load_done)
         self._load_worker.error.connect(self._on_load_error)
@@ -234,21 +251,72 @@ class MainWindow(QMainWindow):
     # ── Pitch editing (CQT view) ──────────────────────────────────────────
 
     def _on_cqt_clicked(self, t: float, midi: int) -> None:
-        """Left click on CQT: set/add manual pitch for the block at t."""
-        if self._markers:
-            self._markers.add_manual_pitch(t, midi)
+        """Left click: confirm pitch (pitched mode) or drum (percussive mode)."""
+        if self._markers is None:
+            return
+
+        mode = self._controls.get_mode()
+        if mode == "Percussive":
+            bpm = float(self._markers.grid.bpm)
+            beats_per_bar = int(self._markers.grid.beats_per_bar)
+            duration_str = self._controls.get_duration()
+            beat_index = self._markers.time_to_beat_index(
+                t, bpm, beats_per_bar, duration_str)
+            print(
+                f"[drum_grid] left_click t={t:.3f}s drum={midi} slice={beat_index} "
+                f"bpm={bpm:.2f} dur={duration_str}"
+            )
+            ok = self._markers.add_manual_drum(
+                beat_index, midi, bpm, beats_per_bar, duration_str)
             self._cqt_view.refresh()
-            self._envelope_view.refresh()
+            self._pitch_timer.start()
+            if ok:
+                self._status_bar.showMessage(
+                    f"Added drum {midi} at slice {beat_index}")
+            else:
+                self._status_bar.showMessage(
+                    f"Could not add drum {midi} at slice {beat_index} (empty/invalid slice)")
+            return
+
+        self._markers.add_manual_pitch(t, midi)
+        self._cqt_view.refresh()
+        self._envelope_view.refresh()
+        self._pitch_timer.start()
 
     def _on_cqt_right_clicked(self, t: float, midi: int) -> None:
-        """Right click on CQT: remove manual pitch nearest to midi.
-        If no manual pitches remain, mark as rest (explicit silence)."""
-        if self._markers:
-            removed = self._markers.remove_manual_pitch(t, midi)
-            if not removed:
-                self._markers.mark_as_rest(t)
+        """Right click: reject pitch (pitched mode) or drum (percussive mode)."""
+        if self._markers is None:
+            return
+
+        mode = self._controls.get_mode()
+        if mode == "Percussive":
+            bpm = float(self._markers.grid.bpm)
+            beats_per_bar = int(self._markers.grid.beats_per_bar)
+            duration_str = self._controls.get_duration()
+            beat_index = self._markers.time_to_beat_index(
+                t, bpm, beats_per_bar, duration_str)
+            print(
+                f"[drum_grid] right_click t={t:.3f}s drum={midi} slice={beat_index} "
+                f"bpm={bpm:.2f} dur={duration_str}"
+            )
+            ok = self._markers.remove_manual_drum(
+                beat_index, midi, bpm, beats_per_bar, duration_str)
             self._cqt_view.refresh()
-            self._envelope_view.refresh()
+            self._pitch_timer.start()
+            if ok:
+                self._status_bar.showMessage(
+                    f"Rejected drum {midi} at slice {beat_index}")
+            else:
+                self._status_bar.showMessage(
+                    f"Could not reject drum {midi} at slice {beat_index} (empty/invalid slice)")
+            return
+
+        removed = self._markers.remove_manual_pitch(t, midi)
+        if not removed:
+            self._markers.mark_as_rest(t)
+        self._cqt_view.refresh()
+        self._envelope_view.refresh()
+        self._pitch_timer.start()
 
     def _on_cqt_hovered(self, t: float, midi: int) -> None:
         if self._markers is None:
@@ -343,13 +411,34 @@ class MainWindow(QMainWindow):
             self._player = MidiPlayback()
 
         t_start, t_end = self._cqt_view._time_window()
-        blocks = self._markers.get_cached_block_pitches(t_start, t_end) if midi else []
+        
+        mode = self._controls.get_mode()
+        
+        # Get MIDI blocks based on mode
+        if mode == "Percussive" and midi:
+            blocks = self._markers.get_cached_drum_hits(t_start, t_end)
+        elif midi:
+            blocks = self._markers.get_cached_block_pitches(t_start, t_end)
+        else:
+            blocks = []
+        
         audio_slice = None
         if audio:
             s0 = max(0, int(t_start * self._markers.sr))
             s1 = min(len(self._markers.audio), int(t_end * self._markers.sr))
             audio_slice = self._markers.audio[s0:s1] if s1 > s0 else None
-        self._player.play(blocks, t_start, audio_slice, self._markers.sr)
+        
+        # Track playback timing for playhead
+        self._playback_start_time = time.perf_counter()
+        self._playback_start_t = t_start
+        
+        # Start playhead timer
+        self._playback_timer.start()
+        
+        # Use percussion channel (9 = channel 10) for drum mode
+        channel = 9 if mode == "Percussive" else None
+        
+        self._player.play(blocks, t_start, audio_slice, self._markers.sr, channel=channel)
 
     def _on_play_midi(self) -> None:
         self._play(midi=True, audio=False)
@@ -359,10 +448,23 @@ class MainWindow(QMainWindow):
 
     def _on_play_both(self) -> None:
         self._play(midi=True, audio=True)
+    
+    def _on_playback_tick(self) -> None:
+        """Update playhead position during playback."""
+        if not self._player or not self._player.is_playing:
+            self._playback_timer.stop()
+            self._cqt_view.set_playhead_position(-1)
+            return
+        
+        elapsed = time.perf_counter() - self._playback_start_time
+        current_t = self._playback_start_t + elapsed
+        self._cqt_view.set_playhead_position(current_t)
 
     def _on_stop(self) -> None:
         if self._player:
             self._player.stop()
+        self._playback_timer.stop()
+        self._cqt_view.set_playhead_position(-1)  # Hide playhead
 
     # ── MIDI export ───────────────────────────────────────────────────────
 
@@ -373,9 +475,51 @@ class MainWindow(QMainWindow):
             self, "Export MIDI", "output.mid", "MIDI files (*.mid *.midi)")
         if not out_path:
             return
-        notes = self._markers.build_midi_notes(run_pyin_for_missing=True)
-        build_midi(notes, self._markers.grid.bpm, out_path)
+        
+        mode = self._controls.get_mode()
+        
+        if mode == "Percussive":
+            # Export drum hits (beats/grid)
+            notes = self._markers.get_cached_drum_hits(0.0, self._markers.duration)
+            build_midi(notes, self._markers.grid.bpm, out_path, percussion=True)
+        else:
+            # Export pitched notes
+            notes = self._markers.build_midi_notes(run_pyin_for_missing=True)
+            build_midi(notes, self._markers.grid.bpm, out_path, percussion=False)
+        
         self._status_bar.showMessage(f"MIDI exported: {os.path.basename(out_path)}")
+
+    def _on_save_model(self) -> None:
+        if not self._markers:
+            return
+        name, ok = QInputDialog.getText(self, "Save Model", "Profile name:")
+        if not ok:
+            return
+        profile_name = str(name).strip() or "default"
+        try:
+            path = self._markers.save_model_profile(profile_name)
+            self._status_bar.showMessage(
+                f"Model saved: {os.path.basename(path)}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Save Model Error", str(exc))
+
+    def _on_load_model(self) -> None:
+        if not self._markers:
+            return
+        names = self._markers.list_model_profiles()
+        if not names:
+            QMessageBox.information(
+                self, "Load Model", "No model profiles found.")
+            return
+        choice, ok = QInputDialog.getItem(
+            self, "Load Model", "Choose profile:", names, editable=False)
+        if not ok:
+            return
+        try:
+            self._markers.load_model_profile(str(choice), merge=False)
+            self._status_bar.showMessage(f"Model loaded: {choice}")
+        except Exception as exc:
+            QMessageBox.critical(self, "Load Model Error", str(exc))
 
     # ── Chord analysis ────────────────────────────────────────────────────
 
@@ -419,6 +563,28 @@ class MainWindow(QMainWindow):
 
     def _on_cqt_source_changed(self, source: str) -> None:
         self._cqt_view.set_cqt_source(source)
+
+    def _on_mode_changed(self, mode: str) -> None:
+        self._cqt_view.set_mode(mode)
+
+    def _on_accept_all_recommendations(self) -> None:
+        """Accept all visible pitch and onset recommendations."""
+        if not self._markers:
+            return
+
+        t_start, t_end = self._cqt_view._time_window()
+        visible_pitch_rows = self._cqt_view.visible_recommendation_rows(t_start, t_end)
+        mode = self._controls.get_mode()
+        accepted_pitches, accepted_onsets = self._markers.accept_visible_recommendations(
+            t_start, t_end, visible_pitch_rows, current_mode=mode)
+
+        self._cqt_view.refresh()
+        self._envelope_view.refresh()
+
+        if accepted_pitches or accepted_onsets:
+            item_label = "drums" if mode == "Percussive" else "pitch recommendations"
+            self._status_bar.showMessage(
+                f"Accepted {accepted_pitches} {item_label} and {accepted_onsets} onset recommendations")
 
     # ── Cleanup ───────────────────────────────────────────────────────────
 
