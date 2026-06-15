@@ -8,7 +8,6 @@ Scene coordinates: X = seconds, Y = MIDI note.
 View transform flips Y so high notes appear at top.
 """
 
-import time
 import numpy as np
 
 from PySide6.QtWidgets import (
@@ -33,6 +32,56 @@ from core.chord_analysis import chord_to_piano_notes
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 NOTE_NAMES = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+
+# Drum MIDI note names (GM percussion standard)
+DRUM_MIDI_NAMES = {
+    36: "Kick Drum",
+    37: "Rim Shot",
+    38: "Acoustic Snare",
+    39: "Hand Clap",
+    40: "Electric Snare",
+    41: "Low Floor Tom",     # Primary Floor Tom
+    42: "Hi-Hat Closed",
+    43: "High Floor Tom",    # Secondary Floor Tom
+    44: "Pedal Hi-Hat",
+    45: "Low-Mid Tom",       # Primary Mid/Rack Tom 2
+    46: "Hi-Hat Open",
+    47: "High-Mid Tom",      # Extra Rack Tom
+    48: "Hi-Mid Tom 2",      # Extra Rack Tom
+    49: "Crash Cymbal 1",
+    50: "High Tom",          # Primary High/Rack Tom 1
+    51: "Ride Cymbal 1",
+    52: "Chinese Cymbal",
+    53: "Ride Bell",
+    54: "Tambourine",
+    55: "Splash Cymbal",
+    56: "Cowbell",
+    57: "Crash Cymbal 2",
+    58: "Vibraslap",
+    59: "Ride Cymbal 2",
+    60: "Bongo High",
+    61: "Bongo Low",
+    62: "Conga High",
+    63: "Conga Low",
+    64: "Conga Low Muted",
+    65: "Timbale High",
+    66: "Timbale Low",
+    67: "Agogo High",
+    68: "Agogo Low",
+    69: "Guiro Long",
+    70: "Guiro Short",
+    71: "Claves",
+    72: "Wood Block High",
+    73: "Wood Block Low",
+    74: "Cuica Muted",
+    75: "Cuica Open",
+    76: "Triangle Muted",
+    77: "Triangle Open",
+    78: "Shaker",
+    79: "Jingle Bell",
+    80: "Bell Tree",
+    81: "Castanets"
+}
 
 BAR_LINE_COLOR = QColor("#808080")
 BEAT_LINE_COLOR = QColor("#555555")
@@ -86,17 +135,42 @@ PITCH_STYLES = {
     "pyin":   (QColor("#1a8fff"), Qt.PenStyle.DashLine, 0.50),
 }
 
+# Percussive layout constants
+PERC_DRUM_MIN = 36
+PERC_DRUM_MAX = 81
+PERC_LANES_DEFAULT = [
+    36,  # Kick Drum
+    37,  # Rim Shot
+    38,  # Acoustic Snare
+    41,  # Low Floor Tom
+    45,  # Low-Mid Tom
+    50,  # High Tom
+    42,  # Hi-Hat Closed
+    44,  # Pedal Hi-Hat
+    46,  # Hi-Hat Open
+    49,  # Crash Cymbal 1
+    51,  # Ride Cymbal 1
+]
+PERC_BASE_Y = 36
+
 
 # ── CQT → QPixmap ────────────────────────────────────────────────────────────
 
 def cqt_to_qpixmap(cqt_slice: np.ndarray, midi_lo: int, midi_hi: int,
                     colored_pcs: set[int] | None = None,
-                    frame_colored_pcs: np.ndarray | None = None) -> QPixmap:
+                    frame_colored_pcs: np.ndarray | None = None,
+                    vmin: float = -50.0,
+                    vmax: float = 0.0,
+                    log_color: bool = False) -> QPixmap:
     """CQT (n_bins, n_frames) → QPixmap with inferno colormap.
     Rows whose pitch class is NOT in colored_pcs are desaturated.
     If colored_pcs is None, all rows keep full color."""
-    vmin, vmax = -50.0, 0.0
+    if vmax <= vmin:
+        vmax = vmin + 1e-6
     norm = np.clip((cqt_slice - vmin) / (vmax - vmin), 0.0, 1.0)
+    if log_color:
+        # Log-shaped mapping boosts quieter high-frequency details (e.g. cymbals).
+        norm = np.log1p(24.0 * norm) / np.log1p(24.0)
     indices = (norm * 255).astype(np.uint8)
     rgba = INFERNO_LUT[indices]
 
@@ -183,8 +257,16 @@ class CQTGraphicsView(QGraphicsView):
         self._pitch_rects: list[QGraphicsRectItem] = []
         self._y_labels: list[QGraphicsSimpleTextItem] = []
         self._chord_results: list = []
+        self._playhead_line: QGraphicsLineItem | None = None
         self._view_mode: str = "Gray off-scale"
         self._cqt_source: str = "db"
+        self._current_mode: str = "Pitched"  # "Pitched" or "Percussive"
+        self._perc_lane_midis: list[int] = []
+        self._perc_lane_y: dict[int, float] = {}
+        self._perc_view_lo: float = float(self._midi_lo) - 0.5
+        self._perc_view_hi: float = float(self._midi_hi) + 0.5
+        self._perc_lane_lo: float = 35.5
+        self._perc_lane_hi: float = 50.5
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -218,6 +300,14 @@ class CQTGraphicsView(QGraphicsView):
 
     def set_cqt_source(self, source: str) -> None:
         self._cqt_source = source
+        self.refresh()
+
+    def set_mode(self, mode: str) -> None:
+        """Set mode to 'Pitched' or 'Percussive'."""
+        self._current_mode = mode
+        if mode != "Percussive":
+            self._view_midi_window = 48
+            self._view_midi_lo = self._midi_lo
         self.refresh()
 
     @property
@@ -262,18 +352,63 @@ class CQTGraphicsView(QGraphicsView):
         """Return the set of pitch classes to keep colored, or None for all."""
         if self._view_mode == "Show all":
             return None
-        if self._view_mode == "Gray off-chord" and self._chord_results:
-            # Union of all chord PCs active in this time window
-            pcs: set[int] = set()
-            for row in self._chord_results:
-                _, _, _, chord_name, _, ct0, ct1 = row
-                if ct1 < t_start or ct0 > t_end:
-                    continue
-                notes = chord_to_piano_notes(chord_name)
-                pcs.update(n % 12 for n in notes)
-            return pcs if pcs else None
+        
+        if self._view_mode == "Gray off-chord":
+            if self._chord_results:
+                # Union of all chord PCs active in this time window
+                pcs: set[int] = set()
+                for row in self._chord_results:
+                    _, _, _, chord_name, _, ct0, ct1 = row
+                    if ct1 < t_start or ct0 > t_end:
+                        continue
+                    notes = chord_to_piano_notes(chord_name)
+                    pcs.update(n % 12 for n in notes)
+                if pcs:
+                    return pcs
+            # Fall back to scale if no chords in window or no chord results
+            return self._scale_pcs if self._scale_pcs else None
+        
         # Default: gray off-scale
         return self._scale_pcs if self._scale_pcs else None
+
+    def _recommendation_visible(self, source: str, midi: int, t0: float, t1: float,
+                                t_start: float, t_end: float) -> bool:
+        """Return whether a pitch recommendation should remain visible.
+        
+        Manual pitches always show. NNLS/ML/pyin recommendations are filtered by gray mode.
+        """
+        if midi is None:
+            return False
+
+        # Percussive mode does not use pitch-class gray filtering.
+        if self._current_mode == "Percussive":
+            return True
+
+        # Manual pitches and Show all mode: always show
+        if source == "manual" or self._view_mode == "Show all":
+            return True
+
+        # For recommendations (nnls, ml, pyin), apply gray mode filtering
+        if t1 <= t_start or t0 >= t_end:
+            return False
+
+        allowed_pcs = self._get_colored_pcs(t_start, t_end)
+        if allowed_pcs is None:
+            # No gray mode filtering active (shouldn't happen, but show all as fallback)
+            return True
+        return (int(midi) % 12) in allowed_pcs
+
+    def visible_recommendation_rows(self, t_start: float, t_end: float) -> list[tuple]:
+        """Return the visible recommendation rows using the current gray mode."""
+        if not self._markers:
+            return []
+        if self._current_mode == "Percussive":
+            return self._markers.get_cached_drum_hits(t_start, t_end)
+        rows = []
+        for t0, t1, midi, source, vel in self._markers.get_cached_block_pitches(t_start, t_end):
+            if self._recommendation_visible(source, midi, t0, t1, t_start, t_end):
+                rows.append((t0, t1, midi, source, vel))
+        return rows
 
     def _build_frame_chord_mask(self, frame_times: np.ndarray) -> np.ndarray | None:
         """Build a (12, n_frames) boolean mask for Gray off-chord mode."""
@@ -298,19 +433,26 @@ class CQTGraphicsView(QGraphicsView):
             return None
         return mask
 
-    def _cqt_matrix_for_source(self) -> np.ndarray:
+    def _spectrogram_matrix_and_times(self) -> tuple[np.ndarray, np.ndarray]:
         if not self._markers:
-            return np.zeros((1, 1), dtype=np.float32)
+            return np.zeros((1, 1), dtype=np.float32), np.zeros(1, dtype=np.float32)
         m = self._markers
+        if self._current_mode == "Percussive":
+            src = self._cqt_source.strip().lower()
+            if src in ("cqt (percussive)", "cqt", "db", "cqt_db", "cqt_mag"):
+                return m.cqt_db, m.cqt_times
+            if src in ("mel", "mel db", "melspectrogram", "mels"):
+                return m.mel_db, m.mel_times
+            return m.stft_db, m.stft_times
         if self._cqt_source in ("db", "cqt_db", "cqt_mag"):
-            return m.cqt_db
+            return m.cqt_db, m.cqt_times
         if self._cqt_source in ("spectral peel", "spectral_peel", "cqt_sal"):
-            return m.cqt_peel_db
+            return m.cqt_peel_db, m.cqt_times
         if self._cqt_source in ("pitch salience", "hcqt", "cqt_hcqt_db"):
-            return m.cqt_hcqt_db
+            return m.cqt_hcqt_db, m.cqt_times
         if self._cqt_source in ("flux novelty", "flux", "cqt_flux_db"):
-            return m.cqt_flux_db
-        return m.cqt_db
+            return m.cqt_flux_db, m.cqt_times
+        return m.cqt_db, m.cqt_times
 
     def _rebuild_scene(self) -> None:
         if not self._markers or not self._grid:
@@ -325,32 +467,52 @@ class CQTGraphicsView(QGraphicsView):
         self._y_labels.clear()
         self._cqt_pixmap_item = None
 
-        # CQT pixmap
-        frame_lo = int(np.searchsorted(m.cqt_times, t_start))
-        frame_hi = int(np.searchsorted(m.cqt_times, t_end))
-        frame_hi = min(frame_hi, m.cqt_db.shape[1] - 1)
+        pitches = self.visible_recommendation_rows(t_start, t_end)
+        if self._current_mode == "Percussive":
+            self._prepare_percussive_layout(pitches)
 
-        if frame_hi > frame_lo:
-            cqt_source = self._cqt_matrix_for_source()
-            cqt_slice = cqt_source[:, frame_lo:frame_hi]
-            t_lo = float(m.cqt_times[frame_lo])
-            t_hi = float(m.cqt_times[frame_hi])
-            frame_times = m.cqt_times[frame_lo:frame_hi]
+        if self._current_mode != "Percussive":
+            spec_matrix, spec_times = self._spectrogram_matrix_and_times()
+
+            # Spectrogram pixmap
+            frame_lo = int(np.searchsorted(spec_times, t_start))
+            frame_hi = int(np.searchsorted(spec_times, t_end))
+            frame_hi = min(frame_hi, spec_matrix.shape[1] - 1)
+
+            if frame_hi <= frame_lo:
+                frame_hi = frame_lo
+
+        if self._current_mode != "Percussive" and frame_hi > frame_lo:
+            cqt_slice = spec_matrix[:, frame_lo:frame_hi]
+            t_lo = float(spec_times[frame_lo])
+            t_hi = float(spec_times[frame_hi])
+            frame_times = spec_times[frame_lo:frame_hi]
             frame_chord_mask = self._build_frame_chord_mask(frame_times)
             colored_pcs = self._get_colored_pcs(t_start, t_end)
+
+            vmin = -50.0
+            vmax = 0.0
+            log_color = False
+            pix_midi_lo = self._midi_lo
+            pix_midi_hi = self._midi_hi
+
             pixmap = cqt_to_qpixmap(
                 cqt_slice,
-                self._midi_lo,
-                self._midi_hi,
+                pix_midi_lo,
+                pix_midi_hi,
                 colored_pcs,
                 frame_chord_mask,
+                vmin=vmin,
+                vmax=vmax,
+                log_color=log_color,
             )
             self._cqt_pixmap_item = self._scene.addPixmap(pixmap)
             n_bins, n_frames = cqt_slice.shape
             sx = (t_hi - t_lo) / max(n_frames, 1)
             sy = (self._midi_hi - self._midi_lo + 1) / max(n_bins, 1)
+            y0 = self._midi_lo - 0.5
             transform = QTransform()
-            transform.translate(t_lo, self._midi_lo - 0.5)
+            transform.translate(t_lo, y0)
             transform.scale(sx, sy)
             self._cqt_pixmap_item.setTransform(transform)
             self._cqt_pixmap_item.setZValue(1)
@@ -379,8 +541,13 @@ class CQTGraphicsView(QGraphicsView):
                 pen = QPen(MIN_GRID_LINE_COLOR)
                 pen.setWidthF(0.4)
             pen.setCosmetic(True)
+            y_grid_lo = self._midi_lo - 0.5
+            y_grid_hi = self._midi_hi + 0.5
+            if self._current_mode == "Percussive":
+                y_grid_lo = self._perc_lane_lo
+                y_grid_hi = self._perc_lane_hi
             line = self._scene.addLine(
-                QLineF(t, self._midi_lo - 0.5, t, self._midi_hi + 0.5), pen)
+                QLineF(t, y_grid_lo, t, y_grid_hi), pen)
             line.setZValue(3)
             self._grid_lines.append(line)
 
@@ -392,17 +559,24 @@ class CQTGraphicsView(QGraphicsView):
             onset_pen = QPen(color)
             onset_pen.setWidthF(1.5)
             onset_pen.setCosmetic(True)
+            y_onset_lo = self._midi_lo - 0.5
+            y_onset_hi = self._midi_hi + 0.5
+            if self._current_mode == "Percussive":
+                y_onset_lo = self._perc_lane_lo
+                y_onset_hi = self._perc_lane_hi
             line = self._scene.addLine(
-                QLineF(t, self._midi_lo - 0.5, t, self._midi_hi + 0.5), onset_pen)
+                QLineF(t, y_onset_lo, t, y_onset_hi), onset_pen)
             line.setZValue(5)
             self._onset_lines.append(line)
 
         # Pitch boxes
-        pitches = m.get_cached_block_pitches(t_start, t_end)
         for entry in pitches:
-            t0, t1, midi, source = entry if len(entry) == 4 else (*entry, "pyin")
+            t0, t1, midi, source = entry[:4]
             if midi is None:
                 continue
+            y_note = float(midi)
+            if self._current_mode == "Percussive":
+                y_note = self._percussive_y_for_midi(int(midi))
             color, style, alpha = PITCH_STYLES.get(source, PITCH_STYLES["pyin"])
             c = QColor(color)
             c.setAlphaF(alpha)
@@ -411,32 +585,61 @@ class CQTGraphicsView(QGraphicsView):
             pen.setCosmetic(True)
             pen.setStyle(style)
             rect = self._scene.addRect(
-                QRectF(max(t0, t_start), midi - 0.45,
+                QRectF(max(t0, t_start), y_note - 0.45,
                        min(t1, t_end) - max(t0, t_start), 0.9),
                 pen, QBrush(Qt.BrushStyle.NoBrush))
             rect.setZValue(8)
             self._pitch_rects.append(rect)
 
         # Y-axis note labels
-        C_MAJOR = {0, 2, 4, 5, 7, 9, 11}
-        for midi in range(self._midi_lo, self._midi_hi + 1):
-            if (midi % 12) not in C_MAJOR:
-                continue
-            name = f"{NOTE_NAMES[midi % 12]}{(midi // 12) - 1}"
-            text = self._scene.addSimpleText(name)
-            text.setBrush(QBrush(QColor("#cccccc")))
-            text.setFont(QFont("Segoe UI", 8))
-            text.setZValue(20)
-            text.setFlag(
-                QGraphicsSimpleTextItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-            text.setData(0, midi)
-            self._y_labels.append(text)
+        if self._current_mode == "Percussive":
+            lane_midis = self._perc_lane_midis
+            for midi in lane_midis:
+                y_lane = self._percussive_y_for_midi(midi)
+                lane_pen = QPen(QColor("#3a3a44"))
+                lane_pen.setCosmetic(True)
+                lane_pen.setWidthF(0.8)
+                lane = self._scene.addLine(
+                    QLineF(t_start, y_lane, t_end, y_lane),
+                    lane_pen,
+                )
+                lane.setZValue(2)
+
+                name = DRUM_MIDI_NAMES.get(midi, f"D{midi}")
+                text = self._scene.addSimpleText(name)
+                text.setBrush(QBrush(QColor("#cccccc")))
+                text.setFont(QFont("Segoe UI", 8))
+                text.setZValue(20)
+                text.setFlag(
+                    QGraphicsSimpleTextItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+                text.setData(0, midi)
+                text.setData(1, y_lane)
+                self._y_labels.append(text)
+        else:
+            # Pitched mode: show pitch names on C major scale
+            C_MAJOR = {0, 2, 4, 5, 7, 9, 11}
+            for midi in range(self._midi_lo, self._midi_hi + 1):
+                if (midi % 12) not in C_MAJOR:
+                    continue
+                name = f"{NOTE_NAMES[midi % 12]}{(midi // 12) - 1}"
+                text = self._scene.addSimpleText(name)
+                text.setBrush(QBrush(QColor("#cccccc")))
+                text.setFont(QFont("Segoe UI", 8))
+                text.setZValue(20)
+                text.setFlag(
+                    QGraphicsSimpleTextItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
+                text.setData(0, midi)
+                self._y_labels.append(text)
 
         self._fit_view_to_window(t_start, t_end)
 
     def _fit_view_to_window(self, t_start: float, t_end: float) -> None:
-        midi_lo_view = self._view_midi_lo - 0.5
-        midi_hi_view = self._view_midi_lo + self._view_midi_window - 0.5
+        if self._current_mode == "Percussive":
+            midi_lo_view = self._perc_view_lo
+            midi_hi_view = self._perc_view_hi
+        else:
+            midi_lo_view = self._view_midi_lo - 0.5
+            midi_hi_view = self._view_midi_lo + self._view_midi_window - 0.5
         vw = self.viewport().width()
         vh = self.viewport().height()
         if vw <= 0 or vh <= 0:
@@ -449,13 +652,104 @@ class CQTGraphicsView(QGraphicsView):
             t_start, midi_lo_view, t_end - t_start, midi_hi_view - midi_lo_view))
         self._update_label_positions()
 
+    def set_playhead_position(self, time_sec: float) -> None:
+        """Update playhead line position (vertical line at time_sec)."""
+        if not self._markers:
+            return
+        
+        # Remove old playhead if it exists
+        if self._playhead_line is not None and self._playhead_line in self._scene.items():
+            self._scene.removeItem(self._playhead_line)
+        
+        # Create new playhead line if time is within visible window
+        if time_sec >= 0:
+            if self._current_mode == "Percussive":
+                midi_lo = self._perc_view_lo
+                midi_hi = self._perc_view_hi
+            else:
+                midi_lo = self._view_midi_lo - 0.5
+                midi_hi = self._view_midi_lo + self._view_midi_window - 0.5
+            
+            pen = QPen(QColor("#00ff00"), 1.0)
+            pen.setStyle(Qt.PenStyle.SolidLine)
+            self._playhead_line = self._scene.addLine(
+                QLineF(time_sec, midi_lo, time_sec, midi_hi), pen)
+            self._playhead_line.setZValue(100)
+
+    def _prepare_percussive_layout(self, visible_rows: list[tuple]) -> None:
+        lanes = self._percussive_lane_midis(visible_rows)
+        if not lanes:
+            lanes = [36]
+        self._perc_lane_midis = lanes
+        self._perc_lane_y = {
+            int(midi): float(PERC_BASE_Y + idx)
+            for idx, midi in enumerate(lanes)
+        }
+
+        self._perc_lane_lo = float(PERC_BASE_Y) - 0.5
+        self._perc_lane_hi = float(PERC_BASE_Y + len(lanes) - 1) + 0.5
+        self._perc_view_lo = self._perc_lane_lo - 1.0
+        self._perc_view_hi = self._perc_lane_hi + 1.0
+
+    def _percussive_y_for_midi(self, midi: int) -> float:
+        if int(midi) in self._perc_lane_y:
+            return self._perc_lane_y[int(midi)]
+        lanes = self._percussive_lane_midis()
+        if not lanes:
+            return float(PERC_BASE_Y)
+        closest = min(lanes, key=lambda m: abs(int(midi) - int(m)))
+        return float(self._perc_lane_y.get(int(closest), float(PERC_BASE_Y)))
+
+    def _percussive_lane_midis(self, visible_rows: list[tuple] | None = None) -> list[int]:
+        default_lanes = [
+            int(midi)
+            for midi in PERC_LANES_DEFAULT
+            if PERC_DRUM_MIN <= int(midi) <= PERC_DRUM_MAX
+        ]
+        lane_set: set[int] = set(default_lanes)
+        extra_lanes: set[int] = set()
+
+        if self._markers is not None:
+            for _, midi in self._markers.model.get_drum_patterns():
+                if PERC_DRUM_MIN <= int(midi) <= PERC_DRUM_MAX:
+                    m = int(midi)
+                    if m not in lane_set:
+                        extra_lanes.add(m)
+            for midi_set in self._markers._manual_drums.values():
+                for midi in midi_set:
+                    if PERC_DRUM_MIN <= int(midi) <= PERC_DRUM_MAX:
+                        m = int(midi)
+                        if m not in lane_set:
+                            extra_lanes.add(m)
+
+        if visible_rows:
+            for row in visible_rows:
+                if len(row) >= 3 and row[2] is not None:
+                    midi = int(row[2])
+                    if PERC_DRUM_MIN <= midi <= PERC_DRUM_MAX:
+                        if midi not in lane_set:
+                            extra_lanes.add(midi)
+
+        return default_lanes + sorted(extra_lanes)
+
+    def _quantize_percussive_midi(self, y_value: float) -> int:
+        lanes = self._perc_lane_midis or self._percussive_lane_midis()
+        if not lanes:
+            return 36
+        return min(
+            lanes,
+            key=lambda m: abs(float(y_value) - float(self._percussive_y_for_midi(int(m)))),
+        )
+
     def _update_label_positions(self) -> None:
         if not self._y_labels:
             return
         left_scene = self.mapToScene(5, 0).x()
         for text in self._y_labels:
-            midi = text.data(0)
-            text.setPos(left_scene, midi)
+            y = text.data(1)
+            if y is None:
+                y = text.data(0)
+            text.setPos(left_scene, float(y))
 
     # ── Qt events ─────────────────────────────────────────────────────────
 
@@ -485,7 +779,10 @@ class CQTGraphicsView(QGraphicsView):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.pos())
-        midi_note = max(self._midi_lo, min(int(round(scene_pos.y())), self._midi_hi))
+        if self._current_mode == "Percussive":
+            midi_note = self._quantize_percussive_midi(scene_pos.y())
+        else:
+            midi_note = max(self._midi_lo, min(int(round(scene_pos.y())), self._midi_hi))
         if event.button() == Qt.MouseButton.LeftButton:
             self.block_clicked.emit(scene_pos.x(), midi_note)
         elif event.button() == Qt.MouseButton.RightButton:
@@ -494,7 +791,10 @@ class CQTGraphicsView(QGraphicsView):
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
         scene_pos = self.mapToScene(event.pos())
-        midi_note = max(self._midi_lo, min(int(round(scene_pos.y())), self._midi_hi))
+        if self._current_mode == "Percussive":
+            midi_note = self._quantize_percussive_midi(scene_pos.y())
+        else:
+            midi_note = max(self._midi_lo, min(int(round(scene_pos.y())), self._midi_hi))
         self.block_hovered.emit(float(scene_pos.x()), int(midi_note))
         super().mouseMoveEvent(event)
 
