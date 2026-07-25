@@ -584,9 +584,12 @@ class CQTGraphicsView(QGraphicsView):
             pen.setWidthF(4.0)
             pen.setCosmetic(True)
             pen.setStyle(style)
+            # In Percussive mode, use smaller height (0.4) to leave room for envelope view
+            box_height = 0.4 if self._current_mode == "Percussive" else 0.9
+            box_half = box_height / 2.0
             rect = self._scene.addRect(
-                QRectF(max(t0, t_start), y_note - 0.45,
-                       min(t1, t_end) - max(t0, t_start), 0.9),
+                QRectF(max(t0, t_start), y_note - box_half,
+                       min(t1, t_end) - max(t0, t_start), box_height),
                 pen, QBrush(Qt.BrushStyle.NoBrush))
             rect.setZValue(8)
             self._pitch_rects.append(rect)

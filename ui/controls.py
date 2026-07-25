@@ -291,11 +291,11 @@ class ControlPanel(QWidget):
         return self._polyphony_slider.value()
 
     def _on_load(self) -> None:
-        # Always open the file dialog so users can add more WAV files.
+        # Always open the file dialog so users can add more audio files.
         start_dir = self._stem_dir or ""
         paths, _ = QFileDialog.getOpenFileNames(
             self, "Select audio files", start_dir,
-            "Audio files (*.wav);;All files (*)")
+            "Audio files (*.wav *.mp3);;All files (*)")
         if not paths:
             return
 
