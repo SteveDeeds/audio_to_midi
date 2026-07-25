@@ -17,11 +17,13 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 
 from core.audio_engine import AudioMarkers
-from core.chord_analysis import key_to_scale_pcs, chord_to_piano_notes
+from core.chord_analysis import key_to_scale_pcs, chord_to_piano_notes, collapse_chords
+from core.chord_change_model import ChordChangeModel
 from core.midi_export import build_midi
 from core.playback import MidiPlayback
 
 from ui.cqt_view import CQTGraphicsView
+from ui.chroma_strip import ChromaStripWidget
 from ui.envelope_view import EnvelopeView
 from ui.controls import ControlPanel
 from ui.chord_stem_dialog import ChordStemDialog
@@ -36,7 +38,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Audio → MIDI")
+        self.setWindowTitle("Audio â†’ MIDI")
         self.resize(1500, 900)
         self.setStyleSheet(QSS)
 
@@ -47,12 +49,21 @@ class MainWindow(QMainWindow):
         self._chord_results: list = []
         self._detected_key: str = ""
         self._player: MidiPlayback | None = None
+        # Chord model / raw data for re-filtering
+        self._raw_beats: list = []
+        self._beat_features: dict = {}
+        self._chord_duration: float = 0.0
+        self._chord_manual_changes: set[int] = set()
+        self._chord_manual_removals: set[int] = set()
+        self._chord_model: ChordChangeModel = ChordChangeModel()
+        self._chord_chroma = None
+        self._chord_frame_times = None
         self._playback_start_time: float = 0.0  # Wall clock time when playback started
         self._playback_start_t: float = 0.0     # Audio time when playback started
 
         self._build_ui()
 
-    # ── UI construction ───────────────────────────────────────────────────
+    # â”€â”€ UI construction â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _build_ui(self) -> None:
         central = QWidget()
@@ -71,7 +82,7 @@ class MainWindow(QMainWindow):
 
         # Info bar
         info = QHBoxLayout()
-        self._key_label = QLabel("Key: —")
+        self._key_label = QLabel("Key: â€”")
         self._key_label.setObjectName("key")
         info.addWidget(self._key_label)
 
@@ -93,6 +104,9 @@ class MainWindow(QMainWindow):
         self._chord_header = ChordHeaderWidget()
         cqt_layout.addWidget(self._chord_header)
 
+        self._chroma_strip = ChromaStripWidget()
+        cqt_layout.addWidget(self._chroma_strip)
+
         self._cqt_view = CQTGraphicsView()
         cqt_layout.addWidget(self._cqt_view, 1)
 
@@ -112,7 +126,7 @@ class MainWindow(QMainWindow):
         self.setStatusBar(self._status_bar)
         self._status_bar.showMessage(
             "Open a WAV file and click Load to begin.  "
-            "Arrow keys: ←/→ bars, ↑/↓ octaves  |  Wheel: zoom")
+            "Arrow keys: â†/â†’ bars, â†‘/â†“ octaves  |  Wheel: zoom")
 
         # Wire signals
         self._controls.load_requested.connect(self._on_load)
@@ -128,6 +142,8 @@ class MainWindow(QMainWindow):
         self._controls.load_model_requested.connect(self._on_load_model)
         self._controls.analyze_chords_requested.connect(self._on_analyze_chords)
         self._controls.view_mode_changed.connect(self._on_view_mode_changed)
+        self._chord_header.chord_change_added.connect(self._on_chord_change_added)
+        self._chord_header.chord_change_removed.connect(self._on_chord_change_removed)
         self._controls.cqt_source_changed.connect(self._on_cqt_source_changed)
         self._controls.mode_changed.connect(self._on_mode_changed)
         self._controls.accept_all_recommendations_requested.connect(self._on_accept_all_recommendations)
@@ -138,6 +154,7 @@ class MainWindow(QMainWindow):
         self._cqt_view.block_right_clicked.connect(self._on_cqt_right_clicked)
         self._cqt_view.block_hovered.connect(self._on_cqt_hovered)
         self._cqt_view.zoom_changed.connect(self._on_zoom_from_cqt)
+        self._chroma_strip.note_hovered.connect(self._on_chroma_hovered)
 
         # Envelope view: onset editing + navigation + zoom
         self._envelope_view.onset_added.connect(self._on_onset_add)
@@ -156,13 +173,13 @@ class MainWindow(QMainWindow):
         self._playback_timer.setInterval(30)  # ~33 Hz for smooth playhead
         self._playback_timer.timeout.connect(self._on_playback_tick)
 
-    # ── Load ──────────────────────────────────────────────────────────────
+    # â”€â”€ Load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_load(self, wav_path: str, bpm: float, beats_per_bar: int) -> None:
         if self._load_worker and self._load_worker.isRunning():
             return
         self._controls.set_loaded(False)
-        self._controls.set_progress(1, "Loading …")
+        self._controls.set_progress(1, "Loading â€¦")
 
         self._load_worker = LoadWorker(
             wav_path,
@@ -179,6 +196,9 @@ class MainWindow(QMainWindow):
         self._markers = markers
         self._detected_key = markers.detected_key
         self._key_label.setText(f"Key: {self._detected_key}")
+        self._chord_chroma = None
+        self._chord_frame_times = None
+        self._chroma_strip.set_chroma_data(None, None)
         scale_pcs = key_to_scale_pcs(self._detected_key)
         self._cqt_view.set_markers(markers, scale_pcs)
         self._envelope_view.set_markers(markers)
@@ -198,7 +218,7 @@ class MainWindow(QMainWindow):
         self._controls.set_loaded(False)
         QMessageBox.critical(self, "Load Error", msg)
 
-    # ── Stem switching ────────────────────────────────────────────────────
+    # â”€â”€ Stem switching â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_stem_changed(self, path: str) -> None:
         if self._markers is None:
@@ -207,7 +227,7 @@ class MainWindow(QMainWindow):
         bpb = self._controls.beats_per_bar()
         self._on_load(path, bpm, bpb)
 
-    # ── Duration / Sensitivity ────────────────────────────────────────────
+    # â”€â”€ Duration / Sensitivity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_duration_changed(self, label: str) -> None:
         if self._markers:
@@ -223,7 +243,7 @@ class MainWindow(QMainWindow):
             self._envelope_view.refresh()
             self._pitch_timer.start()
 
-    # ── Onset editing (envelope view) ─────────────────────────────────────
+    # â”€â”€ Onset editing (envelope view) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_onset_add(self, t: float) -> None:
         """Left click on envelope: restore nearest inactive candidate."""
@@ -248,7 +268,7 @@ class MainWindow(QMainWindow):
                 self._status_bar.showMessage(
                     f"ML applied: {n_pin} added, {n_del} removed")
 
-    # ── Pitch editing (CQT view) ──────────────────────────────────────────
+    # â”€â”€ Pitch editing (CQT view) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_cqt_clicked(self, t: float, midi: int) -> None:
         """Left click: confirm pitch (pitched mode) or drum (percussive mode)."""
@@ -345,7 +365,14 @@ class MainWindow(QMainWindow):
             f"beatWin={dbg['beat_window_ms'][0]:.0f}-{dbg['beat_window_ms'][1]:.0f}ms\n"
             f"top3={top_txt}  octave+12({dbg['octave_up_midi']})={oct_txt}")
 
-    # ── Bar nav (synced between views) ────────────────────────────────────
+    def _on_chroma_hovered(self, t: float, pitch_class: int, value: float) -> None:
+        names = ['C', 'C#', 'D', 'Eb', 'E', 'F', 'F#', 'G', 'Ab', 'A', 'Bb', 'B']
+        note_name = names[int(pitch_class) % 12]
+        self._controls.set_debug_info(
+            f"Hover: {note_name} (pc={int(pitch_class)}) @ {t:.3f}s\n"
+            f"Chroma strip intensity={value:.3f}  source=combined stems")
+
+    # â”€â”€ Bar nav (synced between views) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_bar_changed_from_cqt(self, bar: int) -> None:
         self._bar_label.setText(
@@ -384,8 +411,9 @@ class MainWindow(QMainWindow):
     def _update_chord_header(self) -> None:
         t_start, t_end = self._cqt_view._time_window()
         self._chord_header.set_time_window(t_start, t_end)
+        self._chroma_strip.set_time_window(t_start, t_end)
 
-    # ── Pitch detection ───────────────────────────────────────────────────
+    # â”€â”€ Pitch detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _run_pitch_detection(self) -> None:
         if not self._markers:
@@ -402,7 +430,7 @@ class MainWindow(QMainWindow):
     def _on_pitches_ready(self, results: list) -> None:
         self._cqt_view.refresh()
 
-    # ── Playback ──────────────────────────────────────────────────────────
+    # â”€â”€ Playback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _play(self, midi: bool = True, audio: bool = True) -> None:
         if not self._markers:
@@ -466,7 +494,7 @@ class MainWindow(QMainWindow):
         self._playback_timer.stop()
         self._cqt_view.set_playhead_position(-1)  # Hide playhead
 
-    # ── MIDI export ───────────────────────────────────────────────────────
+    # â”€â”€ MIDI export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_export_midi(self) -> None:
         if not self._markers:
@@ -521,7 +549,7 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Load Model Error", str(exc))
 
-    # ── Chord analysis ────────────────────────────────────────────────────
+    # â”€â”€ Chord analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_analyze_chords(self) -> None:
         if self._chord_worker and self._chord_worker.isRunning():
@@ -537,7 +565,7 @@ class MainWindow(QMainWindow):
         if not wavs:
             return
 
-        self._controls.set_progress(0, "Analyzing chords …")
+        self._controls.set_progress(0, "Analyzing chords â€¦")
         self._chord_worker = ChordWorker(
             wavs, self._controls.bpm(), self._controls.beats_per_bar())
         self._chord_worker.progress.connect(self._controls.set_progress)
@@ -546,17 +574,105 @@ class MainWindow(QMainWindow):
             lambda msg: QMessageBox.critical(self, "Chord Error", msg))
         self._chord_worker.start()
 
-    def _on_chords_done(self, key_str: str, results: list) -> None:
+    def _on_chords_done(self, key_str: str, results: list,
+                        raw_beats: list, beat_features: object,
+                        chroma: object, frame_times: object) -> None:
+        bpm = self._controls.bpm()
+        self._raw_beats = raw_beats
+        self._beat_features = beat_features if isinstance(beat_features, dict) else {}
+        self._chord_duration = raw_beats[-1][1] + 60.0 / bpm if raw_beats else 0.0
+        self._chord_chroma = chroma
+        self._chord_frame_times = frame_times
+        self._chord_manual_changes.clear()
+        self._chord_manual_removals.clear()
+        self._chord_header.set_beat_dur(60.0 / bpm)
         self._chord_results = results
         self._detected_key = key_str
         self._key_label.setText(f"Key: {key_str}")
         self._cqt_view.set_scale_pcs(key_to_scale_pcs(key_str))
         self._cqt_view.set_chord_results(results)
         self._chord_header.set_chord_results(results)
+        self._chord_header.set_confirmed_start_times(self._confirmed_chord_start_times())
+        self._chroma_strip.set_chroma_data(chroma, frame_times)
         self._update_chord_header()
-        self._controls.set_progress(100, f"Chords done — {len(results)} changes")
+        n_pos = self._chord_model.n_positive()
+        n_neg = self._chord_model.n_negative()
+        model_note = f"  [model: {n_pos}+ {n_neg}-]" if n_pos + n_neg else ""
+        self._controls.set_progress(100, f"Chords done - {len(results)} changes{model_note}")
 
-    # ── View mode ───────────────────────────────────────────────────────
+    # â”€â”€ View mode â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€ Chord model interactions â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+    def _beat_idx_from_time(self, t: float) -> int:
+        bpm = self._controls.bpm()
+        beat_dur = 60.0 / max(bpm, 1.0)
+        return round(t / beat_dur)
+
+    def _on_chord_change_added(self, t: float) -> None:
+        """User left-clicked: force a chord boundary here + positive training sample."""
+        if not self._raw_beats:
+            return
+        beat_idx = self._beat_idx_from_time(t)
+        self._chord_manual_removals.discard(beat_idx)
+        self._chord_manual_changes.add(beat_idx)
+        energy, flux = self._beat_features.get(beat_idx, (1.0, 1.0))
+        self._chord_model.add_positive(energy, flux)
+        self._reapply_chord_model()
+        n_pos = self._chord_model.n_positive()
+        n_neg = self._chord_model.n_negative()
+        self._status_bar.showMessage(
+            f"Chord boundary added at beat {beat_idx}  "
+            f"[model: {n_pos}+ {n_neg}-  {len(self._chord_results)} spans]")
+
+    def _on_chord_change_removed(self, t: float) -> None:
+        """User right-clicked: remove chord boundary here + negative training sample."""
+        if not self._raw_beats:
+            return
+        beat_idx = self._beat_idx_from_time(t)
+        self._chord_manual_changes.discard(beat_idx)
+        self._chord_manual_removals.add(beat_idx)
+        energy, flux = self._beat_features.get(beat_idx, (0.0, 0.0))
+        self._chord_model.add_negative(energy, flux)
+        self._reapply_chord_model()
+        n_pos = self._chord_model.n_positive()
+        n_neg = self._chord_model.n_negative()
+        self._status_bar.showMessage(
+            f"Chord boundary removed at beat {beat_idx}  "
+            f"[model: {n_pos}+ {n_neg}-  {len(self._chord_results)} spans]")
+
+    def _reapply_chord_model(self) -> None:
+        """Re-collapse raw beats using current model + manual overrides."""
+        if not self._raw_beats:
+            return
+        bpm = self._controls.bpm()
+        beats_per_bar = self._controls.beats_per_bar()
+        beat_dur = 60.0 / max(bpm, 1.0)
+        results = collapse_chords(
+            self._raw_beats,
+            self._beat_features,
+            beat_dur,
+            self._chord_duration,
+            beats_per_bar,
+            model=self._chord_model,
+            threshold=0.5,
+            manual_changes=self._chord_manual_changes,
+            manual_removals=self._chord_manual_removals,
+        )
+        self._chord_results = results
+        self._cqt_view.set_chord_results(results)
+        self._chord_header.set_chord_results(results)
+        self._chord_header.set_confirmed_start_times(self._confirmed_chord_start_times())
+        self._update_chord_header()
+
+    def _confirmed_chord_start_times(self) -> set[float]:
+        """Return span start times corresponding to user-forced boundaries."""
+        if not self._chord_results:
+            return set()
+        beat_dur = 60.0 / max(self._controls.bpm(), 1.0)
+        manual_times = {idx * beat_dur for idx in self._chord_manual_changes}
+        start_times = {row[5] for row in self._chord_results}
+        return {t for t in start_times if any(abs(t - mt) <= 0.001 for mt in manual_times)}
+
 
     def _on_view_mode_changed(self, mode: str) -> None:
         self._cqt_view.set_view_mode(mode)
@@ -586,7 +702,7 @@ class MainWindow(QMainWindow):
             self._status_bar.showMessage(
                 f"Accepted {accepted_pitches} {item_label} and {accepted_onsets} onset recommendations")
 
-    # ── Cleanup ───────────────────────────────────────────────────────────
+    # â”€â”€ Cleanup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def closeEvent(self, event) -> None:
         if self._player:

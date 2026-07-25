@@ -8,7 +8,7 @@ and pitch detection (all off the GUI thread).
 from PySide6.QtCore import QThread, Signal
 
 from core.audio_engine import AudioMarkers, TimeGrid
-from core.chord_analysis import analyze_chords
+from core.chord_analysis import analyze_chords, collapse_chords
 
 
 class LoadWorker(QThread):
@@ -44,7 +44,7 @@ class ChordWorker(QThread):
     """Run chord analysis on one or more stem files."""
 
     progress = Signal(int, str)
-    finished_ok = Signal(str, list)   # (key_str, results)
+    finished_ok = Signal(str, list, list, object, object, object)  # (key_str, results, raw_beats, beat_features, chroma, frame_times)
     error = Signal(str)
 
     def __init__(self, wav_paths: list[str], bpm: float, beats_per_bar: int,
@@ -57,12 +57,16 @@ class ChordWorker(QThread):
 
     def run(self) -> None:
         try:
-            key_str, results = analyze_chords(
+            key_str, raw_beats, beat_features, duration, chroma, frame_times = analyze_chords(
                 self.wav_paths, self.bpm, self.beats_per_bar,
                 self.chord_mode,
                 progress_callback=lambda p, m: self.progress.emit(p, m),
             )
-            self.finished_ok.emit(key_str, results)
+            beat_dur = 60.0 / self.bpm
+            results = collapse_chords(
+                raw_beats, beat_features, beat_dur, duration, self.beats_per_bar,
+            )
+            self.finished_ok.emit(key_str, results, raw_beats, beat_features, chroma, frame_times)
         except Exception as exc:
             self.error.emit(str(exc))
 
