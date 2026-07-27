@@ -27,7 +27,6 @@ _CHORD_TYPES: dict[str, np.ndarray] = {
     "dim": np.array([1, 0, 0, 1, 0, 0, 1, 0, 0, 0, 0, 0], dtype=float),
     "aug": np.array([1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], dtype=float),
     "sus4": np.array([1, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0], dtype=float),
-    "sus2": np.array([1, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0], dtype=float),
 }
 
 _CHORD_INTERVALS: dict[str, list[int]] = {
@@ -39,7 +38,6 @@ _CHORD_INTERVALS: dict[str, list[int]] = {
     "dim": [0, 3, 6],
     "aug": [0, 4, 8],
     "sus4": [0, 5, 7],
-    "sus2": [0, 2, 7],
 }
 
 _NOTE_TO_PC = {
@@ -74,8 +72,28 @@ def detect_chord(
     diatonic_bias: float = 0.10,
     chord_mode: str = "full",
 ) -> tuple[str, float]:
+    candidates = detect_chord_candidates(
+        chroma_vector,
+        diatonic_scale_pcs=diatonic_scale_pcs,
+        diatonic_bias=diatonic_bias,
+        chord_mode=chord_mode,
+    )
+    if not candidates:
+        return "N.C.", 0.0
+    best_name, _best_score, best_conf = candidates[0]
+    return best_name, best_conf
+
+
+def detect_chord_candidates(
+    chroma_vector: np.ndarray,
+    diatonic_scale_pcs: set[int] | None = None,
+    diatonic_bias: float = 0.10,
+    chord_mode: str = "full",
+) -> list[tuple[str, float, float]]:
+    """Return ranked chord candidates as (name, score, confidence)."""
     qualities = ["", "m"] if chord_mode == "simple" else list(_CHORD_TYPES.keys())
-    best_score, best_name = -np.inf, "N.C."
+    scored: list[tuple[str, float]] = []
+
     for quality in qualities:
         template = _CHORD_TYPES[quality]
         for root in range(12):
@@ -86,10 +104,14 @@ def detect_chord(
                 in_scale = len(tones) - out_of_scale
                 score += diatonic_bias * (in_scale / max(1, len(tones)))
                 score -= diatonic_bias * out_of_scale
-            if score > best_score:
-                best_score, best_name = score, f"{_PITCH_NAMES[root]}{quality}"
-    confidence = max(0.0, min(1.0, (best_score + 1.0) / 2.0))
-    return best_name, confidence
+            scored.append((f"{_PITCH_NAMES[root]}{quality}", float(score)))
+
+    scored.sort(key=lambda x: x[1], reverse=True)
+    ranked: list[tuple[str, float, float]] = []
+    for name, score in scored:
+        confidence = max(0.0, min(1.0, (score + 1.0) / 2.0))
+        ranked.append((name, score, confidence))
+    return ranked
 
 
 def chord_to_piano_notes(chord: str) -> list[int]:

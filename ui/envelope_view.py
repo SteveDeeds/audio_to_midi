@@ -149,22 +149,24 @@ class EnvelopeView(QGraphicsView):
         # Reserve top strip for labels (scene Y 1.0..1.15)
         label_y = 1.08   # scene Y for label text placement
 
-        # ── 16th-note grid: ticks + labels ────────────────────────────────
-        sixteenth_dur = g.beat_dur / 4.0
-        first_16th = int(t_start / sixteenth_dur)
-        last_16th = int(t_end / sixteenth_dur) + 1
+        # ── Note-duration grid: ticks + labels ─────────────────────────────
+        step_dur = float(m.current_grid_duration()) if m else 0.0
+        if step_dur <= 0.0:
+            step_dur = g.beat_dur / 4.0
+        steps_per_beat = max(1, int(round(g.beat_dur / step_dur)))
+        steps_per_bar = max(1, int(g.beats_per_bar) * steps_per_beat)
 
-        for idx in range(first_16th, last_16th + 1):
-            t = idx * sixteenth_dur
+        first_step = int(t_start / step_dur)
+        last_step = int(t_end / step_dur) + 1
+
+        for idx in range(first_step, last_step + 1):
+            t = idx * step_dur
             if t < t_start or t > t_end:
                 continue
 
-            # Which beat/bar does this 16th belong to?
-            beat_idx_in_bar = (idx % (g.beats_per_bar * 4)) // 4  # 0-based beat
-            sub = idx % 4  # 0 = beat, 1-3 = 16th subdivisions
-
-            is_bar = (beat_idx_in_bar == 0 and sub == 0)
-            is_beat = (sub == 0)
+            # Determine whether this tick lands on a beat or bar.
+            is_bar = (idx % steps_per_bar == 0)
+            is_beat = (idx % steps_per_beat == 0)
 
             # Grid line
             if is_bar:
@@ -207,7 +209,7 @@ class EnvelopeView(QGraphicsView):
                 lbl.setPos(t, label_y)
                 self._tick_labels.append(lbl)
             else:
-                # 16th tick label: small dot or thin tick mark only
+                # Subdivision tick label: thin tick mark only.
                 tick_line = self._scene.addLine(
                     QLineF(t, 1.0, t, 1.04),
                     QPen(SIXTEENTH_LABEL_COLOR))

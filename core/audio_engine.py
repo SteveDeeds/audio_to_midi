@@ -109,7 +109,7 @@ class AudioMarkers:
     """Holds raw audio, all detected PNCPs with strengths, and a filtered view."""
 
     NOTE_DURATION_OPTIONS: dict[str, float] = {
-        "1/4": 1.0, "1/8": 0.5, "1/16": 0.25, "1/32": 0.125,
+        "1/2": 2.0, "1/8": 0.5, "1/16": 0.25,
     }
     DEFAULT_DURATION = "1/16"
     MODEL_PROFILE_DIR = "model_profiles"
@@ -375,6 +375,10 @@ class AudioMarkers:
             self._extract_candidate_features(grid)
         self._activate_candidates(onset_thresh, chroma_thresh)
 
+    def current_grid_duration(self) -> float:
+        """Return the active note-duration grid in seconds."""
+        return float(self._current_min_dur_sec)
+
     def _extract_candidate_features(self, grid):
         cand_times = np.arange(grid, self.duration, grid)
         self._candidate_raw_times = [float(t) for t in cand_times]
@@ -437,7 +441,7 @@ class AudioMarkers:
         Args:
             bpm: beats per minute
             beats_per_bar: numerator of time signature (e.g., 4 for 4/4)
-            duration_str: duration selection ("1/4", "1/8", "1/16", "1/32")
+            duration_str: duration selection ("1/2", "1/8", "1/16")
         
         Returns:
             duration of each beat slice in seconds

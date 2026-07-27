@@ -17,7 +17,12 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
 
 from core.audio_engine import AudioMarkers
-from core.chord_analysis import key_to_scale_pcs, chord_to_piano_notes, collapse_chords
+from core.chord_analysis import (
+    key_to_scale_pcs,
+    chord_to_piano_notes,
+    collapse_chords,
+    detect_chord_candidates,
+)
 from core.chord_change_model import ChordChangeModel
 from core.midi_export import build_midi
 from core.playback import MidiPlayback
@@ -26,7 +31,6 @@ from ui.cqt_view import CQTGraphicsView
 from ui.chroma_strip import ChromaStripWidget
 from ui.envelope_view import EnvelopeView
 from ui.controls import ControlPanel
-from ui.chord_stem_dialog import ChordStemDialog
 from ui.chord_header import ChordHeaderWidget
 from ui.styles import QSS
 
@@ -55,9 +59,13 @@ class MainWindow(QMainWindow):
         self._chord_duration: float = 0.0
         self._chord_manual_changes: set[int] = set()
         self._chord_manual_removals: set[int] = set()
+        self._chord_manual_overrides: dict[int, tuple[str, float]] = {}
         self._chord_model: ChordChangeModel = ChordChangeModel()
         self._chord_chroma = None
         self._chord_frame_times = None
+        self._chord_candidate_conf_threshold: float = 0.58
+        self._chord_candidate_score_delta: float = 0.12
+        self._preserve_chords_on_next_load: bool = False
         self._playback_start_time: float = 0.0  # Wall clock time when playback started
         self._playback_start_t: float = 0.0     # Audio time when playback started
 
@@ -175,9 +183,13 @@ class MainWindow(QMainWindow):
 
     # â”€â”€ Load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    def _on_load(self, wav_path: str, bpm: float, beats_per_bar: int) -> None:
+    def _on_load(self, wav_path: str, bpm: float, beats_per_bar: int,
+                 preserve_chords: bool = False) -> None:
         if self._load_worker and self._load_worker.isRunning():
             return
+        self._preserve_chords_on_next_load = bool(preserve_chords)
+        if not self._preserve_chords_on_next_load:
+            self._clear_chord_analysis_state()
         self._controls.set_loaded(False)
         self._controls.set_progress(1, "Loading â€¦")
 
@@ -194,14 +206,31 @@ class MainWindow(QMainWindow):
 
     def _on_load_done(self, markers: AudioMarkers) -> None:
         self._markers = markers
-        self._detected_key = markers.detected_key
+        keep_chords = self._preserve_chords_on_next_load and bool(self._chord_results)
+        self._preserve_chords_on_next_load = False
+
+        if keep_chords:
+            scale_pcs = key_to_scale_pcs(self._detected_key)
+        else:
+            self._detected_key = markers.detected_key
+            scale_pcs = key_to_scale_pcs(self._detected_key)
+
         self._key_label.setText(f"Key: {self._detected_key}")
-        self._chord_chroma = None
-        self._chord_frame_times = None
-        self._chroma_strip.set_chroma_data(None, None)
-        scale_pcs = key_to_scale_pcs(self._detected_key)
         self._cqt_view.set_markers(markers, scale_pcs)
         self._envelope_view.set_markers(markers)
+
+        if keep_chords:
+            self._cqt_view.set_chord_results(self._chord_results)
+            self._chord_header.set_beat_dur(60.0 / max(self._controls.bpm(), 1.0))
+            self._chord_header.set_chord_results(self._chord_results)
+            self._chord_header.set_confirmed_start_times(self._confirmed_chord_start_times())
+            self._chroma_strip.set_chroma_data(self._chord_chroma, self._chord_frame_times)
+        else:
+            self._cqt_view.set_chord_results([])
+            self._chord_header.set_chord_results([])
+            self._chord_header.set_confirmed_start_times(set())
+            self._chroma_strip.set_chroma_data(None, None)
+
         self._controls.set_loaded(True)
         self._controls.set_progress(100, "Ready")
         self._bar_label.setText(
@@ -225,7 +254,29 @@ class MainWindow(QMainWindow):
             return
         bpm = self._controls.bpm()
         bpb = self._controls.beats_per_bar()
-        self._on_load(path, bpm, bpb)
+        self._on_load(path, bpm, bpb, preserve_chords=True)
+
+    def _clear_chord_analysis_state(self) -> None:
+        self._chord_results = []
+        self._raw_beats = []
+        self._beat_features = {}
+        self._chord_duration = 0.0
+        self._chord_chroma = None
+        self._chord_frame_times = None
+        self._chord_manual_changes.clear()
+        self._chord_manual_removals.clear()
+        self._chord_manual_overrides.clear()
+
+    def _is_likely_percussive_stem(self, path: str) -> bool:
+        name = os.path.basename(path).lower()
+        tokens = (
+            "drum", "drums", "perc", "percussion", "kick", "snare", "hat",
+            "hihat", "hi-hat", "cymbal", "tom", "clap", "shaker", "tamb",
+        )
+        return any(tok in name for tok in tokens)
+
+    def _pitched_stem_paths(self, paths: list[str]) -> list[str]:
+        return [p for p in paths if not self._is_likely_percussive_stem(p)]
 
     # â”€â”€ Duration / Sensitivity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -446,7 +497,7 @@ class MainWindow(QMainWindow):
         if mode == "Percussive" and midi:
             blocks = self._markers.get_cached_drum_hits(t_start, t_end)
         elif midi:
-            blocks = self._markers.get_cached_block_pitches(t_start, t_end)
+            blocks = self._cqt_view.visible_recommendation_rows(t_start, t_end)
         else:
             blocks = []
         
@@ -558,12 +609,9 @@ class MainWindow(QMainWindow):
         if not all_stems:
             return
 
-        dlg = ChordStemDialog(all_stems, self)
-        if dlg.exec() != ChordStemDialog.DialogCode.Accepted:
-            return
-        wavs = dlg.selected_paths()
-        if not wavs:
-            return
+        pitched_stems = self._pitched_stem_paths(all_stems)
+        wavs = pitched_stems if pitched_stems else list(all_stems)
+        skipped = max(0, len(all_stems) - len(wavs))
 
         self._controls.set_progress(0, "Analyzing chords â€¦")
         self._chord_worker = ChordWorker(
@@ -573,6 +621,10 @@ class MainWindow(QMainWindow):
         self._chord_worker.error.connect(
             lambda msg: QMessageBox.critical(self, "Chord Error", msg))
         self._chord_worker.start()
+        self._status_bar.showMessage(
+            f"Analyzing chords from {len(wavs)} pitched stem(s)"
+            + (f" (skipped {skipped} percussive stem(s))" if skipped else "")
+        )
 
     def _on_chords_done(self, key_str: str, results: list,
                         raw_beats: list, beat_features: object,
@@ -585,6 +637,7 @@ class MainWindow(QMainWindow):
         self._chord_frame_times = frame_times
         self._chord_manual_changes.clear()
         self._chord_manual_removals.clear()
+        self._chord_manual_overrides.clear()
         self._chord_header.set_beat_dur(60.0 / bpm)
         self._chord_results = results
         self._detected_key = key_str
@@ -608,11 +661,84 @@ class MainWindow(QMainWindow):
         beat_dur = 60.0 / max(bpm, 1.0)
         return round(t / beat_dur)
 
+    def _beat_chroma(self, beat_idx: int) -> np.ndarray | None:
+        if self._chord_chroma is None or self._chord_frame_times is None:
+            return None
+        bpm = self._controls.bpm()
+        beat_dur = 60.0 / max(bpm, 1.0)
+        t0 = float(beat_idx) * beat_dur
+        t1 = t0 + beat_dur
+        frame_times = np.asarray(self._chord_frame_times)
+        chroma = np.asarray(self._chord_chroma)
+        mask = (frame_times >= t0) & (frame_times < t1)
+        if not np.any(mask):
+            return None
+        return np.mean(chroma[:, mask], axis=1)
+
+    def _likely_chord_candidates(self, beat_idx: int) -> list[tuple[str, float, float]]:
+        beat_chroma = self._beat_chroma(beat_idx)
+        if beat_chroma is None:
+            return []
+        candidates = detect_chord_candidates(
+            beat_chroma,
+            diatonic_scale_pcs=key_to_scale_pcs(self._detected_key),
+            diatonic_bias=0.10,
+            chord_mode="full",
+        )
+        if not candidates:
+            return []
+
+        best_score = float(candidates[0][1])
+        likely = [
+            c for c in candidates
+            if (float(c[2]) >= self._chord_candidate_conf_threshold)
+            and ((best_score - float(c[1])) <= self._chord_candidate_score_delta)
+        ]
+        if likely:
+            return likely
+        return [candidates[0]]
+
     def _on_chord_change_added(self, t: float) -> None:
-        """User left-clicked: force a chord boundary here + positive training sample."""
+        """User left-clicked: choose a likely chord override for this beat."""
         if not self._raw_beats:
             return
         beat_idx = self._beat_idx_from_time(t)
+
+        candidates = self._likely_chord_candidates(beat_idx)
+        if not candidates:
+            self._status_bar.showMessage(f"No chord candidates available at beat {beat_idx}")
+            return
+
+        option_labels = [
+            f"{name} ({conf * 100.0:.0f}%)"
+            for name, _score, conf in candidates
+        ]
+        clear_label = "Clear manual chord override"
+        options = list(option_labels)
+        has_override = beat_idx in self._chord_manual_overrides
+        if has_override:
+            options.append(clear_label)
+
+        choice, ok = QInputDialog.getItem(
+            self,
+            "Choose Chord",
+            f"Beat {beat_idx + 1}: select a likely chord",
+            options,
+            0,
+            False,
+        )
+        if not ok:
+            return
+
+        if has_override and choice == clear_label:
+            self._chord_manual_overrides.pop(beat_idx, None)
+            self._reapply_chord_model()
+            self._status_bar.showMessage(f"Cleared manual chord override at beat {beat_idx}")
+            return
+
+        choice_idx = options.index(choice)
+        chord_name, _score, conf = candidates[choice_idx]
+        self._chord_manual_overrides[beat_idx] = (str(chord_name), float(conf))
         self._chord_manual_removals.discard(beat_idx)
         self._chord_manual_changes.add(beat_idx)
         energy, flux = self._beat_features.get(beat_idx, (1.0, 1.0))
@@ -621,7 +747,7 @@ class MainWindow(QMainWindow):
         n_pos = self._chord_model.n_positive()
         n_neg = self._chord_model.n_negative()
         self._status_bar.showMessage(
-            f"Chord boundary added at beat {beat_idx}  "
+            f"Chord set to {chord_name} at beat {beat_idx}  "
             f"[model: {n_pos}+ {n_neg}-  {len(self._chord_results)} spans]")
 
     def _on_chord_change_removed(self, t: float) -> None:
@@ -629,6 +755,7 @@ class MainWindow(QMainWindow):
         if not self._raw_beats:
             return
         beat_idx = self._beat_idx_from_time(t)
+        removed_override = self._chord_manual_overrides.pop(beat_idx, None)
         self._chord_manual_changes.discard(beat_idx)
         self._chord_manual_removals.add(beat_idx)
         energy, flux = self._beat_features.get(beat_idx, (0.0, 0.0))
@@ -636,8 +763,10 @@ class MainWindow(QMainWindow):
         self._reapply_chord_model()
         n_pos = self._chord_model.n_positive()
         n_neg = self._chord_model.n_negative()
+        override_note = " + override cleared" if removed_override is not None else ""
         self._status_bar.showMessage(
             f"Chord boundary removed at beat {beat_idx}  "
+            f"{override_note}"
             f"[model: {n_pos}+ {n_neg}-  {len(self._chord_results)} spans]")
 
     def _reapply_chord_model(self) -> None:
@@ -647,8 +776,18 @@ class MainWindow(QMainWindow):
         bpm = self._controls.bpm()
         beats_per_bar = self._controls.beats_per_bar()
         beat_dur = 60.0 / max(bpm, 1.0)
+
+        adjusted_raw_beats = []
+        for beat_idx, t0, chord_name, conf in self._raw_beats:
+            override = self._chord_manual_overrides.get(int(beat_idx))
+            if override is not None:
+                ov_name, ov_conf = override
+                adjusted_raw_beats.append((beat_idx, t0, ov_name, float(ov_conf)))
+            else:
+                adjusted_raw_beats.append((beat_idx, t0, chord_name, conf))
+
         results = collapse_chords(
-            self._raw_beats,
+            adjusted_raw_beats,
             self._beat_features,
             beat_dur,
             self._chord_duration,

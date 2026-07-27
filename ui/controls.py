@@ -24,7 +24,7 @@ class ControlPanel(QWidget):
     # Signals
     load_requested = Signal(str, float, int)   # (wav_path, bpm, beats_per_bar)
     stem_changed = Signal(str)                  # new stem path
-    duration_changed = Signal(str)              # "1/4", "1/8", "1/16", "1/32"
+    duration_changed = Signal(str)              # "1/2", "1/8", "1/16"
     polyphony_changed = Signal(int)              # max simultaneous notes (1–10)
     mode_changed = Signal(str)                  # "Pitched" or "Percussive"
     play_midi_requested = Signal()
@@ -137,7 +137,7 @@ class ControlPanel(QWidget):
         dur_grp = QGroupBox("Note duration")
         dg = QHBoxLayout(dur_grp)
         self._dur_group = QButtonGroup(self)
-        for label in ["1/4", "1/8", "1/16", "1/32"]:
+        for label in ["1/2", "1/8", "1/16"]:
             rb = QRadioButton(label)
             if label == "1/16":
                 rb.setChecked(True)

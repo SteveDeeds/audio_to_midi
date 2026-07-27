@@ -14,7 +14,7 @@ class ChordHeaderWidget(QWidget):
     """Thin horizontal bar that draws chord names aligned to time positions."""
 
     # Emitted with the audio time (seconds) of the click
-    chord_change_added = Signal(float)    # left-click: force a chord boundary
+    chord_change_added = Signal(float)    # left-click: choose/override chord at beat
     chord_change_removed = Signal(float)  # right-click: remove a chord boundary
 
     def __init__(self, parent=None):

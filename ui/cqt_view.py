@@ -392,11 +392,29 @@ class CQTGraphicsView(QGraphicsView):
         if t1 <= t_start or t0 >= t_end:
             return False
 
-        allowed_pcs = self._get_colored_pcs(t_start, t_end)
-        if allowed_pcs is None:
-            # No gray mode filtering active (shouldn't happen, but show all as fallback)
+        midi_pc = int(midi) % 12
+
+        if self._view_mode == "Gray off-chord":
+            if self._chord_results:
+                # Use only chord tones active during this note block.
+                chord_pcs: set[int] = set()
+                for row in self._chord_results:
+                    _, _, _, chord_name, _, ct0, ct1 = row
+                    if ct1 <= t0 or ct0 >= t1:
+                        continue
+                    notes = chord_to_piano_notes(chord_name)
+                    chord_pcs.update(int(n) % 12 for n in notes)
+                if chord_pcs:
+                    return midi_pc in chord_pcs
+            # Fall back to scale when chord coverage is missing.
+            if self._scale_pcs:
+                return midi_pc in self._scale_pcs
             return True
-        return (int(midi) % 12) in allowed_pcs
+
+        # Default: Gray off-scale
+        if self._scale_pcs:
+            return midi_pc in self._scale_pcs
+        return True
 
     def visible_recommendation_rows(self, t_start: float, t_end: float) -> list[tuple]:
         """Return the visible recommendation rows using the current gray mode."""
@@ -517,19 +535,22 @@ class CQTGraphicsView(QGraphicsView):
             self._cqt_pixmap_item.setTransform(transform)
             self._cqt_pixmap_item.setZValue(1)
 
-        # Minimum/beat/bar grid (16th-note minimum grid)
-        sixteenth_dur = self._grid.beat_dur / 4.0
-        first_16th = int(t_start / sixteenth_dur)
-        last_16th = int(t_end / sixteenth_dur) + 1
-        for idx in range(first_16th, last_16th + 1):
-            t = idx * sixteenth_dur
+        # Minimum/beat/bar grid using active note-duration spacing.
+        step_dur = float(self._markers.current_grid_duration()) if self._markers else 0.0
+        if step_dur <= 0.0:
+            step_dur = self._grid.beat_dur / 4.0
+        steps_per_beat = max(1, int(round(self._grid.beat_dur / step_dur)))
+        steps_per_bar = max(1, int(self._grid.beats_per_bar) * steps_per_beat)
+
+        first_step = int(t_start / step_dur)
+        last_step = int(t_end / step_dur) + 1
+        for idx in range(first_step, last_step + 1):
+            t = idx * step_dur
             if t < t_start or t > t_end:
                 continue
 
-            beat_idx_in_bar = (idx % (self._grid.beats_per_bar * 4)) // 4
-            sub = idx % 4
-            is_bar = (beat_idx_in_bar == 0 and sub == 0)
-            is_beat = (sub == 0)
+            is_bar = (idx % steps_per_bar == 0)
+            is_beat = (idx % steps_per_beat == 0)
 
             if is_bar:
                 pen = QPen(BAR_LINE_COLOR)
