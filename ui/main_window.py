@@ -13,7 +13,7 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QSplitter, QLabel, QStatusBar, QFileDialog, QMessageBox, QInputDialog,
 )
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QTimer, QThread
 from PySide6.QtGui import QFont
 
 from core.audio_engine import AudioMarkers
@@ -181,12 +181,39 @@ class MainWindow(QMainWindow):
         self._playback_timer.setInterval(30)  # ~33 Hz for smooth playhead
         self._playback_timer.timeout.connect(self._on_playback_tick)
 
+    def _dispose_finished_worker(self, worker_attr: str) -> None:
+        worker = getattr(self, worker_attr)
+        if worker is None:
+            return
+        if worker.isRunning():
+            return
+        try:
+            worker.disconnect()
+        except Exception:
+            pass
+        worker.deleteLater()
+        setattr(self, worker_attr, None)
+
+    def _stop_worker(self, worker: QThread | None, timeout_ms: int = 2000) -> None:
+        if worker is None:
+            return
+        try:
+            if worker.isRunning():
+                worker.requestInterruption()
+                worker.quit()
+                worker.wait(timeout_ms)
+            worker.disconnect()
+        except Exception:
+            pass
+        worker.deleteLater()
+
     # â”€â”€ Load â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_load(self, wav_path: str, bpm: float, beats_per_bar: int,
                  preserve_chords: bool = False) -> None:
         if self._load_worker and self._load_worker.isRunning():
             return
+        self._dispose_finished_worker("_load_worker")
         self._preserve_chords_on_next_load = bool(preserve_chords)
         if not self._preserve_chords_on_next_load:
             self._clear_chord_analysis_state()
@@ -435,32 +462,26 @@ class MainWindow(QMainWindow):
     def _on_bar_changed_from_envelope(self, bar: int) -> None:
         self._bar_label.setText(
             f"Bar {bar}  ({self._envelope_view.zoom_bars}-bar view)")
-        self._cqt_view._current_bar = bar
-        self._cqt_view._zoom_bars = self._envelope_view.zoom_bars
-        self._cqt_view.refresh()
+        self._cqt_view.sync_view(bar, self._envelope_view.zoom_bars)
         self._update_chord_header()
         self._pitch_timer.start()
 
     def _on_zoom_from_cqt(self, zoom_bars: int) -> None:
-        self._envelope_view._zoom_bars = zoom_bars
-        self._envelope_view._current_bar = self._cqt_view._current_bar
-        self._envelope_view.refresh()
+        self._envelope_view.sync_view(self._cqt_view.current_bar, zoom_bars)
         self._bar_label.setText(
-            f"Bar {self._cqt_view._current_bar}  ({zoom_bars}-bar view)")
+            f"Bar {self._cqt_view.current_bar}  ({zoom_bars}-bar view)")
         self._update_chord_header()
         self._pitch_timer.start()
 
     def _on_zoom_from_envelope(self, zoom_bars: int) -> None:
-        self._cqt_view._zoom_bars = zoom_bars
-        self._cqt_view._current_bar = self._envelope_view._current_bar
-        self._cqt_view.refresh()
+        self._cqt_view.sync_view(self._envelope_view.current_bar, zoom_bars)
         self._bar_label.setText(
-            f"Bar {self._envelope_view._current_bar}  ({zoom_bars}-bar view)")
+            f"Bar {self._envelope_view.current_bar}  ({zoom_bars}-bar view)")
         self._update_chord_header()
         self._pitch_timer.start()
 
     def _update_chord_header(self) -> None:
-        t_start, t_end = self._cqt_view._time_window()
+        t_start, t_end = self._cqt_view.time_window()
         self._chord_header.set_time_window(t_start, t_end)
         self._chroma_strip.set_time_window(t_start, t_end)
 
@@ -471,7 +492,8 @@ class MainWindow(QMainWindow):
             return
         if self._pitch_worker and self._pitch_worker.isRunning():
             return
-        t_start, t_end = self._cqt_view._time_window()
+        self._dispose_finished_worker("_pitch_worker")
+        t_start, t_end = self._cqt_view.time_window()
         self._pitch_worker = PitchWorker(self._markers, t_start, t_end)
         self._pitch_worker.finished_ok.connect(self._on_pitches_ready)
         self._pitch_worker.error.connect(
@@ -489,7 +511,7 @@ class MainWindow(QMainWindow):
         if self._player is None:
             self._player = MidiPlayback()
 
-        t_start, t_end = self._cqt_view._time_window()
+        t_start, t_end = self._cqt_view.time_window()
         
         mode = self._controls.get_mode()
         
@@ -605,6 +627,7 @@ class MainWindow(QMainWindow):
     def _on_analyze_chords(self) -> None:
         if self._chord_worker and self._chord_worker.isRunning():
             return
+        self._dispose_finished_worker("_chord_worker")
         all_stems = self._controls.get_all_stem_paths()
         if not all_stems:
             return
@@ -827,7 +850,7 @@ class MainWindow(QMainWindow):
         if not self._markers:
             return
 
-        t_start, t_end = self._cqt_view._time_window()
+        t_start, t_end = self._cqt_view.time_window()
         visible_pitch_rows = self._cqt_view.visible_recommendation_rows(t_start, t_end)
         mode = self._controls.get_mode()
         accepted_pitches, accepted_onsets = self._markers.accept_visible_recommendations(
@@ -844,6 +867,13 @@ class MainWindow(QMainWindow):
     # â”€â”€ Cleanup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def closeEvent(self, event) -> None:
+        self._playback_timer.stop()
         if self._player:
             self._player.stop()
+        self._stop_worker(self._load_worker)
+        self._stop_worker(self._chord_worker)
+        self._stop_worker(self._pitch_worker)
+        self._load_worker = None
+        self._chord_worker = None
+        self._pitch_worker = None
         super().closeEvent(event)

@@ -10,6 +10,8 @@ ML correction models trained incrementally from user edits.
 
 import numpy as np
 
+from core.logistic_utils import sigmoid_clipped, train_binary_logistic_minmax
+
 
 class CorrectionModel:
     """Two sub-models trained incrementally from user corrections."""
@@ -50,7 +52,7 @@ class CorrectionModel:
         self._drum_training_y: list[int] = []  # Accept (1) or reject (0)
         self._drum_keys: list[str | None] = []
         self._drum_src: list[str] = []
-        self._drum_w: np.ndarray = np.zeros(7)  # Logistic regression weights + bias
+        self._drum_w: np.ndarray = np.zeros(10)  # Logistic regression weights + bias (9 features + bias)
         self._drum_norm: tuple = (np.zeros(9), np.ones(9))  # 9 percussive features
         self._drum_trained: bool = False
         self._MAX_PROTOTYPES_PER_DRUM = 3  # Cap prototypes to limit NNLS dictionary size
@@ -62,24 +64,19 @@ class CorrectionModel:
 
     @staticmethod
     def _sigmoid(x: np.ndarray) -> np.ndarray:
-        return 1.0 / (1.0 + np.exp(-np.clip(x, -50.0, 50.0)))
+        return sigmoid_clipped(x)
 
     def _retrain_binary(self, X_rows, y_rows):
-        y = np.array(y_rows, dtype=float)
-        n_features = len(X_rows[0]) if X_rows else 2
-        if (y == 0).sum() < 1 or (y == 1).sum() < 1:
-            return False, np.zeros(n_features + 1), (np.zeros(n_features), np.ones(n_features))
-        X = np.array(X_rows, dtype=float)
-        lo, hi = X.min(axis=0), X.max(axis=0)
-        rng = np.where(hi > lo, hi - lo, 1.0)
-        Xn = (X - lo) / rng
-        Xb = np.column_stack([Xn, np.ones(len(Xn))])
-        w = np.zeros(n_features + 1)
-        n_iter = max(200, min(800, 40 * len(y)))
-        for _ in range(n_iter):
-            grad = Xb.T @ (self._sigmoid(Xb @ w) - y) / len(y)
-            w -= grad
-        return True, w, (lo, rng)
+        if not X_rows:
+            return False, np.zeros(3), (np.zeros(2), np.ones(2))
+        return train_binary_logistic_minmax(
+            X_rows,
+            y_rows,
+            learning_rate=1.0,
+            n_iter_min=200,
+            n_iter_max=800,
+            n_iter_factor=40,
+        )
 
     def _append_candidate_sample(self, feat: list[float], keep: bool,
                                  candidate_key=None, source: str = "user") -> None:
@@ -102,6 +99,53 @@ class CorrectionModel:
             self._cand_y.append(y_val)
             self._cand_keys.append(candidate_key)
             self._cand_src.append(source)
+
+    @staticmethod
+    def _map_candidate_row(row: list[float] | tuple[float, ...]) -> list[float] | None:
+        """Map legacy candidate row shapes to the active 4-feature format."""
+        if not isinstance(row, (list, tuple)) or len(row) < 3:
+            return None
+        vals = [float(v) for v in row]
+        if len(vals) >= 5:
+            return [vals[0], vals[1], vals[2], vals[4]]
+        if len(vals) == 4:
+            return [vals[0], vals[1], vals[2], vals[3]]
+        while len(vals) < 4:
+            vals.append(0.0)
+        return vals[:4]
+
+    @classmethod
+    def candidate_rows_from_payload(cls, data: dict, user_only: bool = False) -> list[dict]:
+        """Return normalized candidate rows from new or legacy profile payloads."""
+        out: list[dict] = []
+        if "cand" in data:
+            for item in data.get("cand", []):
+                source = str(item.get("source", "user"))
+                if user_only and source != "user":
+                    continue
+                mapped = cls._map_candidate_row(item.get("row", []))
+                if mapped is None:
+                    continue
+                out.append({
+                    "row": mapped,
+                    "label": int(item.get("label", 0)),
+                    "key": item.get("key"),
+                    "source": source,
+                })
+            return out
+
+        # Backward compatibility with older saved profiles.
+        for row, label in zip(data.get("cand_X", []), data.get("cand_y", [])):
+            mapped = cls._map_candidate_row(row)
+            if mapped is None:
+                continue
+            out.append({
+                "row": mapped,
+                "label": int(label),
+                "key": None,
+                "source": "user",
+            })
+        return out
 
     def _seed_bootstrap_candidates(self) -> None:
         if self._cand_X:
@@ -531,11 +575,13 @@ class CorrectionModel:
                 "source": src,
             })
         drum_patterns = []
-        for vec, drum_midi in self._drum_patterns:
-            drum_patterns.append({
-                "vec": vec.tolist(),
-                "drum_midi": int(drum_midi),
-            })
+        for drum_midi, prototypes in self._drum_patterns_dict.items():
+            for vec, support in prototypes:
+                drum_patterns.append({
+                    "vec": vec.tolist(),
+                    "drum_midi": int(drum_midi),
+                    "support": int(max(1, support)),
+                })
         return {
             "schema": 10,
             "cand": cand_rows,
@@ -548,47 +594,13 @@ class CorrectionModel:
         if not merge:
             self.__init__()
 
-        # New schema keeps candidate samples together and tags their source.
-        if "cand" in data:
-            for item in data.get("cand", []):
-                row = item.get("row")
-                if not isinstance(row, (list, tuple)) or len(row) < 3:
-                    continue
-                vals = [float(v) for v in row]
-                if len(vals) >= 5:
-                    mapped = [vals[0], vals[1], vals[2], vals[4]]
-                elif len(vals) == 4:
-                    mapped = [vals[0], vals[1], vals[2], vals[3]]
-                else:
-                    while len(vals) < 4:
-                        vals.append(0.0)
-                    mapped = vals[:4]
-                self._append_candidate_sample(
-                    mapped,
-                    bool(int(item.get("label", 0))),
-                    candidate_key=item.get("key"),
-                    source=str(item.get("source", "user")),
-                )
-        else:
-            # Backward compatibility with older saved profiles.
-            for row, label in zip(data.get("cand_X", []), data.get("cand_y", [])):
-                if not isinstance(row, (list, tuple)) or len(row) < 3:
-                    continue
-                vals = [float(v) for v in row]
-                if len(vals) >= 5:
-                    mapped = [vals[0], vals[1], vals[2], vals[4]]
-                elif len(vals) == 4:
-                    mapped = [vals[0], vals[1], vals[2], vals[3]]
-                else:
-                    while len(vals) < 4:
-                        vals.append(0.0)
-                    mapped = vals[:4]
-                self._append_candidate_sample(
-                    mapped,
-                    bool(int(label)),
-                    candidate_key=None,
-                    source="user",
-                )
+        for item in self.candidate_rows_from_payload(data, user_only=False):
+            self._append_candidate_sample(
+                item["row"],
+                bool(int(item["label"])),
+                candidate_key=item.get("key"),
+                source=str(item.get("source", "user")),
+            )
         trained, w, norm = self._retrain_binary(self._cand_X, self._cand_y)
         self._cand_trained, self._cand_w, self._cand_norm = trained, w, norm
         for item in data.get("pitch", []):
@@ -623,4 +635,14 @@ class CorrectionModel:
                 norm = float(np.linalg.norm(vec))
                 if norm > 1e-8:
                     vec = vec / norm
-                self._drum_patterns.append((vec, drum_midi))
+                support = int(item.get("support", 1))
+                support = max(1, support)
+                drum_midi_int = int(drum_midi)
+                self._drum_patterns_dict.setdefault(drum_midi_int, []).append((vec, support))
+
+        # Keep only the strongest prototypes per drum after merges.
+        for drum_midi, prototypes in list(self._drum_patterns_dict.items()):
+            if len(prototypes) <= self._MAX_PROTOTYPES_PER_DRUM:
+                continue
+            ordered = sorted(prototypes, key=lambda item: int(item[1]), reverse=True)
+            self._drum_patterns_dict[drum_midi] = ordered[:self._MAX_PROTOTYPES_PER_DRUM]

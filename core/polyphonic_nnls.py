@@ -108,30 +108,6 @@ def solve_polyphonic_activations(cqt_matrix, dictionary_matrix):
     return H
 
 
-def extract_note_events(activation_matrix, threshold):
-    """Return note-on events as (frame_time, midi_note, velocity_gain).
-
-    frame_time is returned as frame index (float). MIDI rows are mapped to
-    [21..] by default.
-    """
-    H = np.asarray(activation_matrix, dtype=np.float32)
-    if H.ndim != 2 or H.shape[1] == 0:
-        return []
-
-    dH = np.zeros_like(H)
-    dH[:, 1:] = np.maximum(0.0, H[:, 1:] - H[:, :-1])
-
-    thr = float(max(0.0, threshold))
-    events: list[tuple[float, int, float]] = []
-    for n in range(dH.shape[0]):
-        midi_note = DEFAULT_MIN_MIDI + n
-        for t in range(dH.shape[1]):
-            gain = float(dH[n, t])
-            if gain >= thr:
-                events.append((float(t), int(midi_note), gain))
-    return events
-
-
 # ---------------------------------------------------------------------------
 # Register-aware calibration and dual-feature helpers
 # ---------------------------------------------------------------------------

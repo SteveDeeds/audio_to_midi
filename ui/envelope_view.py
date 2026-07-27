@@ -25,6 +25,7 @@ except ImportError:
     _USE_OPENGL = False
 
 from core.audio_engine import AudioMarkers, TimeGrid
+from ui.view_state import compute_time_window
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -110,6 +111,10 @@ class EnvelopeView(QGraphicsView):
         self._zoom_bars = zoom_bars
         self._rebuild_scene()
 
+    def time_window(self) -> tuple[float, float]:
+        """Public wrapper for the current visible time window."""
+        return self._time_window()
+
     @property
     def current_bar(self) -> int:
         return self._current_bar
@@ -123,12 +128,12 @@ class EnvelopeView(QGraphicsView):
     def _time_window(self) -> tuple[float, float]:
         if not self._grid or not self._markers:
             return 0.0, 1.0
-        bar_start = (self._current_bar - 1) * self._grid.bar_dur
-        t_start = bar_start - 0.5 * self._grid.bar_dur
-        t_end = t_start + self._zoom_bars * self._grid.bar_dur
-        t_start = max(0.0, t_start)
-        t_end = min(self._markers.duration, t_end)
-        return t_start, t_end
+        return compute_time_window(
+            current_bar=self._current_bar,
+            zoom_bars=self._zoom_bars,
+            bar_duration=self._grid.bar_dur,
+            total_duration=self._markers.duration,
+        )
 
     # ── Scene rebuild ─────────────────────────────────────────────────────
 

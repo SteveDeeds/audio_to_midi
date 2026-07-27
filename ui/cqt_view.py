@@ -28,6 +28,7 @@ except ImportError:
 
 from core.audio_engine import AudioMarkers, TimeGrid
 from core.chord_analysis import chord_to_piano_notes
+from ui.view_state import compute_time_window
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -310,6 +311,16 @@ class CQTGraphicsView(QGraphicsView):
             self._view_midi_lo = self._midi_lo
         self.refresh()
 
+    def sync_view(self, bar: int, zoom_bars: int) -> None:
+        """Sync current bar and zoom from another timeline view."""
+        self._current_bar = max(1, int(bar))
+        self._zoom_bars = max(1, int(zoom_bars))
+        self._rebuild_scene()
+
+    def time_window(self) -> tuple[float, float]:
+        """Public wrapper for the current visible time window."""
+        return self._time_window()
+
     @property
     def current_bar(self) -> int:
         return self._current_bar
@@ -323,12 +334,12 @@ class CQTGraphicsView(QGraphicsView):
     def _time_window(self) -> tuple[float, float]:
         if not self._grid or not self._markers:
             return 0.0, 1.0
-        bar_start = (self._current_bar - 1) * self._grid.bar_dur
-        t_start = bar_start - 0.5 * self._grid.bar_dur
-        t_end = t_start + self._zoom_bars * self._grid.bar_dur
-        t_start = max(0.0, t_start)
-        t_end = min(self._markers.duration, t_end)
-        return t_start, t_end
+        return compute_time_window(
+            current_bar=self._current_bar,
+            zoom_bars=self._zoom_bars,
+            bar_duration=self._grid.bar_dur,
+            total_duration=self._markers.duration,
+        )
 
     def _navigate_to_bar(self, bar: int) -> None:
         if not self._grid or not self._markers:

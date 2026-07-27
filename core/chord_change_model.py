@@ -27,6 +27,8 @@ import os
 
 import numpy as np
 
+from core.logistic_utils import train_binary_logistic_zscore
+
 _DEFAULT_PATH = os.path.normpath(
     os.path.join(os.path.dirname(__file__), "..", "model_profiles", "chord_model.json")
 )
@@ -119,23 +121,18 @@ class ChordChangeModel:
         y = np.array([l for _, _, l in self._samples], dtype=float)
         if len(np.unique(y)) < 2:
             return
-        # Normalise features
-        self._mu = X_raw.mean(axis=0)
-        self._sigma = X_raw.std(axis=0)
-        self._sigma[self._sigma < 1e-8] = 1.0
-        X_norm = (X_raw - self._mu) / self._sigma
-        X = np.column_stack([np.ones(len(y)), X_norm])
-        # Gradient descent with L2 regularisation
-        w = np.zeros(3)
-        lr = 0.5
-        lam = 0.01
-        for _ in range(600):
-            logits = np.clip(X @ w, -30.0, 30.0)
-            pred = 1.0 / (1.0 + np.exp(-logits))
-            grad = (X.T @ (pred - y)) / len(y)
-            grad[1:] += lam * w[1:]   # regularise weights but not bias
-            w -= lr * grad
+        trained, w, mu, sigma = train_binary_logistic_zscore(
+            X_raw,
+            y,
+            learning_rate=0.5,
+            l2_lambda=0.01,
+            n_iter=600,
+        )
+        if not trained:
+            return
         self._weights = w
+        self._mu = mu
+        self._sigma = sigma
 
     def _autosave(self) -> None:
         try:

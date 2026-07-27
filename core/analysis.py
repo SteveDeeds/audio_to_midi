@@ -17,9 +17,6 @@ CHROMA_HOP = 512
 CHROMA_SHIFT_THRESH = 0.002
 CHROMA_COMPARE_LAG = 2
 CHROMA_ENERGY_GATE_DB = 62.0
-MIN_BLOCK_SAMPLES = 512
-PITCH_WORK_SR = 4000
-PITCH_ONSET_SEC = 0.18
 
 # Overtone offsets in semitones for spectral peeling
 _SPECTRAL_PEEL_OVERTONES = [12, 19, 24, 28]
@@ -284,67 +281,6 @@ def compute_cqt(
     cqt_times = librosa.frames_to_time(
         np.arange(cqt_db.shape[1]), sr=sr, hop_length=HOP_SIZE)
     return cqt_db, cqt_sal, cqt_mag, cqt_peel_db, cqt_times, fmin_hz, cqt_hcqt_db, cqt_flux_db
-
-
-# ---------------------------------------------------------------------------
-# Pitch detection
-# ---------------------------------------------------------------------------
-
-def hz_to_midi(hz: float) -> int | None:
-    if hz <= 0:
-        return None
-    midi_f = 69 + 12 * np.log2(hz / 440.0)
-    midi_note = int(round(midi_f))
-    return midi_note if 0 <= midi_note <= 127 else None
-
-
-def detect_block_pitch(block: np.ndarray, sr: int) -> tuple[int | None, float]:
-    """pYIN pitch detection with onset-focused + full-block blending."""
-    if len(block) < MIN_BLOCK_SAMPLES:
-        return None, 0.0
-
-    work = block.astype(np.float32)
-    work_sr = int(sr)
-    if sr > PITCH_WORK_SR:
-        work = librosa.resample(work, orig_sr=sr, target_sr=PITCH_WORK_SR)
-        work_sr = PITCH_WORK_SR
-
-    if len(work) < 64:
-        return None, 0.0
-
-    def _pyin_stats(sig, frame_length):
-        local_hop = max(32, min(256, frame_length // 8))
-        f0, voiced_flag, _ = librosa.pyin(
-            sig, fmin=librosa.note_to_hz("C0"), fmax=librosa.note_to_hz("C5"),
-            sr=work_sr, hop_length=local_hop, frame_length=frame_length,
-            fill_na=None,
-        )
-        voiced = f0[np.asarray(voiced_flag, dtype=bool)]
-        voiced = voiced[~np.isnan(voiced)]
-        conf = float(len(voiced)) / max(1, len(f0))
-        return voiced, conf
-
-    onset_len = min(len(work), int(PITCH_ONSET_SEC * work_sr))
-    onset_sig = work[:max(onset_len, 1)]
-    onset_frame = int(min(2048, max(512, 2 ** int(np.floor(np.log2(max(512, len(onset_sig))))))))
-    onset_voiced, onset_conf = _pyin_stats(onset_sig, onset_frame)
-
-    full_frame = int(min(4096, max(1024, 2 ** int(np.floor(np.log2(max(1024, len(work))))))))
-    full_voiced, full_conf = _pyin_stats(work, full_frame)
-
-    if len(onset_voiced) == 0 and len(full_voiced) == 0:
-        return None, max(onset_conf, full_conf)
-    if len(onset_voiced) == 0:
-        return hz_to_midi(float(np.median(full_voiced))), full_conf
-    if len(full_voiced) == 0:
-        return hz_to_midi(float(np.median(onset_voiced))), onset_conf
-
-    onset_hz = float(np.median(onset_voiced))
-    full_hz = float(np.median(full_voiced))
-    w_on = max(0.10, onset_conf)
-    w_full = max(0.10, full_conf)
-    blend_hz = (w_on * onset_hz + w_full * full_hz) / (w_on + w_full)
-    return hz_to_midi(blend_hz), max(onset_conf, full_conf)
 
 
 # ---------------------------------------------------------------------------

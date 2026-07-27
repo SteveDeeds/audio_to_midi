@@ -1409,31 +1409,13 @@ class AudioMarkers:
             except Exception:
                 continue
 
-            if "cand" in payload:
-                for item in payload.get("cand", []):
-                    src = str(item.get("source", "user"))
-                    if src != "user":
-                        continue
-                    row = item.get("row")
-                    if not isinstance(row, (list, tuple)):
-                        continue
-                    merged_rows.append({
-                        "row": list(row),
-                        "label": int(item.get("label", 0)),
-                        "key": None,
-                        "source": "user",
-                    })
-            else:
-                # Backward-compatible path for old schema profiles.
-                for row, label in zip(payload.get("cand_X", []), payload.get("cand_y", [])):
-                    if not isinstance(row, (list, tuple)):
-                        continue
-                    merged_rows.append({
-                        "row": list(row),
-                        "label": int(label),
-                        "key": None,
-                        "source": "user",
-                    })
+            for item in self.model.candidate_rows_from_payload(payload, user_only=True):
+                merged_rows.append({
+                    "row": list(item["row"]),
+                    "label": int(item["label"]),
+                    "key": None,
+                    "source": "user",
+                })
 
             if len(merged_rows) >= max_rows:
                 break
