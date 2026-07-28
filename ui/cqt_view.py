@@ -28,7 +28,7 @@ except ImportError:
 
 from core.audio_engine import AudioMarkers, TimeGrid
 from core.chord_analysis import chord_to_piano_notes
-from ui.view_state import compute_time_window
+from ui.view_state import build_onset_pen, compute_grid_steps, compute_time_window
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -547,11 +547,12 @@ class CQTGraphicsView(QGraphicsView):
             self._cqt_pixmap_item.setZValue(1)
 
         # Minimum/beat/bar grid using active note-duration spacing.
-        step_dur = float(self._markers.current_grid_duration()) if self._markers else 0.0
-        if step_dur <= 0.0:
-            step_dur = self._grid.beat_dur / 4.0
-        steps_per_beat = max(1, int(round(self._grid.beat_dur / step_dur)))
-        steps_per_bar = max(1, int(self._grid.beats_per_bar) * steps_per_beat)
+        req_step = float(self._markers.current_grid_duration()) if self._markers else 0.0
+        step_dur, steps_per_beat, steps_per_bar = compute_grid_steps(
+            beat_duration=self._grid.beat_dur,
+            beats_per_bar=int(self._grid.beats_per_bar),
+            requested_step_duration=req_step,
+        )
 
         first_step = int(t_start / step_dur)
         last_step = int(t_end / step_dur) + 1
@@ -586,11 +587,12 @@ class CQTGraphicsView(QGraphicsView):
         # Onset markers
         visible = m.visible_onset_markers(t_start, t_end)
         for t, source in visible:
-            color = QColor(ONSET_USER_COLOR if source == "manual" else ONSET_COLOR)
-            color.setAlphaF(1.0 if source == "manual" else 0.5)
-            onset_pen = QPen(color)
-            onset_pen.setWidthF(1.5)
-            onset_pen.setCosmetic(True)
+            onset_pen = build_onset_pen(
+                source=source,
+                user_color=ONSET_USER_COLOR,
+                guess_color=ONSET_COLOR,
+                width=1.5,
+            )
             y_onset_lo = self._midi_lo - 0.5
             y_onset_hi = self._midi_hi + 0.5
             if self._current_mode == "Percussive":

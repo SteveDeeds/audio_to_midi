@@ -25,7 +25,7 @@ except ImportError:
     _USE_OPENGL = False
 
 from core.audio_engine import AudioMarkers, TimeGrid
-from ui.view_state import compute_time_window
+from ui.view_state import build_onset_pen, compute_grid_steps, compute_time_window
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 
@@ -155,11 +155,12 @@ class EnvelopeView(QGraphicsView):
         label_y = 1.08   # scene Y for label text placement
 
         # ── Note-duration grid: ticks + labels ─────────────────────────────
-        step_dur = float(m.current_grid_duration()) if m else 0.0
-        if step_dur <= 0.0:
-            step_dur = g.beat_dur / 4.0
-        steps_per_beat = max(1, int(round(g.beat_dur / step_dur)))
-        steps_per_bar = max(1, int(g.beats_per_bar) * steps_per_beat)
+        req_step = float(m.current_grid_duration()) if m else 0.0
+        step_dur, steps_per_beat, steps_per_bar = compute_grid_steps(
+            beat_duration=g.beat_dur,
+            beats_per_bar=int(g.beats_per_bar),
+            requested_step_duration=req_step,
+        )
 
         first_step = int(t_start / step_dur)
         last_step = int(t_end / step_dur) + 1
@@ -258,11 +259,12 @@ class EnvelopeView(QGraphicsView):
         # ── Onset markers ─────────────────────────────────────────────────
         visible = m.visible_onset_markers(t_start, t_end)
         for t, source in visible:
-            color = QColor(ONSET_USER_COLOR if source == "manual" else ONSET_COLOR)
-            color.setAlphaF(1.0 if source == "manual" else 0.5)
-            onset_pen = QPen(color)
-            onset_pen.setWidthF(2.0)
-            onset_pen.setCosmetic(True)
+            onset_pen = build_onset_pen(
+                source=source,
+                user_color=ONSET_USER_COLOR,
+                guess_color=ONSET_COLOR,
+                width=2.0,
+            )
             line = self._scene.addLine(QLineF(t, 0.0, t, 1.0), onset_pen)
             line.setZValue(6)
             self._onset_lines.append(line)
