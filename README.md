@@ -6,4 +6,7 @@ App Goal:
 A machine learning assisted audio to MIDI converter.
 It focus on getting human input specific to the song being worked on to train a simple model to reconize chord changes, note onsets, and pitches.
 
+Fundamental constraint:
+Models must remain lightweight enough to learn from each user edit and rerun inference on the visible notes in real time. Analysis and inference for the rest of the file can run in the background, but the edit-to-training-to-screen-update loop must stay interactive.
+
 This app acts as a bridge between Ableton live (with it's profesional warping capabilites to create exact on beat tracks) and Unreal Vocal Remover to produce stems of the parts.  This is the input to the App.  The app then produces midi that is imported into Muse Score
