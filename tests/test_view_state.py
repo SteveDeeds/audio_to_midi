@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import numpy as np
 
 from ui.cqt_view import CQTGraphicsView
+from ui.controls import ControlPanel
 from ui.main_window import MainWindow, _clicked_manual_note, _playback_mix_levels
 from ui.view_state import compute_time_window
 from core.playback import _midi_mix_messages, _stereo_audio_int16
@@ -38,7 +39,10 @@ class TestViewState(unittest.TestCase):
         window = SimpleNamespace(
             _markers=SimpleNamespace(audio=np.arange(100), sr=10),
             _player=player,
-            _controls=SimpleNamespace(get_play_mix=lambda: 25),
+            _controls=SimpleNamespace(
+                get_play_mix=lambda: 25,
+                set_playing=lambda playing: calls.append(("playing", playing)),
+            ),
             _cqt_view=SimpleNamespace(rendered_note_rows=lambda *_: list(rows)),
             _playback_timer=SimpleNamespace(start=lambda: calls.append(("timer",))),
             _playback_start_time=0.0,
@@ -55,6 +59,40 @@ class TestViewState(unittest.TestCase):
         self.assertEqual(sr, 10)
         self.assertEqual(kwargs, {"channel": 9, "midi_gain": 0.75, "audio_gain": 0.25})
         self.assertEqual(window._playback_start_t, 2.0)
+        self.assertEqual(calls[2], ("playing", True))
+
+    def test_transport_click_stops_when_playing(self) -> None:
+        calls = []
+        panel = SimpleNamespace(
+            _is_playing=True,
+            stop_requested=SimpleNamespace(emit=lambda: calls.append("stop")),
+            play_requested=SimpleNamespace(emit=lambda mix: calls.append(("play", mix))),
+            get_play_mix=lambda: 50,
+        )
+
+        ControlPanel._on_transport_clicked(panel)
+
+        self.assertEqual(calls, ["stop"])
+
+    def test_playback_completion_restores_play_state(self) -> None:
+        calls = []
+        window = SimpleNamespace(
+            _player=SimpleNamespace(is_playing=False),
+            _playback_timer=SimpleNamespace(stop=lambda: calls.append("timer stopped")),
+            _cqt_view=SimpleNamespace(
+                set_playhead_position=lambda position: calls.append(("playhead", position))
+            ),
+            _controls=SimpleNamespace(
+                set_playing=lambda playing: calls.append(("playing", playing))
+            ),
+        )
+
+        MainWindow._on_playback_tick(window)
+
+        self.assertEqual(
+            calls,
+            ["timer stopped", ("playhead", -1), ("playing", False)],
+        )
 
     def test_clicked_manual_note_selects_only_matching_added_note(self) -> None:
         rows = [

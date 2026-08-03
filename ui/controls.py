@@ -44,6 +44,7 @@ class ControlPanel(QWidget):
         self._wav_path: str | None = None
         self._stem_dir: str | None = None
         self._loaded_paths: list[str] = []
+        self._is_playing = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -170,18 +171,9 @@ class ControlPanel(QWidget):
         self._btn_play.setToolTip("Play")
         self._btn_play.setAccessibleName("Play")
         self._btn_play.setEnabled(False)
-        self._btn_play.clicked.connect(
-            lambda: self.play_requested.emit(self._play_mix_slider.value())
-        )
+        self._btn_play.clicked.connect(self._on_transport_clicked)
         row1.addWidget(self._btn_play)
         ag.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        self._btn_stop = QPushButton("Stop")
-        self._btn_stop.setEnabled(False)
-        self._btn_stop.clicked.connect(self.stop_requested.emit)
-        row2.addWidget(self._btn_stop)
-        ag.addLayout(row2)
 
         self._btn_export = QPushButton("Export MIDI")
         self._btn_export.setEnabled(False)
@@ -235,6 +227,24 @@ class ControlPanel(QWidget):
     def get_play_mix(self) -> int:
         return int(self._play_mix_slider.value())
 
+    def _on_transport_clicked(self) -> None:
+        if self._is_playing:
+            self.stop_requested.emit()
+        else:
+            self.play_requested.emit(self.get_play_mix())
+
+    def set_playing(self, playing: bool) -> None:
+        self._is_playing = bool(playing)
+        if self._is_playing:
+            icon = QStyle.StandardPixmap.SP_MediaStop
+            label = "Stop"
+        else:
+            icon = QStyle.StandardPixmap.SP_MediaPlay
+            label = "Play"
+        self._btn_play.setIcon(self.style().standardIcon(icon))
+        self._btn_play.setToolTip(label)
+        self._btn_play.setAccessibleName(label)
+
     def set_progress(self, pct: int, msg: str = "") -> None:
         self._progress.setValue(pct)
         self._progress.setFormat(f"{pct}%")
@@ -245,7 +255,6 @@ class ControlPanel(QWidget):
 
     def set_loaded(self, enabled: bool) -> None:
         self._btn_play.setEnabled(enabled)
-        self._btn_stop.setEnabled(enabled)
         self._btn_export.setEnabled(enabled)
         self._btn_save_model.setEnabled(enabled)
         self._btn_load_model.setEnabled(enabled)

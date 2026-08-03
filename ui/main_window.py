@@ -767,6 +767,7 @@ class MainWindow(QMainWindow):
             midi_gain=midi_gain,
             audio_gain=audio_gain,
         )
+        self._controls.set_playing(True)
 
     def _play(self, midi_gain: float = 1.0, audio_gain: float = 1.0) -> None:
         if not self._markers:
@@ -808,6 +809,7 @@ class MainWindow(QMainWindow):
             midi_gain=midi_gain,
             audio_gain=audio_gain,
         )
+        self._controls.set_playing(True)
 
     def _on_play_mix(self, slider_value: int) -> None:
         midi_gain, audio_gain = _playback_mix_levels(slider_value)
@@ -818,6 +820,7 @@ class MainWindow(QMainWindow):
         if not self._player or not self._player.is_playing:
             self._playback_timer.stop()
             self._cqt_view.set_playhead_position(-1)
+            self._controls.set_playing(False)
             return
         
         elapsed = time.perf_counter() - self._playback_start_time
@@ -829,6 +832,7 @@ class MainWindow(QMainWindow):
             self._player.stop()
         self._playback_timer.stop()
         self._cqt_view.set_playhead_position(-1)  # Hide playhead
+        self._controls.set_playing(False)
 
     # â”€â”€ MIDI export â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
