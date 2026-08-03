@@ -13,6 +13,28 @@ import pygame.midi
 import pygame.mixer
 
 
+MIDI_PAN_75_LEFT = 16
+AUDIO_LEFT_GAIN = 0.25
+AUDIO_RIGHT_GAIN = 1.0
+
+
+def _midi_mix_messages(channel: int, gain: float) -> tuple[tuple[int, int, int], ...]:
+    status = 0xB0 | int(channel)
+    volume = int(round(127.0 * max(0.0, min(1.0, float(gain)))))
+    return ((status, 10, MIDI_PAN_75_LEFT), (status, 7, volume))
+
+
+def _stereo_audio_int16(audio_slice: np.ndarray, gain: float) -> np.ndarray | None:
+    peak = float(np.max(np.abs(audio_slice)))
+    if peak < 1e-6:
+        return None
+    normalized = audio_slice / peak * 32767.0 * max(0.0, min(1.0, float(gain)))
+    return np.column_stack([
+        normalized * AUDIO_LEFT_GAIN,
+        normalized * AUDIO_RIGHT_GAIN,
+    ]).astype(np.int16)
+
+
 def _find_output_device() -> int:
     for i in range(pygame.midi.get_count()):
         info = pygame.midi.get_device_info(i)
@@ -28,10 +50,9 @@ class MidiPlayback:
     CHANNEL = 0
     PROGRAM = 0
     MIXER_FREQ = 44100
-
     def __init__(self) -> None:
         self._thread: threading.Thread | None = None
-        self._stop_event = threading.Event()
+        self._stop_event: threading.Event | None = None
         if not pygame.mixer.get_init():
             pygame.mixer.init(frequency=self.MIXER_FREQ, size=-16, channels=2, buffer=1024)
         pygame.midi.init()
@@ -49,31 +70,33 @@ class MidiPlayback:
 
     def play(self, blocks: list, t_start: float,
              audio_slice: np.ndarray | None = None, sr: int = 44100,
-             channel: int | None = None) -> None:
+             channel: int | None = None, midi_gain: float = 1.0,
+             audio_gain: float = 1.0) -> None:
+        previous_thread = self._thread
         self.stop()
-        self._stop_event.clear()
-        sound = self._make_sound(audio_slice, sr) if audio_slice is not None else None
         if channel is None:
             channel = self.CHANNEL
+        stop_event = threading.Event()
+        self._stop_event = stop_event
         self._thread = threading.Thread(
-            target=self._run, args=(blocks, t_start, sound, channel), daemon=True)
+            target=self._run,
+            args=(
+                blocks, t_start, audio_slice, sr, channel, stop_event,
+                previous_thread, float(midi_gain), float(audio_gain),
+            ),
+            daemon=True,
+        )
         self._thread.start()
 
     def stop(self) -> None:
-        if self._thread and self._thread.is_alive():
+        if self._stop_event is not None:
             self._stop_event.set()
-            self._thread.join(timeout=1.0)
         self._thread = None
+        self._stop_event = None
         if pygame.mixer.get_init():
             pygame.mixer.stop()
-        if self._midi_port is not None:
-            for note in range(128):
-                try:
-                    self._midi_port.note_off(note, 0, self.CHANNEL)
-                except Exception:
-                    pass
 
-    def _make_sound(self, audio_slice: np.ndarray, sr: int):
+    def _make_sound(self, audio_slice: np.ndarray, sr: int, gain: float):
         try:
             mixer_init = pygame.mixer.get_init()
             if mixer_init and mixer_init[0] != sr:
@@ -81,27 +104,36 @@ class MidiPlayback:
                 pygame.mixer.init(frequency=sr, size=-16, channels=2, buffer=1024)
             elif not mixer_init:
                 pygame.mixer.init(frequency=sr, size=-16, channels=2, buffer=1024)
-            peak = np.max(np.abs(audio_slice))
-            if peak < 1e-6:
+            stereo = _stereo_audio_int16(audio_slice, gain)
+            if stereo is None:
                 return None
-            audio_int16 = ((audio_slice / peak) * 32767).astype(np.int16)
-            stereo = np.column_stack([audio_int16, audio_int16])
             return pygame.sndarray.make_sound(stereo)
         except Exception as exc:
             print(f"[Audio] Could not prepare sound: {exc}")
             return None
 
-    def _run(self, blocks, t_start, sound, channel=None):
+    def _run(self, blocks, t_start, audio_slice, sr, channel, stop_event,
+             previous_thread, midi_gain, audio_gain):
+        sound = (
+            self._make_sound(audio_slice, sr, audio_gain)
+            if audio_slice is not None else None
+        )
+        if previous_thread is not None and previous_thread.is_alive():
+            previous_thread.join()
+        if stop_event.is_set():
+            return
         if channel is None:
             channel = self.CHANNEL
         port = self._midi_port
         if port is None:
             if sound is not None:
                 sound.play()
-                while sound.get_num_channels() > 0 and not self._stop_event.is_set():
+                while sound.get_num_channels() > 0 and not stop_event.is_set():
                     time.sleep(0.05)
             return
         try:
+            for status, control, value in _midi_mix_messages(channel, midi_gain):
+                port.write_short(status, control, value)
             events = []
             for entry in blocks:
                 t0, t1, midi, *_ = entry
@@ -125,10 +157,10 @@ class MidiPlayback:
                     if now >= target:
                         break
                     remaining = target - now
-                    if self._stop_event.is_set():
+                    if stop_event.is_set():
                         break
                     time.sleep(min(remaining * 0.5, 0.002))
-                if self._stop_event.is_set():
+                if stop_event.is_set():
                     break
                 if ev_type == "on":
                     port.note_on(note, vel, channel)
@@ -142,7 +174,7 @@ class MidiPlayback:
                     port.note_off(note, 0, channel)
                 except Exception:
                     pass
-            if sound is not None and self._stop_event.is_set():
+            if sound is not None and stop_event.is_set():
                 try:
                     sound.stop()
                 except Exception:

@@ -202,10 +202,13 @@ class AudioMarkers:
         self._pitch_cache: dict[tuple[int, int], tuple] = {}
         self._manual_pitches: dict[tuple[int, int], tuple[int, ...] | None] = {}
         self._explicit_note_spans: dict[str, PitchedNoteSpan] = {}
+        self._release_edit_note_ids: dict[str, str] = {}
         self._next_explicit_note_id = 1
         self._generated_note_spans_cache: tuple[PitchedNoteSpan, ...] | None = None
+        self._published_note_spans: tuple[PitchedNoteSpan, ...] = ()
         self._pitch_training_lock = threading.Lock()
         self._pending_pitch_training: list[tuple[tuple[int, int], int, bool]] = []
+        self._pending_drum_training: list[tuple[int, int, float, int, str, bool]] = []
         self._pitch_edit_generation = 0
         self._note_spans_revision = 0
         self._onset_training_lock = threading.Lock()
@@ -1011,6 +1014,15 @@ class AudioMarkers:
                 return (int(t0 * self.sr), int(min(t1 * self.sr, len(self.audio))))
         return None
 
+    def note_onset_window_at(self, t: float) -> tuple[float, float] | None:
+        boundaries = np.sort(np.unique(np.concatenate([
+            [0.0], self.onset_times, [self.duration]
+        ])))
+        index = int(np.searchsorted(boundaries, float(t), side="right")) - 1
+        if index < 0 or index >= len(boundaries) - 1:
+            return None
+        return float(boundaries[index]), float(boundaries[index + 1])
+
     def _train_pitch_model_for_manual_block(self, key: tuple[int, int]) -> None:
         with self._pitch_training_lock:
             manual = self._manual_pitches.get(key)
@@ -1176,16 +1188,21 @@ class AudioMarkers:
 
     def has_pending_pitch_training(self) -> bool:
         with self._pitch_training_lock:
-            return bool(self._pending_pitch_training)
+            return bool(
+                self._pending_pitch_training
+                or getattr(self, "_pending_drum_training", [])
+            )
 
     def process_pending_pitch_training(self) -> int:
         """Drain queued pitch labels and retrain once; intended for PitchWorker."""
         with self._pitch_training_lock:
             events = self._pending_pitch_training
             self._pending_pitch_training = []
+            drum_events = getattr(self, "_pending_drum_training", [])
+            self._pending_drum_training = []
             generation = int(self._pitch_edit_generation)
 
-        if not events:
+        if not events and not drum_events:
             return generation
 
         gate_examples = []
@@ -1206,6 +1223,10 @@ class AudioMarkers:
             self.model.record_pitch_gate_batch(gate_examples)
         for key in positive_keys:
             self._train_pitch_model_for_manual_block(key)
+        for beat_index, drum_midi, bpm, beats_per_bar, duration_str, keep in drum_events:
+            self._process_drum_training(
+                beat_index, drum_midi, bpm, beats_per_bar, duration_str, keep
+            )
         self._invalidate_note_spans()
         return generation
 
@@ -1280,6 +1301,7 @@ class AudioMarkers:
             with self._pitch_training_lock:
                 if revision == int(getattr(self, "_note_spans_revision", 0)):
                     self._generated_note_spans_cache = computed
+                    self._published_note_spans = computed
                     cached = computed
                     break
         spans = list(cached)
@@ -1399,8 +1421,13 @@ class AudioMarkers:
         return sorted(output, key=lambda span: (span.onset, span.midi, span.release))
 
     def preview_note_release(self, note_id: str, requested_release: float) -> float | None:
-        spans = self.get_pitched_note_spans(0.0, float(self.duration))
-        span = next((item for item in spans if item.note_id == note_id), None)
+        with self._pitch_training_lock:
+            resolved_note_id = getattr(self, "_release_edit_note_ids", {}).get(
+                note_id, note_id
+            )
+            spans = list(getattr(self, "_published_note_spans", ()))
+            spans.extend(self._explicit_note_spans.values())
+        span = next((item for item in spans if item.note_id == resolved_note_id), None)
         if span is None:
             return None
 
@@ -1422,23 +1449,33 @@ class AudioMarkers:
         return max(minimum_release, min(release, upper_bound, float(self.duration)))
 
     def set_note_release(self, note_id: str, requested_release: float) -> float | None:
-        spans = self.get_pitched_note_spans(0.0, float(self.duration))
-        span = next((item for item in spans if item.note_id == note_id), None)
+        with self._pitch_training_lock:
+            resolved_note_id = getattr(self, "_release_edit_note_ids", {}).get(
+                note_id, note_id
+            )
+            spans = list(getattr(self, "_published_note_spans", ()))
+            spans.extend(self._explicit_note_spans.values())
+        span = next((item for item in spans if item.note_id == resolved_note_id), None)
         release = self.preview_note_release(note_id, requested_release)
         if span is None or release is None:
             return None
 
-        if note_id.startswith("explicit:"):
-            explicit_id = note_id
+        if resolved_note_id.startswith("explicit:"):
+            explicit_id = resolved_note_id
         else:
             explicit_id = f"explicit:{self._next_explicit_note_id}"
             self._next_explicit_note_id += 1
         with self._pitch_training_lock:
-            if not note_id.startswith("explicit:"):
+            if not resolved_note_id.startswith("explicit:"):
                 self._pending_pitch_training.extend(
                     (key, span.midi, True) for key in span.block_keys
                 )
                 self._pitch_edit_generation += 1
+                aliases = getattr(self, "_release_edit_note_ids", None)
+                if aliases is None:
+                    aliases = {}
+                    self._release_edit_note_ids = aliases
+                aliases[note_id] = explicit_id
             self._explicit_note_spans[explicit_id] = replace(
                 span,
                 note_id=explicit_id,
@@ -1782,20 +1819,23 @@ class AudioMarkers:
             manual_t1 = float(key[1]) / float(self.sr)
             if manual_t1 <= t_start or manual_t0 >= t_end:
                 continue
-            manual_intervals.append((manual_t0, manual_t1))
+            note_window = self.note_onset_window_at(manual_t0)
+            if note_window is None:
+                rendered_t0, rendered_t1 = manual_t0, manual_t1
+            else:
+                rendered_t0 = note_window[0]
+                rendered_t1 = min(
+                    float(self.duration), max(manual_t1, note_window[1])
+                )
+            manual_intervals.append((rendered_t0, rendered_t1))
             if manual is None:
                 continue
-            grid_duration = float(getattr(self, "_current_min_dur_sec", 0.0))
-            rendered_t1 = (
-                min(manual_t1, manual_t0 + grid_duration)
-                if grid_duration > 0.0 else manual_t1
-            )
             for midi in manual:
                 energy = self._harmonic_block_energy(
-                    manual_t0, manual_t1, int(midi)
+                    rendered_t0, rendered_t1, int(midi)
                 )
                 note_rows.append((
-                    manual_t0, rendered_t1, int(midi), "manual", energy
+                    rendered_t0, rendered_t1, int(midi), "manual", energy
                 ))
 
         for i in range(len(boundaries) - 1):
@@ -1822,10 +1862,6 @@ class AudioMarkers:
                     e_m = self._harmonic_block_energy(t0, t1, int(midi))
                     ml_energy_db[int(midi)] = float(20.0 * np.log10(max(e_m, 1e-8)))
                 ml_max_db = max(ml_energy_db.values()) if ml_energy_db else -120.0
-                learned_release = min(
-                    float(t1), float(t0) + float(self._current_min_dur_sec)
-                )
-
                 for midi in ml_midis:
                     e = self._harmonic_block_energy(t0, t1, int(midi))
                     e_db = ml_energy_db[int(midi)]
@@ -1852,7 +1888,7 @@ class AudioMarkers:
                             if final_prob < self.model.PITCH_GATE_THRESHOLD:
                                 continue
 
-                    note_rows.append((float(t0), learned_release, int(midi), "ml", e))
+                    note_rows.append((float(t0), float(t1), int(midi), "ml", e))
             elif nnls_notes:
                 nnls_energy_db = {}
                 for midi, _ in nnls_notes:
@@ -2171,55 +2207,51 @@ class AudioMarkers:
 
     def add_manual_drum(self, beat_index: int, drum_midi: int, bpm: float,
                        beats_per_bar: int, duration_str: str) -> bool:
-        """Train a drum pattern from a beat slice (left click confirm)."""
+        """Apply a drum confirmation immediately and queue model training."""
         if self.model is None:
             return False
-        
-        result = self._extract_drum_slice_features(beat_index, bpm, beats_per_bar, duration_str)
-        if result is None:
-            print(f"[drum_grid] add_failed slice={beat_index} drum={drum_midi} dur={duration_str}")
+        t0 = self.beat_index_to_time(beat_index, bpm, beats_per_bar, duration_str)
+        if beat_index < 0 or t0 < 0.0 or t0 >= self.duration:
             return False
-        
-        fingerprint, features = result
-        attack_slope, impulsivity, decay_rate, energy_db, energy_rel_db, band_low, band_mid, band_high, _ = features
-        
-        sample_key = f"beat:{beat_index}:{int(drum_midi)}"
-        self.model.record_drum_pattern(
-            drum_midi=int(drum_midi),
-            fingerprint=fingerprint,
-            attack_slope=attack_slope,
-            impulsivity=impulsivity,
-            decay_rate=decay_rate,
-            energy_db=energy_db,
-            energy_rel_db=energy_rel_db,
-            band_low=band_low,
-            band_mid=band_mid,
-            band_high=band_high,
-            keep=True,
-            sample_key=sample_key,
-            source="user"
-        )
         manual = self._manual_drums.setdefault(int(beat_index), set())
         manual.add(int(drum_midi))
         rejects = self._manual_drum_rejects.get(int(beat_index))
         if rejects is not None:
             rejects.discard(int(drum_midi))
-        print(
-            f"[drum_grid] add_ok slice={beat_index} drum={drum_midi} "
-            f"attack={attack_slope:.2f} impulsivity={impulsivity:.2f} decay={decay_rate:.2f} "
-            f"dB={energy_db:.1f} patterns={len(self.model.get_drum_patterns(expected_size=len(fingerprint)))}"
-        )
+        with self._pitch_training_lock:
+            self._pending_drum_training.append((
+                int(beat_index), int(drum_midi), float(bpm), int(beats_per_bar),
+                str(duration_str), True,
+            ))
+            self._pitch_edit_generation += 1
         return True
     
     def remove_manual_drum(self, beat_index: int, drum_midi: int, bpm: float,
                           beats_per_bar: int, duration_str: str) -> bool:
-        """Record negative drum training sample (right click reject)."""
+        """Apply a drum rejection immediately and queue model training."""
         if self.model is None:
             return False
-        
+        t0 = self.beat_index_to_time(beat_index, bpm, beats_per_bar, duration_str)
+        if beat_index < 0 or t0 < 0.0 or t0 >= self.duration:
+            return False
+        manual = self._manual_drums.get(int(beat_index))
+        if manual is not None:
+            manual.discard(int(drum_midi))
+            if not manual:
+                self._manual_drums.pop(int(beat_index), None)
+        self._manual_drum_rejects.setdefault(int(beat_index), set()).add(int(drum_midi))
+        with self._pitch_training_lock:
+            self._pending_drum_training.append((
+                int(beat_index), int(drum_midi), float(bpm), int(beats_per_bar),
+                str(duration_str), False,
+            ))
+            self._pitch_edit_generation += 1
+        return True
+
+    def _process_drum_training(self, beat_index: int, drum_midi: int, bpm: float,
+                               beats_per_bar: int, duration_str: str, keep: bool) -> bool:
         result = self._extract_drum_slice_features(beat_index, bpm, beats_per_bar, duration_str)
         if result is None:
-            print(f"[drum_grid] reject_failed slice={beat_index} drum={drum_midi} dur={duration_str}")
             return False
         
         fingerprint, features = result
@@ -2237,20 +2269,8 @@ class AudioMarkers:
             band_low=band_low,
             band_mid=band_mid,
             band_high=band_high,
-            keep=False,
+            keep=bool(keep),
             sample_key=sample_key,
             source="user"
-        )
-        manual = self._manual_drums.get(int(beat_index))
-        if manual is not None:
-            manual.discard(int(drum_midi))
-            if not manual:
-                self._manual_drums.pop(int(beat_index), None)
-        rejects = self._manual_drum_rejects.setdefault(int(beat_index), set())
-        rejects.add(int(drum_midi))
-        print(
-            f"[drum_grid] reject_ok slice={beat_index} drum={drum_midi} "
-            f"attack={attack_slope:.2f} impulsivity={impulsivity:.2f} decay={decay_rate:.2f} "
-            f"dB={energy_db:.1f}"
         )
         return True

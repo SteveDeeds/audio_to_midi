@@ -37,6 +37,30 @@ from ui.styles import QSS
 from workers.analysis_worker import LoadWorker, ChordWorker, OnsetWorker, PitchWorker
 
 
+def _clicked_manual_note(rows: list, t: float, midi: int) -> tuple | None:
+    matches = [
+        row for row in rows
+        if len(row) >= 5
+        and int(row[2]) == int(midi)
+        and str(row[3]) == "manual"
+        and float(row[0]) <= float(t) < float(row[1])
+    ]
+    return max(matches, key=lambda row: float(row[0]), default=None)
+
+
+def _manual_preview_note(markers: AudioMarkers, t: float, midi: int) -> tuple | None:
+    note_window = markers.note_onset_window_at(float(t))
+    if note_window is None:
+        return None
+    t0, t1 = note_window
+    return (t0, t1, int(midi), "manual", MidiPlayback.VELOCITY)
+
+
+def _playback_mix_levels(slider_value: int) -> tuple[float, float]:
+    audio_gain = max(0.0, min(1.0, float(slider_value) / 100.0))
+    return 1.0 - audio_gain, audio_gain
+
+
 class MainWindow(QMainWindow):
     """Unified audio-to-MIDI + chord analyzer window."""
 
@@ -145,9 +169,7 @@ class MainWindow(QMainWindow):
         self._controls.duration_changed.connect(self._on_duration_changed)
         self._controls.polyphony_changed.connect(self._on_polyphony_changed)
         self._controls.pitch_model_changed.connect(self._on_pitch_model_changed)
-        self._controls.play_midi_requested.connect(self._on_play_midi)
-        self._controls.play_audio_requested.connect(self._on_play_audio)
-        self._controls.play_both_requested.connect(self._on_play_both)
+        self._controls.play_requested.connect(self._on_play_mix)
         self._controls.stop_requested.connect(self._on_stop)
         self._controls.export_midi_requested.connect(self._on_export_midi)
         self._controls.save_model_requested.connect(self._on_save_model)
@@ -249,6 +271,8 @@ class MainWindow(QMainWindow):
 
     def _on_load_done(self, markers: AudioMarkers) -> None:
         self._markers = markers
+        if self._player is None:
+            self._player = MidiPlayback()
         markers.set_pitch_model(self._controls.pitch_model())
         keep_chords = self._preserve_chords_on_next_load and bool(self._chord_results)
         self._preserve_chords_on_next_load = False
@@ -521,18 +545,28 @@ class MainWindow(QMainWindow):
             )
             ok = self._markers.add_manual_drum(
                 beat_index, midi, bpm, beats_per_bar, duration_str)
-            self._cqt_view.refresh()
-            self._pitch_timer.start()
             if ok:
+                slice_dur = self._markers.get_beat_slice_duration(
+                    bpm, beats_per_bar, duration_str)
+                t0 = self._markers.beat_index_to_time(
+                    beat_index, bpm, beats_per_bar, duration_str)
+                t1 = min(self._markers.duration, t0 + slice_dur)
+                row = (t0, t1, int(midi), "manual", MidiPlayback.VELOCITY)
+                self._cqt_view.apply_drum_feedback(t0, t1, midi, keep=True)
+                self._preview_note_window(t0, t1, fallback_row=row, channel=9)
                 self._status_bar.showMessage(
                     f"Added drum {midi} at slice {beat_index}")
             else:
                 self._status_bar.showMessage(
                     f"Could not add drum {midi} at slice {beat_index} (empty/invalid slice)")
+            self._pitch_timer.start()
             return
 
         self._markers.add_manual_pitch(t, midi)
         self._cqt_view.apply_pitch_feedback(t, midi, keep=True)
+        row = _manual_preview_note(self._markers, t, midi)
+        if row is not None:
+            self._preview_note_window(float(row[0]), float(row[1]), fallback_row=row)
         self._pitch_update_dirty = True
         self._status_bar.showMessage("Pitch feedback queued")
         self._pitch_timer.start()
@@ -555,14 +589,19 @@ class MainWindow(QMainWindow):
             )
             ok = self._markers.remove_manual_drum(
                 beat_index, midi, bpm, beats_per_bar, duration_str)
-            self._cqt_view.refresh()
-            self._pitch_timer.start()
             if ok:
+                slice_dur = self._markers.get_beat_slice_duration(
+                    bpm, beats_per_bar, duration_str)
+                t0 = self._markers.beat_index_to_time(
+                    beat_index, bpm, beats_per_bar, duration_str)
+                t1 = min(self._markers.duration, t0 + slice_dur)
+                self._cqt_view.apply_drum_feedback(t0, t1, midi, keep=False)
                 self._status_bar.showMessage(
                     f"Rejected drum {midi} at slice {beat_index}")
             else:
                 self._status_bar.showMessage(
                     f"Could not reject drum {midi} at slice {beat_index} (empty/invalid slice)")
+            self._pitch_timer.start()
             return
 
         self._markers.remove_manual_pitch(t, midi)
@@ -694,7 +733,42 @@ class MainWindow(QMainWindow):
 
     # â”€â”€ Playback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    def _play(self, midi: bool = True, audio: bool = True) -> None:
+    def _preview_note_window(
+        self,
+        t_start: float,
+        t_end: float,
+        fallback_row: tuple | None = None,
+        channel: int | None = None,
+    ) -> None:
+        if self._markers is None:
+            return
+        if self._player is None:
+            self._player = MidiPlayback()
+
+        blocks = self._cqt_view.rendered_note_rows(t_start, t_end)
+        if fallback_row is not None and not any(
+            int(row[2]) == int(fallback_row[2]) for row in blocks
+        ):
+            blocks.append(fallback_row)
+        s0 = max(0, int(t_start * self._markers.sr))
+        s1 = min(len(self._markers.audio), int(t_end * self._markers.sr))
+        audio_slice = self._markers.audio[s0:s1] if s1 > s0 else None
+        midi_gain, audio_gain = _playback_mix_levels(self._controls.get_play_mix())
+
+        self._playback_start_time = time.perf_counter()
+        self._playback_start_t = t_start
+        self._playback_timer.start()
+        self._player.play(
+            blocks,
+            t_start,
+            audio_slice,
+            self._markers.sr,
+            channel=channel,
+            midi_gain=midi_gain,
+            audio_gain=audio_gain,
+        )
+
+    def _play(self, midi_gain: float = 1.0, audio_gain: float = 1.0) -> None:
         if not self._markers:
             return
         if self._player is None:
@@ -704,16 +778,13 @@ class MainWindow(QMainWindow):
         
         mode = self._controls.get_mode()
         
-        # Get MIDI blocks based on mode
-        if mode == "Percussive" and midi:
-            blocks = self._markers.get_cached_drum_hits(t_start, t_end)
-        elif midi:
-            blocks = self._cqt_view.visible_recommendation_rows(t_start, t_end)
-        else:
-            blocks = []
+        blocks = (
+            self._cqt_view.rendered_note_rows(t_start, t_end)
+            if midi_gain > 0.0 else []
+        )
         
         audio_slice = None
-        if audio:
+        if audio_gain > 0.0:
             s0 = max(0, int(t_start * self._markers.sr))
             s1 = min(len(self._markers.audio), int(t_end * self._markers.sr))
             audio_slice = self._markers.audio[s0:s1] if s1 > s0 else None
@@ -728,16 +799,19 @@ class MainWindow(QMainWindow):
         # Use percussion channel (9 = channel 10) for drum mode
         channel = 9 if mode == "Percussive" else None
         
-        self._player.play(blocks, t_start, audio_slice, self._markers.sr, channel=channel)
+        self._player.play(
+            blocks,
+            t_start,
+            audio_slice,
+            self._markers.sr,
+            channel=channel,
+            midi_gain=midi_gain,
+            audio_gain=audio_gain,
+        )
 
-    def _on_play_midi(self) -> None:
-        self._play(midi=True, audio=False)
-
-    def _on_play_audio(self) -> None:
-        self._play(midi=False, audio=True)
-
-    def _on_play_both(self) -> None:
-        self._play(midi=True, audio=True)
+    def _on_play_mix(self, slider_value: int) -> None:
+        midi_gain, audio_gain = _playback_mix_levels(slider_value)
+        self._play(midi_gain=midi_gain, audio_gain=audio_gain)
     
     def _on_playback_tick(self) -> None:
         """Update playhead position during playback."""
@@ -1081,10 +1155,10 @@ class MainWindow(QMainWindow):
         if not self._markers:
             return
         snapped_release = self._markers.set_note_release(note_id, release)
-        self._cqt_view.refresh()
         if snapped_release is None:
             self._status_bar.showMessage("Could not update note release")
             return
+        self._cqt_view.apply_note_release(note_id, snapped_release)
         if self._markers.has_pending_pitch_training():
             self._pitch_update_dirty = True
             self._pitch_timer.start()

@@ -59,6 +59,7 @@ QPushButton {
 QPushButton:hover    { background: #1a4470; }
 QPushButton:pressed  { background: #082030; }
 QPushButton:disabled { background: #252538; color: #555577; }
+QPushButton#transportPlay { padding: 0; }
 QPushButton#analyze, QPushButton#load {
     background: #e94560;
     font-size: 12pt;

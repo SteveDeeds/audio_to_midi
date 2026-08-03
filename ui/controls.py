@@ -10,9 +10,9 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QPushButton, QLabel, QDoubleSpinBox,
     QComboBox, QSlider, QRadioButton, QButtonGroup,
-    QProgressBar, QFileDialog, QApplication,
+    QProgressBar, QFileDialog, QApplication, QStyle,
 )
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QSize
 
 
 class ControlPanel(QWidget):
@@ -28,9 +28,7 @@ class ControlPanel(QWidget):
     polyphony_changed = Signal(int)              # max simultaneous notes (1–10)
     pitch_model_changed = Signal(str)           # registered pitch-model policy name
     mode_changed = Signal(str)                  # "Pitched" or "Percussive"
-    play_midi_requested = Signal()
-    play_audio_requested = Signal()
-    play_both_requested = Signal()
+    play_requested = Signal(int)
     stop_requested = Signal()
     export_midi_requested = Signal()
     save_model_requested = Signal()
@@ -155,18 +153,27 @@ class ControlPanel(QWidget):
         ag = QVBoxLayout(act_grp)
 
         row1 = QHBoxLayout()
-        self._btn_play_midi = QPushButton("▶ MIDI")
-        self._btn_play_midi.setEnabled(False)
-        self._btn_play_midi.clicked.connect(self.play_midi_requested.emit)
-        row1.addWidget(self._btn_play_midi)
-        self._btn_play_audio = QPushButton("▶ Audio")
-        self._btn_play_audio.setEnabled(False)
-        self._btn_play_audio.clicked.connect(self.play_audio_requested.emit)
-        row1.addWidget(self._btn_play_audio)
-        self._btn_play_both = QPushButton("▶ Both")
-        self._btn_play_both.setEnabled(False)
-        self._btn_play_both.clicked.connect(self.play_both_requested.emit)
-        row1.addWidget(self._btn_play_both)
+        row1.addWidget(QLabel("MIDI"))
+        self._play_mix_slider = QSlider(Qt.Orientation.Horizontal)
+        self._play_mix_slider.setRange(0, 100)
+        self._play_mix_slider.setValue(50)
+        self._play_mix_slider.setSingleStep(5)
+        row1.addWidget(self._play_mix_slider, 1)
+        row1.addWidget(QLabel("Audio"))
+        self._btn_play = QPushButton()
+        self._btn_play.setObjectName("transportPlay")
+        self._btn_play.setIcon(
+            self.style().standardIcon(QStyle.StandardPixmap.SP_MediaPlay)
+        )
+        self._btn_play.setIconSize(QSize(18, 18))
+        self._btn_play.setFixedSize(34, 34)
+        self._btn_play.setToolTip("Play")
+        self._btn_play.setAccessibleName("Play")
+        self._btn_play.setEnabled(False)
+        self._btn_play.clicked.connect(
+            lambda: self.play_requested.emit(self._play_mix_slider.value())
+        )
+        row1.addWidget(self._btn_play)
         ag.addLayout(row1)
 
         row2 = QHBoxLayout()
@@ -225,6 +232,9 @@ class ControlPanel(QWidget):
 
     # ── Public helpers ────────────────────────────────────────────────────
 
+    def get_play_mix(self) -> int:
+        return int(self._play_mix_slider.value())
+
     def set_progress(self, pct: int, msg: str = "") -> None:
         self._progress.setValue(pct)
         self._progress.setFormat(f"{pct}%")
@@ -234,9 +244,7 @@ class ControlPanel(QWidget):
         self._debug.setText(msg)
 
     def set_loaded(self, enabled: bool) -> None:
-        self._btn_play_midi.setEnabled(enabled)
-        self._btn_play_audio.setEnabled(enabled)
-        self._btn_play_both.setEnabled(enabled)
+        self._btn_play.setEnabled(enabled)
         self._btn_stop.setEnabled(enabled)
         self._btn_export.setEnabled(enabled)
         self._btn_save_model.setEnabled(enabled)

@@ -313,13 +313,10 @@ class CQTGraphicsView(QGraphicsView):
                 return
             if not self._markers:
                 return
-            key = self._markers.get_block_key_at(float(t))
-            if key is None:
+            note_window = self._markers.note_onset_window_at(float(t))
+            if note_window is None:
                 return
-            t0 = float(key[0]) / float(self._markers.sr)
-            block_t1 = float(key[1]) / float(self._markers.sr)
-            grid_duration = float(self._markers.current_grid_duration())
-            t1 = min(block_t1, t0 + grid_duration) if grid_duration > 0.0 else block_t1
+            t0, t1 = note_window
             rect = self._scene.addRect(
                 QRectF(t0, float(midi) - 0.45, t1 - t0, 0.9),
                 pen, QBrush(Qt.BrushStyle.NoBrush),
@@ -336,6 +333,54 @@ class CQTGraphicsView(QGraphicsView):
                 self._pitch_rects.remove(rect)
         self.viewport().update()
 
+    def apply_drum_feedback(self, t0: float, t1: float, midi: int, keep: bool) -> None:
+        """Apply immediate percussion feedback without rebuilding inference results."""
+        matching = [
+            rect for rect in self._pitch_rects
+            if rect.data(3) == int(midi)
+            and float(rect.data(1) or rect.rect().left()) < float(t1)
+            and float(rect.data(2) or rect.rect().right()) > float(t0)
+        ]
+        if keep:
+            pen = QPen(QColor("#ffffff"))
+            pen.setWidthF(4.0)
+            pen.setCosmetic(True)
+            pen.setStyle(Qt.PenStyle.SolidLine)
+            if matching:
+                for rect in matching:
+                    rect.setPen(pen)
+                    rect.setData(4, "manual")
+            else:
+                y_note = self._percussive_y_for_midi(int(midi))
+                rect = self._scene.addRect(
+                    QRectF(float(t0), y_note - 0.2, float(t1) - float(t0), 0.4),
+                    pen, QBrush(Qt.BrushStyle.NoBrush),
+                )
+                rect.setZValue(8)
+                rect.setData(1, float(t0))
+                rect.setData(2, float(t1))
+                rect.setData(3, int(midi))
+                rect.setData(4, "manual")
+                self._pitch_rects.append(rect)
+        else:
+            for rect in matching:
+                self._scene.removeItem(rect)
+                self._pitch_rects.remove(rect)
+        self.viewport().update()
+
+    def apply_note_release(self, note_id: str, release: float) -> None:
+        """Update a rendered note release without rebuilding model results."""
+        for rect in self._pitch_rects:
+            if str(rect.data(0) or "") != str(note_id):
+                continue
+            note_rect = rect.rect()
+            note_rect.setRight(float(release))
+            rect.setRect(note_rect)
+            rect.setData(2, float(release))
+            rect.setData(4, "manual")
+            break
+        self.viewport().update()
+
     def rendered_suggestion_signature(self) -> set[tuple[float, float, int, str]]:
         """Return the generated pitch boxes currently shown in the viewport."""
         signature = set()
@@ -350,6 +395,28 @@ class CQTGraphicsView(QGraphicsView):
                 source,
             ))
         return signature
+
+    def rendered_note_rows(self, t_start: float, t_end: float) -> list[tuple]:
+        """Snapshot visible note graphics without invoking model inference."""
+        rows = []
+        for rect in self._pitch_rects:
+            midi = rect.data(3)
+            if midi is None:
+                continue
+            t0 = float(rect.data(1) or rect.rect().left())
+            t1 = float(rect.data(2) or rect.rect().right())
+            if t1 <= float(t_start) or t0 >= float(t_end):
+                continue
+            row = (
+                max(t0, float(t_start)),
+                min(t1, float(t_end)),
+                int(midi),
+                str(rect.data(4) or "manual"),
+                90,
+            )
+            note_id = rect.data(0)
+            rows.append(row + (str(note_id),) if note_id else row)
+        return rows
 
     def set_scale_pcs(self, pcs: set[int]) -> None:
         self._scale_pcs = pcs
@@ -379,7 +446,7 @@ class CQTGraphicsView(QGraphicsView):
         """Sync current bar and zoom from another timeline view."""
         self._current_bar = max(1, int(bar))
         self._zoom_bars = max(1, int(zoom_bars))
-        self._rebuild_scene()
+        self._rebuild_scene(run_inference=False)
 
     def time_window(self) -> tuple[float, float]:
         """Public wrapper for the current visible time window."""
@@ -410,7 +477,7 @@ class CQTGraphicsView(QGraphicsView):
             return
         total_bars = max(1, int(self._markers.duration / self._grid.bar_dur))
         self._current_bar = max(1, min(bar, total_bars))
-        self._rebuild_scene()
+        self._rebuild_scene(run_inference=False)
         self.bar_changed.emit(self._current_bar)
 
     def _shift_pitch_view(self, delta: int) -> None:
@@ -548,11 +615,16 @@ class CQTGraphicsView(QGraphicsView):
             return m.cqt_flux_db, m.cqt_times
         return m.cqt_db, m.cqt_times
 
-    def _rebuild_scene(self) -> None:
+    def _rebuild_scene(self, run_inference: bool = True) -> None:
         if not self._markers or not self._grid:
             return
         t_start, t_end = self._time_window()
         m = self._markers
+        pitches = (
+            self.visible_recommendation_rows(t_start, t_end)
+            if run_inference
+            else self.rendered_note_rows(t_start, t_end)
+        )
 
         self._cancel_release_drag()
         self._scene.clear()
@@ -562,7 +634,6 @@ class CQTGraphicsView(QGraphicsView):
         self._y_labels.clear()
         self._cqt_pixmap_item = None
 
-        pitches = self.visible_recommendation_rows(t_start, t_end)
         if self._current_mode == "Percussive":
             self._prepare_percussive_layout(pitches)
 
@@ -694,10 +765,10 @@ class CQTGraphicsView(QGraphicsView):
             rect.setZValue(8)
             if self._current_mode != "Percussive" and len(entry) >= 6:
                 rect.setData(0, entry[5])
-                rect.setData(1, float(t0))
-                rect.setData(2, float(t1))
-                rect.setData(3, int(midi))
-                rect.setData(4, str(source))
+            rect.setData(1, float(t0))
+            rect.setData(2, float(t1))
+            rect.setData(3, int(midi))
+            rect.setData(4, str(source))
             self._pitch_rects.append(rect)
 
         # Y-axis note labels
@@ -883,7 +954,7 @@ class CQTGraphicsView(QGraphicsView):
         elif delta < 0 and self._zoom_bars < 16:
             self._zoom_bars += 1
         if self._zoom_bars != old:
-            self._rebuild_scene()
+            self._rebuild_scene(run_inference=False)
             self.zoom_changed.emit(self._zoom_bars)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
