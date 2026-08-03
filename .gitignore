@@ -19,3 +19,5 @@ model_profiles/
 *.mid
 Firm Foundation (He Won't)/
 experimental/
+benchmark_results/
+benchmark_transcription.py
