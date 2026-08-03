@@ -6,6 +6,21 @@ from core.models import CorrectionModel
 
 
 class TestCorrectionModelProfiles(unittest.TestCase):
+    def test_instrument_dictionary_round_trip(self) -> None:
+        model = CorrectionModel()
+        model.instrument_dictionary.add_atom(
+            55, np.array([1.0, 0.2, 0.0], dtype=np.float32), quality=0.8
+        )
+        model.multi_atom_threshold_ratio = 0.6
+
+        restored = CorrectionModel()
+        restored.load_dict(model.to_dict(user_only=False), merge=False)
+
+        atoms = restored.instrument_dictionary.atoms_for_midi(55)
+        self.assertEqual(len(atoms), 1)
+        self.assertAlmostEqual(atoms[0].quality, 0.8)
+        self.assertAlmostEqual(restored.multi_atom_threshold_ratio, 0.6)
+
     def test_drum_patterns_round_trip(self) -> None:
         model = CorrectionModel()
         fingerprint = np.ones(8, dtype=np.float32)

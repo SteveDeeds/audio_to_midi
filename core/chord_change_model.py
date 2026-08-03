@@ -22,6 +22,7 @@ Usage
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 
@@ -51,17 +52,27 @@ class ChordChangeModel:
 
     # ── Public API ──────────────────────────────────────────────────────────
 
+    def clone(self) -> "ChordChangeModel":
+        return copy.deepcopy(self)
+
     def add_positive(self, energy: float, flux: float) -> None:
         """Record a user-confirmed chord change as a positive training sample."""
-        self._samples.append((float(energy), float(flux), 1))
-        self._refit()
-        self._autosave()
+        self.add_batch([(energy, flux, True)])
 
     def add_negative(self, energy: float, flux: float) -> None:
         """Record a user-rejected chord change as a negative training sample."""
-        self._samples.append((float(energy), float(flux), 0))
+        self.add_batch([(energy, flux, False)])
+
+    def add_batch(self, examples: list[tuple[float, float, bool]],
+                  autosave: bool = True) -> None:
+        """Record a label batch and refit once after all samples are present."""
+        self._samples.extend(
+            (float(energy), float(flux), 1 if keep else 0)
+            for energy, flux, keep in examples
+        )
         self._refit()
-        self._autosave()
+        if autosave:
+            self._autosave()
 
     def predict(self, energy: float, flux: float) -> float:
         """Return P(real chord change).  Returns 1.0 when untrained (no filtering)."""

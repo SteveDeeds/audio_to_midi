@@ -8,8 +8,11 @@ ML correction models trained incrementally from user edits.
     - Pitch cosine 1-NN: fingerprint → MIDI note suggestion
 """
 
+import copy
+
 import numpy as np
 
+from core.instrument_dictionary import InstrumentDictionary
 from core.logistic_utils import sigmoid_clipped, train_binary_logistic_minmax
 
 
@@ -34,6 +37,8 @@ class CorrectionModel:
         self._fp_notes: list[tuple[int, ...]] = []  # polyphonic: tuple of sorted MIDI notes
         self._fp_midi: list[float] = []  # median MIDI note for each fingerprint (for register weighting)
         self._fp_src: list[str] = []
+        self.instrument_dictionary = InstrumentDictionary()
+        self.multi_atom_threshold_ratio = 0.35
 
         # Pitch acceptance gate (latest model): logistic regression on
         # [peel, salience, flux, onset, energy_db, energy_rel_db].
@@ -59,6 +64,10 @@ class CorrectionModel:
 
         self._seed_bootstrap_candidates()
         self._seed_bootstrap_pitch_gate()
+
+    def clone(self) -> "CorrectionModel":
+        """Return an isolated training copy, including non-persisted live state."""
+        return copy.deepcopy(self)
 
     # ── Candidate model ──────────────────────────────────────────────────
 
@@ -165,6 +174,19 @@ class CorrectionModel:
         y_val = 1 if keep else 0
         feat = [float(transient), float(chroma_delta), float(energy_db), float(percussive_spike)]
         self._append_candidate_sample(feat, bool(keep), candidate_key=candidate_key, source=source)
+        trained, w, norm = self._retrain_binary(self._cand_X, self._cand_y)
+        self._cand_trained, self._cand_w, self._cand_norm = trained, w, norm
+
+    def record_candidate_batch(self, examples: list[tuple]) -> None:
+        """Record candidate labels and retrain once after the complete batch."""
+        for transient, chroma_delta, energy_db, percussive_spike, keep, key, source in examples:
+            feat = [
+                float(transient), float(chroma_delta),
+                float(energy_db), float(percussive_spike),
+            ]
+            self._append_candidate_sample(
+                feat, bool(keep), candidate_key=key, source=str(source)
+            )
         trained, w, norm = self._retrain_binary(self._cand_X, self._cand_y)
         self._cand_trained, self._cand_w, self._cand_norm = trained, w, norm
 
@@ -344,6 +366,25 @@ class CorrectionModel:
             sample_key=sample_key,
             source=source,
         )
+        trained, w, norm = self._retrain_binary(self._pitch_gate_X, self._pitch_gate_y)
+        self._pitch_gate_trained, self._pitch_gate_w, self._pitch_gate_norm = trained, w, norm
+
+    def record_pitch_gate_batch(self, examples: list[tuple]) -> None:
+        """Record pitch-gate labels and retrain once after the complete batch."""
+        for peel, salience, flux, onset, energy_db, energy_rel_db, keep, key, source in examples:
+            self._append_pitch_gate_sample(
+                [
+                    float(np.clip(peel, 0.0, 1.0)),
+                    float(np.clip(salience, 0.0, 1.0)),
+                    float(np.clip(flux, 0.0, 1.0)),
+                    float(np.clip(onset, 0.0, 1.0)),
+                    float(energy_db),
+                    float(energy_rel_db),
+                ],
+                bool(keep),
+                sample_key=key,
+                source=str(source),
+            )
         trained, w, norm = self._retrain_binary(self._pitch_gate_X, self._pitch_gate_y)
         self._pitch_gate_trained, self._pitch_gate_w, self._pitch_gate_norm = trained, w, norm
 
@@ -583,11 +624,13 @@ class CorrectionModel:
                     "support": int(max(1, support)),
                 })
         return {
-            "schema": 10,
+            "schema": 12,
             "cand": cand_rows,
             "pitch": pitch_items,
             "pitch_gate": pitch_gate_rows,
             "drum_patterns": drum_patterns,
+            "instrument_dictionary": self.instrument_dictionary.to_dict(),
+            "multi_atom_threshold_ratio": self.multi_atom_threshold_ratio,
         }
 
     def load_dict(self, data: dict, merge: bool = False):
@@ -610,6 +653,13 @@ class CorrectionModel:
                 self.record_pitches(vec, item["notes"], item.get("source", "user"))
             else:
                 self.record_pitch(vec, item["midi"], item.get("source", "user"))
+
+        instrument_dictionary = data.get("instrument_dictionary")
+        if isinstance(instrument_dictionary, dict):
+            self.instrument_dictionary.load_dict(instrument_dictionary)
+        self.multi_atom_threshold_ratio = float(np.clip(
+            data.get("multi_atom_threshold_ratio", 0.35), 0.10, 0.90
+        ))
 
         for item in data.get("pitch_gate", []):
             row = item.get("row")
