@@ -34,7 +34,7 @@ from ui.controls import ControlPanel
 from ui.chord_header import ChordHeaderWidget
 from ui.styles import QSS
 
-from workers.analysis_worker import LoadWorker, ChordWorker, PitchWorker
+from workers.analysis_worker import LoadWorker, ChordWorker, OnsetWorker, PitchWorker
 
 
 class MainWindow(QMainWindow):
@@ -50,6 +50,9 @@ class MainWindow(QMainWindow):
         self._load_worker: LoadWorker | None = None
         self._chord_worker: ChordWorker | None = None
         self._pitch_worker: PitchWorker | None = None
+        self._onset_worker: OnsetWorker | None = None
+        self._pitch_update_dirty: bool = False
+        self._pitch_suggestion_baseline: set[tuple] = set()
         self._chord_results: list = []
         self._detected_key: str = ""
         self._player: MidiPlayback | None = None
@@ -141,6 +144,7 @@ class MainWindow(QMainWindow):
         self._controls.stem_changed.connect(self._on_stem_changed)
         self._controls.duration_changed.connect(self._on_duration_changed)
         self._controls.polyphony_changed.connect(self._on_polyphony_changed)
+        self._controls.pitch_model_changed.connect(self._on_pitch_model_changed)
         self._controls.play_midi_requested.connect(self._on_play_midi)
         self._controls.play_audio_requested.connect(self._on_play_audio)
         self._controls.play_both_requested.connect(self._on_play_both)
@@ -161,6 +165,7 @@ class MainWindow(QMainWindow):
         self._cqt_view.block_clicked.connect(self._on_cqt_clicked)
         self._cqt_view.block_right_clicked.connect(self._on_cqt_right_clicked)
         self._cqt_view.block_hovered.connect(self._on_cqt_hovered)
+        self._cqt_view.note_release_requested.connect(self._on_note_release_requested)
         self._cqt_view.zoom_changed.connect(self._on_zoom_from_cqt)
         self._chroma_strip.note_hovered.connect(self._on_chroma_hovered)
 
@@ -175,6 +180,11 @@ class MainWindow(QMainWindow):
         self._pitch_timer.setSingleShot(True)
         self._pitch_timer.setInterval(200)
         self._pitch_timer.timeout.connect(self._run_pitch_detection)
+
+        self._onset_timer = QTimer(self)
+        self._onset_timer.setSingleShot(True)
+        self._onset_timer.setInterval(100)
+        self._onset_timer.timeout.connect(self._run_onset_training)
         
         # Playback position timer (updates playhead line)
         self._playback_timer = QTimer(self)
@@ -213,6 +223,12 @@ class MainWindow(QMainWindow):
                  preserve_chords: bool = False) -> None:
         if self._load_worker and self._load_worker.isRunning():
             return
+        self._pitch_timer.stop()
+        self._onset_timer.stop()
+        self._stop_worker(self._pitch_worker)
+        self._stop_worker(self._onset_worker)
+        self._pitch_worker = None
+        self._onset_worker = None
         self._dispose_finished_worker("_load_worker")
         self._preserve_chords_on_next_load = bool(preserve_chords)
         if not self._preserve_chords_on_next_load:
@@ -233,6 +249,7 @@ class MainWindow(QMainWindow):
 
     def _on_load_done(self, markers: AudioMarkers) -> None:
         self._markers = markers
+        markers.set_pitch_model(self._controls.pitch_model())
         keep_chords = self._preserve_chords_on_next_load and bool(self._chord_results)
         self._preserve_chords_on_next_load = False
 
@@ -258,16 +275,24 @@ class MainWindow(QMainWindow):
             self._chord_header.set_confirmed_start_times(set())
             self._chroma_strip.set_chroma_data(None, None)
 
+        companion_note = self._load_companion_stem_midi_if_present()
+
         self._controls.set_loaded(True)
         self._controls.set_progress(100, "Ready")
         self._bar_label.setText(
             f"Bar {self._cqt_view.current_bar}  "
             f"({self._cqt_view.zoom_bars}-bar view)")
         self._pitch_timer.start()
+        if markers.has_pending_onset_training():
+            self._onset_timer.start()
         self._update_chord_header()
-        self._status_bar.showMessage(
+        base_msg = (
             f"Loaded: {os.path.basename(markers.wav_path)}  "
-            f"Duration: {markers.duration:.1f}s  Key: {self._detected_key}")
+            f"Duration: {markers.duration:.1f}s  Key: {self._detected_key}"
+        )
+        if companion_note:
+            base_msg = f"{base_msg}  |  {companion_note}"
+        self._status_bar.showMessage(base_msg)
 
     def _on_load_error(self, msg: str) -> None:
         self._controls.set_progress(0, "")
@@ -305,6 +330,105 @@ class MainWindow(QMainWindow):
     def _pitched_stem_paths(self, paths: list[str]) -> list[str]:
         return [p for p in paths if not self._is_likely_percussive_stem(p)]
 
+    def _default_stem_midi_path(self, stem_path: str) -> str:
+        root, _ = os.path.splitext(stem_path)
+        return f"{root}.mid"
+
+    def _default_chord_midi_path(self, stem_midi_path: str) -> str:
+        root, _ = os.path.splitext(stem_midi_path)
+        return f"{root}.chords.mid"
+
+    def _load_companion_stem_midi_if_present(self) -> str | None:
+        if self._markers is None:
+            return None
+
+        stem_path = self._markers.wav_path
+        if not stem_path:
+            return None
+
+        default_mid = self._default_stem_midi_path(stem_path)
+        default_midi = os.path.splitext(stem_path)[0] + ".midi"
+        candidates = [default_mid, default_midi]
+
+        midi_path = ""
+        for candidate in candidates:
+            if os.path.isfile(candidate):
+                midi_path = candidate
+                break
+        if not midi_path:
+            return None
+
+        try:
+            prefer_percussion = self._is_likely_percussive_stem(stem_path)
+            added_pitches, added_drums, boundaries, negatives = self._markers.load_user_notes_from_midi(
+                midi_path,
+                prefer_percussion=prefer_percussion,
+            )
+            if added_pitches or added_drums or boundaries or negatives:
+                self._cqt_view.refresh()
+                self._envelope_view.refresh()
+                return (
+                    f"Companion MIDI: {os.path.basename(midi_path)} "
+                    f"(pitched: {added_pitches}, drums: {added_drums}, "
+                    f"boundaries: {boundaries}, negatives: {negatives})"
+                )
+            return f"Companion MIDI: {os.path.basename(midi_path)} (no importable notes)"
+        except Exception as exc:
+            return f"Companion MIDI load failed: {os.path.basename(midi_path)} ({exc})"
+
+    def _chord_name_at_time(self, t: float) -> str | None:
+        if not self._chord_results:
+            return None
+        for row in self._chord_results:
+            if len(row) < 7:
+                continue
+            chord_name = str(row[3])
+            t0 = float(row[5])
+            t1 = float(row[6])
+            if t0 <= t < t1:
+                return chord_name
+        last = self._chord_results[-1]
+        if len(last) >= 4:
+            return str(last[3])
+        return None
+
+    def _build_chord_export_notes(self, song_duration: float) -> list[tuple[float, float, int, int]]:
+        if self._markers is None or not self._chord_results:
+            return []
+
+        bar_dur = float(self._markers.grid.bar_dur)
+        if song_duration <= 0.0 or bar_dur <= 0.0:
+            return []
+
+        starts: set[float] = {0.0}
+        t = 0.0
+        while t < song_duration:
+            starts.add(float(t))
+            t += bar_dur
+
+        for row in self._chord_results:
+            if len(row) < 7:
+                continue
+            starts.add(max(0.0, float(row[5])))
+
+        start_times = sorted(x for x in starts if 0.0 <= x < song_duration)
+        if not start_times:
+            return []
+
+        notes: list[tuple[float, float, int, int]] = []
+        for idx, t0 in enumerate(start_times):
+            t1 = start_times[idx + 1] if idx + 1 < len(start_times) else float(song_duration)
+            if t1 <= t0:
+                continue
+            chord_name = self._chord_name_at_time(t0 + 1e-4)
+            if not chord_name or chord_name == "N.C.":
+                continue
+            chord_notes = chord_to_piano_notes(chord_name)
+            for midi in chord_notes:
+                notes.append((float(t0), float(t1), int(midi), 92))
+
+        return notes
+
     # â”€â”€ Duration / Sensitivity â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_duration_changed(self, label: str) -> None:
@@ -321,30 +445,61 @@ class MainWindow(QMainWindow):
             self._envelope_view.refresh()
             self._pitch_timer.start()
 
+    def _on_pitch_model_changed(self, name: str) -> None:
+        if self._markers:
+            self._markers.set_pitch_model(name)
+            self._cqt_view.refresh()
+            self._envelope_view.refresh()
+            self._pitch_timer.start()
+            self._status_bar.showMessage(
+                f"Pitch model: {self._markers.pitch_model_summary}"
+            )
+
     # â”€â”€ Onset editing (envelope view) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
     def _on_onset_add(self, t: float) -> None:
         """Left click on envelope: restore nearest inactive candidate."""
-        if self._markers:
-            self._markers.restore_nearest_candidate(t)
-            n_del, n_pin = self._markers.apply_ml_suggestions_global()
-            self._cqt_view.refresh()
+        if self._markers and self._markers.restore_nearest_candidate(t):
             self._envelope_view.refresh()
-            self._pitch_timer.start()
-            if n_del or n_pin:
-                self._status_bar.showMessage(
-                    f"ML applied: {n_pin} added, {n_del} removed")
+            self._status_bar.showMessage("Onset feedback queued")
+            self._onset_timer.start()
 
     def _on_onset_remove(self, t: float) -> None:
         """Right click on envelope: remove nearest active candidate."""
-        if self._markers:
-            self._markers.remove_nearest_candidate(t)
-            n_del, n_pin = self._markers.apply_ml_suggestions_global()
-            self._cqt_view.refresh()
+        if self._markers and self._markers.remove_nearest_candidate(t):
             self._envelope_view.refresh()
-            if n_del or n_pin:
-                self._status_bar.showMessage(
-                    f"ML applied: {n_pin} added, {n_del} removed")
+            self._status_bar.showMessage("Onset feedback queued")
+            self._onset_timer.start()
+
+    def _run_onset_training(self) -> None:
+        if not self._markers or not self._markers.has_pending_onset_training():
+            return
+        if self._pitch_worker and self._pitch_worker.isRunning():
+            self._onset_timer.start()
+            return
+        if self._onset_worker and self._onset_worker.isRunning():
+            return
+        self._dispose_finished_worker("_onset_worker")
+        self._onset_worker = OnsetWorker(self._markers)
+        self._onset_worker.finished_ok.connect(self._on_onset_training_ready)
+        self._onset_worker.error.connect(
+            lambda msg: self._status_bar.showMessage(f"Onset training error: {msg}"))
+        self._onset_worker.start()
+
+    def _on_onset_training_ready(self, generation: int, stale: bool) -> None:
+        if not self._markers:
+            return
+        if stale or self._markers.has_pending_onset_training():
+            self._status_bar.showMessage("Onset feedback queued")
+            self._onset_timer.start()
+            return
+        t_start, t_end = self._cqt_view.time_window()
+        n_del, n_pin = self._markers.apply_ml_suggestions_window(t_start, t_end)
+        self._cqt_view.refresh()
+        self._envelope_view.refresh()
+        self._pitch_timer.start()
+        self._status_bar.showMessage(
+            f"Onset model updated: {n_pin} added, {n_del} removed")
 
     # â”€â”€ Pitch editing (CQT view) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -377,8 +532,9 @@ class MainWindow(QMainWindow):
             return
 
         self._markers.add_manual_pitch(t, midi)
-        self._cqt_view.refresh()
-        self._envelope_view.refresh()
+        self._cqt_view.apply_pitch_feedback(t, midi, keep=True)
+        self._pitch_update_dirty = True
+        self._status_bar.showMessage("Pitch feedback queued")
         self._pitch_timer.start()
 
     def _on_cqt_right_clicked(self, t: float, midi: int) -> None:
@@ -409,11 +565,10 @@ class MainWindow(QMainWindow):
                     f"Could not reject drum {midi} at slice {beat_index} (empty/invalid slice)")
             return
 
-        removed = self._markers.remove_manual_pitch(t, midi)
-        if not removed:
-            self._markers.mark_as_rest(t)
-        self._cqt_view.refresh()
-        self._envelope_view.refresh()
+        self._markers.remove_manual_pitch(t, midi)
+        self._cqt_view.apply_pitch_feedback(t, midi, keep=False)
+        self._pitch_update_dirty = True
+        self._status_bar.showMessage("Pitch feedback queued")
         self._pitch_timer.start()
 
     def _on_cqt_hovered(self, t: float, midi: int) -> None:
@@ -490,18 +645,52 @@ class MainWindow(QMainWindow):
     def _run_pitch_detection(self) -> None:
         if not self._markers:
             return
+        if self._onset_worker and self._onset_worker.isRunning():
+            self._pitch_update_dirty = True
+            self._pitch_timer.start()
+            return
         if self._pitch_worker and self._pitch_worker.isRunning():
+            self._pitch_update_dirty = True
             return
         self._dispose_finished_worker("_pitch_worker")
         t_start, t_end = self._cqt_view.time_window()
+        self._pitch_update_dirty = False
+        self._pitch_suggestion_baseline = (
+            self._cqt_view.rendered_suggestion_signature()
+        )
         self._pitch_worker = PitchWorker(self._markers, t_start, t_end)
         self._pitch_worker.finished_ok.connect(self._on_pitches_ready)
         self._pitch_worker.error.connect(
             lambda msg: self._status_bar.showMessage(f"Pitch error: {msg}"))
         self._pitch_worker.start()
 
-    def _on_pitches_ready(self, results: list) -> None:
+    def _on_pitches_ready(self, results: list, generation: int, stale: bool) -> None:
+        pending = bool(
+            stale or self._pitch_update_dirty
+            or (self._markers and self._markers.has_pending_pitch_training())
+        )
+        if pending:
+            self._status_bar.showMessage("Pitch feedback queued")
+            self._pitch_timer.start()
+            return
+        result_signature = {
+            (
+                round(float(row[0]), 6),
+                round(float(row[1]), 6),
+                int(row[2]),
+                str(row[3]),
+            )
+            for row in results
+            if len(row) >= 4
+            and row[2] is not None
+            and row[3] in {"nnls", "ml", "pyin"}
+        }
+        added = len(result_signature - self._pitch_suggestion_baseline)
+        removed = len(self._pitch_suggestion_baseline - result_signature)
         self._cqt_view.refresh()
+        self._status_bar.showMessage(
+            f"Pitch model applied to current view: {len(result_signature)} suggestions "
+            f"({added} added, {removed} removed)")
 
     # â”€â”€ Playback â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -572,8 +761,10 @@ class MainWindow(QMainWindow):
     def _on_export_midi(self) -> None:
         if not self._markers:
             return
+
+        stem_mid_default = self._default_stem_midi_path(self._markers.wav_path)
         out_path, _ = QFileDialog.getSaveFileName(
-            self, "Export MIDI", "output.mid", "MIDI files (*.mid *.midi)")
+            self, "Export MIDI", stem_mid_default, "MIDI files (*.mid *.midi)")
         if not out_path:
             return
         
@@ -584,11 +775,22 @@ class MainWindow(QMainWindow):
             notes = self._markers.get_cached_drum_hits(0.0, self._markers.duration)
             build_midi(notes, self._markers.grid.bpm, out_path, percussion=True)
         else:
-            # Export pitched notes
-            notes = self._markers.build_midi_notes(run_pyin_for_missing=True)
+            notes = self._markers.build_midi_notes()
             build_midi(notes, self._markers.grid.bpm, out_path, percussion=False)
-        
-        self._status_bar.showMessage(f"MIDI exported: {os.path.basename(out_path)}")
+
+        chord_out = self._default_chord_midi_path(out_path)
+        chord_notes = self._build_chord_export_notes(self._markers.duration)
+        if chord_notes:
+            build_midi(chord_notes, self._markers.grid.bpm, chord_out, percussion=False)
+            self._status_bar.showMessage(
+                f"MIDI exported: {os.path.basename(out_path)}  "
+                f"+ chords: {os.path.basename(chord_out)}"
+            )
+        else:
+            self._status_bar.showMessage(
+                f"MIDI exported: {os.path.basename(out_path)}  "
+                "(no chord spans available yet)"
+            )
 
     def _on_save_model(self) -> None:
         if not self._markers:
@@ -618,7 +820,13 @@ class MainWindow(QMainWindow):
             return
         try:
             self._markers.load_model_profile(str(choice), merge=False)
-            self._status_bar.showMessage(f"Model loaded: {choice}")
+            self._controls.set_pitch_model(self._markers.pitch_model_name)
+            self._cqt_view.refresh()
+            self._envelope_view.refresh()
+            self._pitch_timer.start()
+            self._status_bar.showMessage(
+                f"Model loaded: {choice} | {self._markers.pitch_model_summary}"
+            )
         except Exception as exc:
             QMessageBox.critical(self, "Load Model Error", str(exc))
 
@@ -860,9 +1068,27 @@ class MainWindow(QMainWindow):
         self._envelope_view.refresh()
 
         if accepted_pitches or accepted_onsets:
+            if self._markers.has_pending_pitch_training():
+                self._pitch_update_dirty = True
+                self._pitch_timer.start()
+            if self._markers.has_pending_onset_training():
+                self._onset_timer.start()
             item_label = "drums" if mode == "Percussive" else "pitch recommendations"
             self._status_bar.showMessage(
                 f"Accepted {accepted_pitches} {item_label} and {accepted_onsets} onset recommendations")
+
+    def _on_note_release_requested(self, note_id: str, release: float) -> None:
+        if not self._markers:
+            return
+        snapped_release = self._markers.set_note_release(note_id, release)
+        self._cqt_view.refresh()
+        if snapped_release is None:
+            self._status_bar.showMessage("Could not update note release")
+            return
+        if self._markers.has_pending_pitch_training():
+            self._pitch_update_dirty = True
+            self._pitch_timer.start()
+        self._status_bar.showMessage(f"Note release: {snapped_release:.3f}s")
 
     # â”€â”€ Cleanup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
@@ -873,7 +1099,9 @@ class MainWindow(QMainWindow):
         self._stop_worker(self._load_worker)
         self._stop_worker(self._chord_worker)
         self._stop_worker(self._pitch_worker)
+        self._stop_worker(self._onset_worker)
         self._load_worker = None
         self._chord_worker = None
         self._pitch_worker = None
+        self._onset_worker = None
         super().closeEvent(event)

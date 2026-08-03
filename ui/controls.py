@@ -26,6 +26,7 @@ class ControlPanel(QWidget):
     stem_changed = Signal(str)                  # new stem path
     duration_changed = Signal(str)              # "1/2", "1/8", "1/16"
     polyphony_changed = Signal(int)              # max simultaneous notes (1–10)
+    pitch_model_changed = Signal(str)           # registered pitch-model policy name
     mode_changed = Signal(str)                  # "Pitched" or "Percussive"
     play_midi_requested = Signal()
     play_audio_requested = Signal()
@@ -125,11 +126,11 @@ class ControlPanel(QWidget):
         vg.addLayout(polyphony_row, 2, 1)
 
         vg.addWidget(QLabel("Mode:"), 3, 0)
-        self._mode_combo = QComboBox()
-        for m in ["Pitched", "Percussive"]:
-            self._mode_combo.addItem(m)
-        self._mode_combo.currentTextChanged.connect(self._on_mode_combo_changed)
-        vg.addWidget(self._mode_combo, 3, 1)
+        self._pitch_model_combo = QComboBox()
+        self._pitch_model_combo.addItem("Pitched (standard)", "standard")
+        self._pitch_model_combo.addItem("Percussive", "percussive")
+        self._pitch_model_combo.currentIndexChanged.connect(self._on_pitch_model_changed)
+        vg.addWidget(self._pitch_model_combo, 3, 1)
 
         layout.addWidget(view_grp)
 
@@ -263,7 +264,15 @@ class ControlPanel(QWidget):
 
     def get_mode(self) -> str:
         """Return current mode ('Pitched' or 'Percussive')."""
-        return self._mode_combo.currentText()
+        return "Percussive" if self._pitch_model_combo.currentData() == "percussive" else "Pitched"
+
+    def pitch_model(self) -> str:
+        name = str(self._pitch_model_combo.currentData() or "standard")
+        return "standard" if name == "percussive" else name
+
+    def set_pitch_model(self, name: str) -> None:
+        index = self._pitch_model_combo.findData(str(name))
+        self._pitch_model_combo.setCurrentIndex(index if index >= 0 else 0)
 
     # ── Stem discovery ────────────────────────────────────────────────────
 
@@ -289,6 +298,14 @@ class ControlPanel(QWidget):
 
     def polyphony(self) -> int:
         return self._polyphony_slider.value()
+
+    def _on_pitch_model_changed(self, index: int) -> None:
+        name = str(self._pitch_model_combo.itemData(index) or "standard")
+        mode = "Percussive" if name == "percussive" else "Pitched"
+        self.mode_changed.emit(mode)
+        self._sync_cqt_source_options(mode)
+        if name != "percussive":
+            self.pitch_model_changed.emit(name)
 
     def _on_load(self) -> None:
         # Always open the file dialog so users can add more audio files.
@@ -330,10 +347,6 @@ class ControlPanel(QWidget):
                 self._wav_path = full
                 self._file_label.setText(name)
                 self.stem_changed.emit(full)
-
-    def _on_mode_combo_changed(self, mode: str) -> None:
-        self.mode_changed.emit(mode)
-        self._sync_cqt_source_options(mode)
 
     def _sync_cqt_source_options(self, mode: str) -> None:
         options = self.PERCUSSIVE_SOURCES if mode == "Percussive" else self.PITCHED_SOURCES

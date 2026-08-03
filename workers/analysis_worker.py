@@ -74,7 +74,7 @@ class ChordWorker(QThread):
 class PitchWorker(QThread):
     """Run pYIN pitch detection for a visible time window."""
 
-    finished_ok = Signal(list)   # list of (t0, t1, midi, source)
+    finished_ok = Signal(list, int, bool)
     error = Signal(str)
 
     def __init__(self, markers: AudioMarkers, t_start: float, t_end: float):
@@ -85,8 +85,31 @@ class PitchWorker(QThread):
 
     def run(self) -> None:
         try:
+            generation = self.markers.process_pending_pitch_training()
             results = self.markers.compute_visible_block_pitches(
                 self.t_start, self.t_end)
-            self.finished_ok.emit(results)
+            stale = generation != self.markers.pitch_edit_generation
+            if stale:
+                self.markers._invalidate_note_spans()
+            self.finished_ok.emit(results, generation, stale)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class OnsetWorker(QThread):
+    """Train queued onset labels without touching pitch, drum, or chord models."""
+
+    finished_ok = Signal(int, bool)
+    error = Signal(str)
+
+    def __init__(self, markers: AudioMarkers):
+        super().__init__()
+        self.markers = markers
+
+    def run(self) -> None:
+        try:
+            generation = self.markers.process_pending_onset_training()
+            stale = generation != self.markers.onset_edit_generation
+            self.finished_ok.emit(generation, stale)
         except Exception as exc:
             self.error.emit(str(exc))
