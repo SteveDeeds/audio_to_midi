@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -22,6 +23,9 @@ class TestMidiRoundTrip(unittest.TestCase):
         markers._candidate_active_keys = set(markers._candidate_features)
         markers._candidate_forced_on_keys = set()
         markers._candidate_forced_off_keys = set()
+        markers._onset_training_lock = threading.Lock()
+        markers._pending_onset_training = []
+        markers._onset_edit_generation = 0
         markers._pitch_cache = {}
         markers._pyin_seeded_keys = set()
         markers.chroma_times = []
@@ -32,6 +36,11 @@ class TestMidiRoundTrip(unittest.TestCase):
         ])
 
         self.assertEqual((positives, negatives), (2, 4))
+        self.assertTrue(markers.has_pending_onset_training())
+        self.assertEqual(markers.model.to_dict(user_only=True)["cand"], [])
+
+        markers.process_pending_onset_training()
+
         user_rows = {
             row["key"]: row["label"]
             for row in markers.model.to_dict(user_only=True)["cand"]

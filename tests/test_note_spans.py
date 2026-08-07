@@ -1,5 +1,7 @@
 import unittest
 import threading
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import numpy as np
 
@@ -87,6 +89,7 @@ class TestNoteSpans(unittest.TestCase):
         markers._next_explicit_note_id = 1
         markers._pitch_training_lock = threading.Lock()
         markers._pending_pitch_training = []
+        markers._pending_pitch_silence_keys = []
         markers._pitch_edit_generation = 0
         markers._note_spans_revision = 0
         markers._onset_training_lock = threading.Lock()
@@ -255,7 +258,9 @@ class TestNoteSpans(unittest.TestCase):
             lambda key, midi, keep, source: (key, midi, keep, source)
         )
         trained_keys = []
-        markers._train_pitch_model_for_manual_block = trained_keys.append
+        markers._train_pitch_model_for_manual_blocks = (
+            lambda keys: trained_keys.extend(sorted(keys))
+        )
 
         generation = markers.process_pending_pitch_training()
 
@@ -263,6 +268,36 @@ class TestNoteSpans(unittest.TestCase):
         self.assertFalse(markers.has_pending_pitch_training())
         self.assertEqual(len(markers.model.batches), 1)
         self.assertEqual(trained_keys, [(0, 100)])
+
+    def test_midi_import_queues_pitch_training_without_fitting_inline(self) -> None:
+        markers = self.make_markers()
+        markers.grid = SimpleNamespace(bpm=120.0, beats_per_bar=4)
+        markers._current_min_dur_label = "1/8"
+        markers._current_min_dur_sec = 0.25
+        markers._candidate_raw_times = []
+        markers._candidate_features = {}
+        markers._candidate_percussive_spikes = {}
+        markers._candidate_active_keys = set()
+        markers._candidate_forced_on_keys = set()
+        markers._candidate_forced_off_keys = set()
+        markers._manual_drums = {}
+        markers._manual_drum_rejects = {}
+        markers._pending_drum_training = []
+        markers._harmonic_block_energy = lambda *_args: 1.0
+        markers.model = _CorrectionModelStub()
+
+        with patch("core.midi_export.load_midi_notes", return_value=[
+            (0.0, 1.0, 60, 100, 0),
+            (1.0, 2.0, 64, 100, 0),
+        ]):
+            result = markers.load_user_notes_from_midi("companion.mid")
+
+        self.assertEqual(result[0], 2)
+        self.assertEqual(markers._pitch_model.events, [])
+        self.assertEqual(markers.model.batches, [])
+        self.assertTrue(markers.has_pending_pitch_training())
+        self.assertEqual(len(markers._pending_pitch_training), 2)
+        self.assertEqual(markers._pending_pitch_silence_keys, [(200, 300), (300, 400)])
 
     def test_onset_edit_is_queued_without_training_inline(self) -> None:
         markers = self.make_markers()

@@ -208,6 +208,7 @@ class AudioMarkers:
         self._published_note_spans: tuple[PitchedNoteSpan, ...] = ()
         self._pitch_training_lock = threading.Lock()
         self._pending_pitch_training: list[tuple[tuple[int, int], int, bool]] = []
+        self._pending_pitch_silence_keys: list[tuple[int, int]] = []
         self._pending_drum_training: list[tuple[int, int, float, int, str, bool]] = []
         self._pitch_edit_generation = 0
         self._note_spans_revision = 0
@@ -1024,15 +1025,27 @@ class AudioMarkers:
         return float(boundaries[index]), float(boundaries[index + 1])
 
     def _train_pitch_model_for_manual_block(self, key: tuple[int, int]) -> None:
+        self._train_pitch_model_for_manual_blocks([key])
+
+    def _train_pitch_model_for_manual_blocks(
+        self, keys: list[tuple[int, int]] | set[tuple[int, int]]
+    ) -> None:
         with self._pitch_training_lock:
-            manual = self._manual_pitches.get(key)
-        if manual is None or len(manual) == 0:
-            return
-        t0 = float(key[0]) / float(self.sr)
-        t1 = float(key[1]) / float(self.sr)
-        self._multi_atom_model.observe(t0, t1, [int(m) for m in manual])
-        self._multi_atom_model.calibrate(self._confirmed_pitch_examples())
-        self.model.multi_atom_threshold_ratio = self._multi_atom_model.threshold_ratio
+            observations = [
+                (key, self._manual_pitches.get(key))
+                for key in sorted(set(keys))
+            ]
+        observed = False
+        for key, manual in observations:
+            if not manual:
+                continue
+            t0 = float(key[0]) / float(self.sr)
+            t1 = float(key[1]) / float(self.sr)
+            self._multi_atom_model.observe(t0, t1, [int(m) for m in manual])
+            observed = True
+        if observed:
+            self._multi_atom_model.calibrate(self._confirmed_pitch_examples())
+            self.model.multi_atom_threshold_ratio = self._multi_atom_model.threshold_ratio
 
     def _confirmed_pitch_examples(self) -> list[tuple[float, float, frozenset[int]]]:
         with self._pitch_training_lock:
@@ -1190,6 +1203,7 @@ class AudioMarkers:
         with self._pitch_training_lock:
             return bool(
                 self._pending_pitch_training
+                or getattr(self, "_pending_pitch_silence_keys", [])
                 or getattr(self, "_pending_drum_training", [])
             )
 
@@ -1198,12 +1212,22 @@ class AudioMarkers:
         with self._pitch_training_lock:
             events = self._pending_pitch_training
             self._pending_pitch_training = []
+            silence_keys = getattr(self, "_pending_pitch_silence_keys", [])
+            self._pending_pitch_silence_keys = []
             drum_events = getattr(self, "_pending_drum_training", [])
             self._pending_drum_training = []
             generation = int(self._pitch_edit_generation)
 
-        if not events and not drum_events:
+        if not events and not silence_keys and not drum_events:
             return generation
+
+        for key in silence_keys:
+            t0 = float(key[0]) / float(self.sr)
+            t1 = float(key[1]) / float(self.sr)
+            candidates = self._pitch_model.select_nnls_notes(
+                self._nnls_notes_for_block(t0, t1)
+            )
+            events.extend((key, int(midi), False) for midi, _score in candidates)
 
         gate_examples = []
         positive_keys: set[tuple[int, int]] = set()
@@ -1221,8 +1245,7 @@ class AudioMarkers:
 
         if gate_examples:
             self.model.record_pitch_gate_batch(gate_examples)
-        for key in positive_keys:
-            self._train_pitch_model_for_manual_block(key)
+        self._train_pitch_model_for_manual_blocks(positive_keys)
         for beat_index, drum_midi, bpm, beats_per_bar, duration_str, keep in drum_events:
             self._process_drum_training(
                 beat_index, drum_midi, bpm, beats_per_bar, duration_str, keep
@@ -1489,11 +1512,14 @@ class AudioMarkers:
     ) -> PitchedNoteSpan:
         boundaries = self._analysis_boundaries()
         block_keys = []
-        for index in range(len(boundaries) - 1):
+        first_index = max(0, int(np.searchsorted(boundaries, onset, side="right")) - 1)
+        end_index = min(
+            len(boundaries) - 1,
+            int(np.searchsorted(boundaries, release, side="left")),
+        )
+        for index in range(first_index, end_index):
             t0 = float(boundaries[index])
             t1 = float(boundaries[index + 1])
-            if t1 <= onset or t0 >= release:
-                continue
             block_keys.append((
                 int(t0 * self.sr),
                 int(min(t1 * self.sr, len(self.audio))),
@@ -1627,7 +1653,9 @@ class AudioMarkers:
                 key in positive_keys, key, "user",
             ))
         if examples:
-            self.model.record_candidate_batch(examples)
+            with self._onset_training_lock:
+                self._pending_onset_training.extend(examples)
+                self._onset_edit_generation += 1
 
         valid_keys = set(self._candidate_features)
         positive_keys &= valid_keys
@@ -1677,8 +1705,7 @@ class AudioMarkers:
 
         added_pitches = 0
         added_drums = 0
-        pitch_gate_examples: list[tuple] = []
-        touched_pitch_keys: set[tuple[int, int]] = set()
+        pending_pitch_events: set[tuple[tuple[int, int], int, bool]] = set()
         seen_pitches: set[tuple[int, int, int]] = set()
         seen_drums: set[tuple[int, int]] = set()
 
@@ -1707,49 +1734,46 @@ class AudioMarkers:
                 continue
             span = self._add_explicit_note_span(tt0, tt1, int(midi))
             for block_key in span.block_keys:
-                self._pitch_model.observe_confirmation(block_key, int(midi))
                 existing = self._manual_pitches.get(block_key)
                 notes = list(existing) if existing else []
                 notes.append(int(midi))
                 self._manual_pitches[block_key] = tuple(sorted(set(notes)))
-                touched_pitch_keys.add(block_key)
+                pending_pitch_events.add((block_key, int(midi), True))
             seen_pitches.add(pitch_key)
             added_pitches += 1
 
-        for key in touched_pitch_keys:
-            self._train_pitch_model_for_manual_block(key)
-            for midi in self._manual_pitches.get(key, ()) or ():
-                example = self._pitch_gate_example_with_nnls(key, int(midi), True, "user")
-                if example is not None:
-                    pitch_gate_examples.append(example)
-
-        pitched_intervals = [
+        pitched_intervals = sorted([
             (t0, t1) for t0, t1, _midi, _vel, channel in clipped
             if not prefer_percussion and int(channel) != 9
-        ]
-        negative_pitch_labels = 0
+        ])
+        silence_keys: list[tuple[int, int]] = []
         if pitched_intervals:
             boundaries = np.sort(np.unique(np.concatenate([
                 [0.0], self.onset_times, self.chroma_times, [self.duration]
             ])))
+            interval_index = 0
             for idx in range(len(boundaries) - 1):
                 t0, t1 = float(boundaries[idx]), float(boundaries[idx + 1])
-                if any(note_t0 < t1 and note_t1 > t0 for note_t0, note_t1 in pitched_intervals):
+                while (
+                    interval_index < len(pitched_intervals)
+                    and pitched_intervals[interval_index][1] <= t0
+                ):
+                    interval_index += 1
+                if (
+                    interval_index < len(pitched_intervals)
+                    and pitched_intervals[interval_index][0] < t1
+                ):
                     continue
                 key = (int(t0 * self.sr), int(min(t1 * self.sr, len(self.audio))))
-                candidates = self._pitch_model.select_nnls_notes(
-                    self._nnls_notes_for_block(t0, t1)
-                )
-                for midi, _score in candidates:
-                    example = self._pitch_gate_example_with_nnls(key, int(midi), False, "user")
-                    if example is not None:
-                        pitch_gate_examples.append(example)
-                        negative_pitch_labels += 1
+                silence_keys.append(key)
 
-        if pitch_gate_examples:
-            self.model.record_pitch_gate_batch(pitch_gate_examples)
+        if pending_pitch_events or silence_keys:
+            with self._pitch_training_lock:
+                self._pending_pitch_training.extend(sorted(pending_pitch_events))
+                self._pending_pitch_silence_keys.extend(silence_keys)
+                self._pitch_edit_generation += 1
 
-        negative_labels = silent_candidate_labels + negative_pitch_labels
+        negative_labels = silent_candidate_labels
         self._invalidate_note_spans()
         return added_pitches, added_drums, boundary_labels, negative_labels
 
