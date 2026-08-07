@@ -119,9 +119,8 @@ class TestViewState(unittest.TestCase):
                     ("feedback", t, midi, keep)
                 )
             ),
-            _pitch_timer=SimpleNamespace(start=lambda: calls.append(("timer",))),
+            _learning=SimpleNamespace(request_pitch=lambda: calls.append(("timer",))),
             _status_bar=SimpleNamespace(showMessage=lambda message: None),
-            _pitch_update_dirty=False,
         )
 
         MainWindow._on_cqt_right_clicked(window, 36.75, 36)
@@ -157,15 +156,13 @@ class TestViewState(unittest.TestCase):
                 ),
                 refresh=lambda: self.fail("release commit must not rebuild the scene"),
             ),
-            _pitch_timer=SimpleNamespace(start=lambda: calls.append(("timer",))),
+            _learning=SimpleNamespace(request_pitch=lambda: calls.append(("timer",))),
             _status_bar=SimpleNamespace(showMessage=lambda message: None),
-            _pitch_update_dirty=False,
         )
 
         MainWindow._on_note_release_requested(window, "generated:1", 2.4)
 
         self.assertEqual(calls[0], ("release", "generated:1", 2.5))
-        self.assertTrue(window._pitch_update_dirty)
         self.assertIn(("timer",), calls)
 
     def test_learned_prediction_is_visible_when_off_scale(self) -> None:

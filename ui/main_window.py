@@ -26,15 +26,17 @@ from core.chord_analysis import (
 from core.chord_change_model import ChordChangeModel
 from core.midi_export import build_midi
 from core.playback import MidiPlayback
+from core.session import SongSession
 
 from ui.cqt_view import CQTGraphicsView
 from ui.chroma_strip import ChromaStripWidget
 from ui.envelope_view import EnvelopeView
 from ui.controls import ControlPanel
 from ui.chord_header import ChordHeaderWidget
+from ui.learning_coordinator import LearningCoordinator
 from ui.styles import QSS
 
-from workers.analysis_worker import LoadWorker, ChordWorker, OnsetWorker, PitchWorker
+from workers.analysis_worker import LoadWorker, ChordWorker
 
 
 def _clicked_manual_note(rows: list, t: float, midi: int) -> tuple | None:
@@ -71,11 +73,9 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(QSS)
 
         self._markers: AudioMarkers | None = None
+        self._song_session = SongSession()
         self._load_worker: LoadWorker | None = None
         self._chord_worker: ChordWorker | None = None
-        self._pitch_worker: PitchWorker | None = None
-        self._onset_worker: OnsetWorker | None = None
-        self._pitch_update_dirty: bool = False
         self._pitch_suggestion_baseline: set[tuple] = set()
         self._chord_results: list = []
         self._detected_key: str = ""
@@ -197,21 +197,20 @@ class MainWindow(QMainWindow):
         self._envelope_view.bar_changed.connect(self._on_bar_changed_from_envelope)
         self._envelope_view.zoom_changed.connect(self._on_zoom_from_envelope)
 
-        # Pitch detection timer
-        self._pitch_timer = QTimer(self)
-        self._pitch_timer.setSingleShot(True)
-        self._pitch_timer.setInterval(200)
-        self._pitch_timer.timeout.connect(self._run_pitch_detection)
-
-        self._onset_timer = QTimer(self)
-        self._onset_timer.setSingleShot(True)
-        self._onset_timer.setInterval(100)
-        self._onset_timer.timeout.connect(self._run_onset_training)
-        
         # Playback position timer (updates playhead line)
         self._playback_timer = QTimer(self)
         self._playback_timer.setInterval(30)  # ~33 Hz for smooth playhead
         self._playback_timer.timeout.connect(self._on_playback_tick)
+
+        self._learning = LearningCoordinator(self._cqt_view.time_window, self)
+        self._learning.pitch_started.connect(self._on_pitch_started)
+        self._learning.pitches_ready.connect(self._on_pitches_ready)
+        self._learning.onset_ready.connect(self._on_onset_training_ready)
+        self._learning.error.connect(
+            lambda domain, msg: self._status_bar.showMessage(
+                f"{domain} training error: {msg}"
+            )
+        )
 
     def _dispose_finished_worker(self, worker_attr: str) -> None:
         worker = getattr(self, worker_attr)
@@ -245,18 +244,19 @@ class MainWindow(QMainWindow):
                  preserve_chords: bool = False) -> None:
         if self._load_worker and self._load_worker.isRunning():
             return
-        self._pitch_timer.stop()
-        self._onset_timer.stop()
-        self._stop_worker(self._pitch_worker)
-        self._stop_worker(self._onset_worker)
-        self._pitch_worker = None
-        self._onset_worker = None
+        self._learning.clear_session()
         self._dispose_finished_worker("_load_worker")
         self._preserve_chords_on_next_load = bool(preserve_chords)
         if not self._preserve_chords_on_next_load:
             self._clear_chord_analysis_state()
         self._controls.set_loaded(False)
         self._controls.set_progress(1, "Loading â€¦")
+
+        cached = self._song_session.activate_cached(wav_path, bpm, beats_per_bar)
+        if cached is not None:
+            self._controls.set_progress(90, "Restoring cached stem â€¦")
+            self._on_load_done(cached.markers)
+            return
 
         self._load_worker = LoadWorker(
             wav_path,
@@ -270,7 +270,13 @@ class MainWindow(QMainWindow):
         self._load_worker.start()
 
     def _on_load_done(self, markers: AudioMarkers) -> None:
-        self._markers = markers
+        stem_session = self._song_session.store(
+            markers,
+            markers.grid.bpm,
+            markers.grid.beats_per_bar,
+        )
+        self._markers = stem_session.markers
+        self._learning.set_session(self._markers)
         if self._player is None:
             self._player = MidiPlayback()
         markers.set_pitch_model(self._controls.pitch_model())
@@ -306,9 +312,9 @@ class MainWindow(QMainWindow):
         self._bar_label.setText(
             f"Bar {self._cqt_view.current_bar}  "
             f"({self._cqt_view.zoom_bars}-bar view)")
-        self._pitch_timer.start()
+        self._learning.request_pitch()
         if markers.has_pending_onset_training():
-            self._onset_timer.start()
+            self._learning.request_onset()
         self._update_chord_header()
         base_msg = (
             f"Loaded: {os.path.basename(markers.wav_path)}  "
@@ -389,7 +395,7 @@ class MainWindow(QMainWindow):
                 prefer_percussion=prefer_percussion,
             )
             if added_pitches or added_drums or boundaries or negatives:
-                self._cqt_view.refresh()
+                self._cqt_view.refresh(run_inference=False)
                 self._envelope_view.refresh()
                 return (
                     f"Companion MIDI: {os.path.basename(midi_path)} "
@@ -460,21 +466,21 @@ class MainWindow(QMainWindow):
             self._markers.apply_min_duration(label)
             self._cqt_view.refresh()
             self._envelope_view.refresh()
-            self._pitch_timer.start()
+            self._learning.request_pitch()
 
     def _on_polyphony_changed(self, max_notes: int) -> None:
         if self._markers:
             self._markers.set_polyphony(max_notes)
             self._cqt_view.refresh()
             self._envelope_view.refresh()
-            self._pitch_timer.start()
+            self._learning.request_pitch()
 
     def _on_pitch_model_changed(self, name: str) -> None:
         if self._markers:
             self._markers.set_pitch_model(name)
             self._cqt_view.refresh()
             self._envelope_view.refresh()
-            self._pitch_timer.start()
+            self._learning.request_pitch()
             self._status_bar.showMessage(
                 f"Pitch model: {self._markers.pitch_model_summary}"
             )
@@ -486,42 +492,26 @@ class MainWindow(QMainWindow):
         if self._markers and self._markers.restore_nearest_candidate(t):
             self._envelope_view.refresh()
             self._status_bar.showMessage("Onset feedback queued")
-            self._onset_timer.start()
+            self._learning.request_onset()
 
     def _on_onset_remove(self, t: float) -> None:
         """Right click on envelope: remove nearest active candidate."""
         if self._markers and self._markers.remove_nearest_candidate(t):
             self._envelope_view.refresh()
             self._status_bar.showMessage("Onset feedback queued")
-            self._onset_timer.start()
+            self._learning.request_onset()
 
-    def _run_onset_training(self) -> None:
-        if not self._markers or not self._markers.has_pending_onset_training():
-            return
-        if self._pitch_worker and self._pitch_worker.isRunning():
-            self._onset_timer.start()
-            return
-        if self._onset_worker and self._onset_worker.isRunning():
-            return
-        self._dispose_finished_worker("_onset_worker")
-        self._onset_worker = OnsetWorker(self._markers)
-        self._onset_worker.finished_ok.connect(self._on_onset_training_ready)
-        self._onset_worker.error.connect(
-            lambda msg: self._status_bar.showMessage(f"Onset training error: {msg}"))
-        self._onset_worker.start()
-
-    def _on_onset_training_ready(self, generation: int, stale: bool) -> None:
+    def _on_onset_training_ready(self, generation: int, pending: bool) -> None:
         if not self._markers:
             return
-        if stale or self._markers.has_pending_onset_training():
+        if pending:
             self._status_bar.showMessage("Onset feedback queued")
-            self._onset_timer.start()
             return
         t_start, t_end = self._cqt_view.time_window()
         n_del, n_pin = self._markers.apply_ml_suggestions_window(t_start, t_end)
         self._cqt_view.refresh()
         self._envelope_view.refresh()
-        self._pitch_timer.start()
+        self._learning.request_pitch()
         self._status_bar.showMessage(
             f"Onset model updated: {n_pin} added, {n_del} removed")
 
@@ -559,7 +549,7 @@ class MainWindow(QMainWindow):
             else:
                 self._status_bar.showMessage(
                     f"Could not add drum {midi} at slice {beat_index} (empty/invalid slice)")
-            self._pitch_timer.start()
+            self._learning.request_pitch()
             return
 
         self._markers.add_manual_pitch(t, midi)
@@ -567,9 +557,8 @@ class MainWindow(QMainWindow):
         row = _manual_preview_note(self._markers, t, midi)
         if row is not None:
             self._preview_note_window(float(row[0]), float(row[1]), fallback_row=row)
-        self._pitch_update_dirty = True
         self._status_bar.showMessage("Pitch feedback queued")
-        self._pitch_timer.start()
+        self._learning.request_pitch()
 
     def _on_cqt_right_clicked(self, t: float, midi: int) -> None:
         """Right click: reject pitch (pitched mode) or drum (percussive mode)."""
@@ -601,14 +590,13 @@ class MainWindow(QMainWindow):
             else:
                 self._status_bar.showMessage(
                     f"Could not reject drum {midi} at slice {beat_index} (empty/invalid slice)")
-            self._pitch_timer.start()
+            self._learning.request_pitch()
             return
 
         self._markers.remove_manual_pitch(t, midi)
         self._cqt_view.apply_pitch_feedback(t, midi, keep=False)
-        self._pitch_update_dirty = True
         self._status_bar.showMessage("Pitch feedback queued")
-        self._pitch_timer.start()
+        self._learning.request_pitch()
 
     def _on_cqt_hovered(self, t: float, midi: int) -> None:
         if self._markers is None:
@@ -651,28 +639,28 @@ class MainWindow(QMainWindow):
             f"Bar {bar}  ({self._cqt_view.zoom_bars}-bar view)")
         self._envelope_view.sync_view(bar, self._cqt_view.zoom_bars)
         self._update_chord_header()
-        self._pitch_timer.start()
+        self._learning.request_pitch()
 
     def _on_bar_changed_from_envelope(self, bar: int) -> None:
         self._bar_label.setText(
             f"Bar {bar}  ({self._envelope_view.zoom_bars}-bar view)")
         self._cqt_view.sync_view(bar, self._envelope_view.zoom_bars)
         self._update_chord_header()
-        self._pitch_timer.start()
+        self._learning.request_pitch()
 
     def _on_zoom_from_cqt(self, zoom_bars: int) -> None:
         self._envelope_view.sync_view(self._cqt_view.current_bar, zoom_bars)
         self._bar_label.setText(
             f"Bar {self._cqt_view.current_bar}  ({zoom_bars}-bar view)")
         self._update_chord_header()
-        self._pitch_timer.start()
+        self._learning.request_pitch()
 
     def _on_zoom_from_envelope(self, zoom_bars: int) -> None:
         self._cqt_view.sync_view(self._envelope_view.current_bar, zoom_bars)
         self._bar_label.setText(
             f"Bar {self._envelope_view.current_bar}  ({zoom_bars}-bar view)")
         self._update_chord_header()
-        self._pitch_timer.start()
+        self._learning.request_pitch()
 
     def _update_chord_header(self) -> None:
         t_start, t_end = self._cqt_view.time_window()
@@ -681,36 +669,14 @@ class MainWindow(QMainWindow):
 
     # â”€â”€ Pitch detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-    def _run_pitch_detection(self) -> None:
-        if not self._markers:
-            return
-        if self._onset_worker and self._onset_worker.isRunning():
-            self._pitch_update_dirty = True
-            self._pitch_timer.start()
-            return
-        if self._pitch_worker and self._pitch_worker.isRunning():
-            self._pitch_update_dirty = True
-            return
-        self._dispose_finished_worker("_pitch_worker")
-        t_start, t_end = self._cqt_view.time_window()
-        self._pitch_update_dirty = False
+    def _on_pitch_started(self) -> None:
         self._pitch_suggestion_baseline = (
             self._cqt_view.rendered_suggestion_signature()
         )
-        self._pitch_worker = PitchWorker(self._markers, t_start, t_end)
-        self._pitch_worker.finished_ok.connect(self._on_pitches_ready)
-        self._pitch_worker.error.connect(
-            lambda msg: self._status_bar.showMessage(f"Pitch error: {msg}"))
-        self._pitch_worker.start()
 
-    def _on_pitches_ready(self, results: list, generation: int, stale: bool) -> None:
-        pending = bool(
-            stale or self._pitch_update_dirty
-            or (self._markers and self._markers.has_pending_pitch_training())
-        )
+    def _on_pitches_ready(self, results: list, generation: int, pending: bool) -> None:
         if pending:
             self._status_bar.showMessage("Pitch feedback queued")
-            self._pitch_timer.start()
             return
         result_signature = {
             (
@@ -901,7 +867,7 @@ class MainWindow(QMainWindow):
             self._controls.set_pitch_model(self._markers.pitch_model_name)
             self._cqt_view.refresh()
             self._envelope_view.refresh()
-            self._pitch_timer.start()
+            self._learning.request_pitch()
             self._status_bar.showMessage(
                 f"Model loaded: {choice} | {self._markers.pitch_model_summary}"
             )
@@ -1147,10 +1113,9 @@ class MainWindow(QMainWindow):
 
         if accepted_pitches or accepted_onsets:
             if self._markers.has_pending_pitch_training():
-                self._pitch_update_dirty = True
-                self._pitch_timer.start()
+                self._learning.request_pitch()
             if self._markers.has_pending_onset_training():
-                self._onset_timer.start()
+                self._learning.request_onset()
             item_label = "drums" if mode == "Percussive" else "pitch recommendations"
             self._status_bar.showMessage(
                 f"Accepted {accepted_pitches} {item_label} and {accepted_onsets} onset recommendations")
@@ -1164,8 +1129,7 @@ class MainWindow(QMainWindow):
             return
         self._cqt_view.apply_note_release(note_id, snapped_release)
         if self._markers.has_pending_pitch_training():
-            self._pitch_update_dirty = True
-            self._pitch_timer.start()
+            self._learning.request_pitch()
         self._status_bar.showMessage(f"Note release: {snapped_release:.3f}s")
 
     # â”€â”€ Cleanup â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -1176,10 +1140,7 @@ class MainWindow(QMainWindow):
             self._player.stop()
         self._stop_worker(self._load_worker)
         self._stop_worker(self._chord_worker)
-        self._stop_worker(self._pitch_worker)
-        self._stop_worker(self._onset_worker)
+        self._learning.shutdown()
         self._load_worker = None
         self._chord_worker = None
-        self._pitch_worker = None
-        self._onset_worker = None
         super().closeEvent(event)

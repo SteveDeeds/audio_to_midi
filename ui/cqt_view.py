@@ -285,10 +285,10 @@ class CQTGraphicsView(QGraphicsView):
         self._current_bar = 1
         self._navigate_to_bar(1)
 
-    def refresh(self) -> None:
+    def refresh(self, run_inference: bool = True) -> None:
         """Re-render the current view (e.g. after pitch detection finishes)."""
         if self._markers:
-            self._rebuild_scene()
+            self._rebuild_scene(run_inference=run_inference)
 
     def apply_pitch_feedback(self, t: float, midi: int, keep: bool) -> None:
         """Apply immediate visual feedback while model work runs in the background."""
