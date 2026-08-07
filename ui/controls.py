@@ -14,12 +14,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, QSize
 
+from core.mode_registry import get_mode, registered_modes
+
 
 class ControlPanel(QWidget):
     """Left sidebar with all controls."""
-
-    PITCHED_SOURCES = ["db", "spectral peel", "pitch salience", "flux novelty"]
-    PERCUSSIVE_SOURCES = ["CQT (Percussive)", "STFT", "Mel"]
 
     # Signals
     load_requested = Signal(str, float, int)   # (wav_path, bpm, beats_per_bar)
@@ -106,7 +105,7 @@ class ControlPanel(QWidget):
 
         vg.addWidget(QLabel("Display source:"), 1, 0)
         self._cqt_source_combo = QComboBox()
-        for source in self.PITCHED_SOURCES:
+        for source in get_mode("standard").display_sources:
             self._cqt_source_combo.addItem(source)
         self._cqt_source_combo.currentTextChanged.connect(self.cqt_source_changed.emit)
         vg.addWidget(self._cqt_source_combo, 1, 1)
@@ -126,8 +125,8 @@ class ControlPanel(QWidget):
 
         vg.addWidget(QLabel("Mode:"), 3, 0)
         self._pitch_model_combo = QComboBox()
-        self._pitch_model_combo.addItem("Pitched (standard)", "standard")
-        self._pitch_model_combo.addItem("Percussive", "percussive")
+        for mode in registered_modes():
+            self._pitch_model_combo.addItem(mode.label, mode.id)
         self._pitch_model_combo.currentIndexChanged.connect(self._on_pitch_model_changed)
         vg.addWidget(self._pitch_model_combo, 3, 1)
 
@@ -281,11 +280,11 @@ class ControlPanel(QWidget):
 
     def get_mode(self) -> str:
         """Return current mode ('Pitched' or 'Percussive')."""
-        return "Percussive" if self._pitch_model_combo.currentData() == "percussive" else "Pitched"
+        return get_mode(str(self._pitch_model_combo.currentData())).ui_mode
 
     def pitch_model(self) -> str:
-        name = str(self._pitch_model_combo.currentData() or "standard")
-        return "standard" if name == "percussive" else name
+        mode = get_mode(str(self._pitch_model_combo.currentData()))
+        return mode.pitch_model_name or "standard"
 
     def set_pitch_model(self, name: str) -> None:
         index = self._pitch_model_combo.findData(str(name))
@@ -317,12 +316,11 @@ class ControlPanel(QWidget):
         return self._polyphony_slider.value()
 
     def _on_pitch_model_changed(self, index: int) -> None:
-        name = str(self._pitch_model_combo.itemData(index) or "standard")
-        mode = "Percussive" if name == "percussive" else "Pitched"
-        self.mode_changed.emit(mode)
-        self._sync_cqt_source_options(mode)
-        if name != "percussive":
-            self.pitch_model_changed.emit(name)
+        mode = get_mode(str(self._pitch_model_combo.itemData(index)))
+        self.mode_changed.emit(mode.ui_mode)
+        self._sync_cqt_source_options(mode.id)
+        if mode.pitch_model_name is not None:
+            self.pitch_model_changed.emit(mode.pitch_model_name)
 
     def _on_load(self) -> None:
         # Always open the file dialog so users can add more audio files.
@@ -365,8 +363,8 @@ class ControlPanel(QWidget):
                 self._file_label.setText(name)
                 self.stem_changed.emit(full)
 
-    def _sync_cqt_source_options(self, mode: str) -> None:
-        options = self.PERCUSSIVE_SOURCES if mode == "Percussive" else self.PITCHED_SOURCES
+    def _sync_cqt_source_options(self, mode_id: str) -> None:
+        options = get_mode(mode_id).display_sources
         current = self._cqt_source_combo.currentText()
         self._cqt_source_combo.blockSignals(True)
         self._cqt_source_combo.clear()
