@@ -69,6 +69,32 @@ class CorrectionModel:
         """Return an isolated training copy, including non-persisted live state."""
         return copy.deepcopy(self)
 
+    def learning_metrics(self) -> dict[str, int]:
+        """Return training-set and learned-state sizes for diagnostics."""
+        atoms = [
+            atom
+            for midi_atoms in self.instrument_dictionary._atoms.values()
+            for atom in midi_atoms
+        ]
+        fixed_weight_scalars = int(
+            self._cand_w.size + self._pitch_gate_w.size + self._drum_w.size
+        )
+        fingerprint_scalars = int(sum(vector.size for vector in self._fp_vecs))
+        atom_scalars = int(sum(atom.vector.size for atom in atoms))
+        return {
+            "candidate_examples": len(self._cand_X),
+            "pitch_gate_examples": len(self._pitch_gate_X),
+            "fingerprint_examples": len(self._fp_vecs),
+            "drum_examples": len(self._drum_training_X),
+            "learned_atoms": len(atoms),
+            "fixed_weight_scalars": fixed_weight_scalars,
+            "fingerprint_scalars": fingerprint_scalars,
+            "atom_scalars": atom_scalars,
+            "learned_scalar_values": (
+                fixed_weight_scalars + fingerprint_scalars + atom_scalars
+            ),
+        }
+
     # ── Candidate model ──────────────────────────────────────────────────
 
     @staticmethod

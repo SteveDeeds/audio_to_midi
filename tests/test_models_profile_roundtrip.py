@@ -6,6 +6,20 @@ from core.models import CorrectionModel
 
 
 class TestCorrectionModelProfiles(unittest.TestCase):
+    def test_learning_metrics_count_examples_and_scalar_state(self) -> None:
+        model = CorrectionModel()
+        model._fp_vecs.append(np.ones(5, dtype=np.float32))
+        model.instrument_dictionary.add_atom(60, np.ones(4, dtype=np.float32))
+
+        metrics = model.learning_metrics()
+
+        self.assertEqual(metrics["candidate_examples"], 4)
+        self.assertEqual(metrics["pitch_gate_examples"], 4)
+        self.assertEqual(metrics["fingerprint_examples"], 1)
+        self.assertEqual(metrics["learned_atoms"], 1)
+        self.assertEqual(metrics["fixed_weight_scalars"], 22)
+        self.assertEqual(metrics["learned_scalar_values"], 31)
+
     def test_instrument_dictionary_round_trip(self) -> None:
         model = CorrectionModel()
         model.instrument_dictionary.add_atom(

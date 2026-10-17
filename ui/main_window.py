@@ -39,25 +39,6 @@ from ui.styles import QSS
 from workers.analysis_worker import LoadWorker, ChordWorker
 
 
-def _clicked_manual_note(rows: list, t: float, midi: int) -> tuple | None:
-    matches = [
-        row for row in rows
-        if len(row) >= 5
-        and int(row[2]) == int(midi)
-        and str(row[3]) == "manual"
-        and float(row[0]) <= float(t) < float(row[1])
-    ]
-    return max(matches, key=lambda row: float(row[0]), default=None)
-
-
-def _manual_preview_note(markers: AudioMarkers, t: float, midi: int) -> tuple | None:
-    note_window = markers.note_onset_window_at(float(t))
-    if note_window is None:
-        return None
-    t0, t1 = note_window
-    return (t0, t1, int(midi), "manual", MidiPlayback.VELOCITY)
-
-
 def _playback_mix_levels(slider_value: int) -> tuple[float, float]:
     audio_gain = max(0.0, min(1.0, float(slider_value) / 100.0))
     return 1.0 - audio_gain, audio_gain
@@ -205,6 +186,11 @@ class MainWindow(QMainWindow):
         self._learning = LearningCoordinator(self._cqt_view.time_window, self)
         self._learning.pitch_started.connect(self._on_pitch_started)
         self._learning.pitches_ready.connect(self._on_pitches_ready)
+        self._learning.onset_started.connect(
+            lambda count: self._status_bar.showMessage(
+                f"Training onset model ({count} examples) ..."
+            )
+        )
         self._learning.onset_ready.connect(self._on_onset_training_ready)
         self._learning.error.connect(
             lambda domain, msg: self._status_bar.showMessage(
@@ -552,11 +538,23 @@ class MainWindow(QMainWindow):
             self._learning.request_pitch()
             return
 
-        self._markers.add_manual_pitch(t, midi)
-        self._cqt_view.apply_pitch_feedback(t, midi, keep=True)
-        row = _manual_preview_note(self._markers, t, midi)
-        if row is not None:
-            self._preview_note_window(float(row[0]), float(row[1]), fallback_row=row)
+        span = self._markers.add_manual_pitch(t, midi, origin="cqt_left_click")
+        if span is None:
+            self._status_bar.showMessage("Could not add pitch at this position")
+            return
+        self._cqt_view.apply_pitch_feedback(
+            t,
+            midi,
+            keep=True,
+            note_id=span.note_id,
+            onset=span.onset,
+            release=span.release,
+        )
+        row = (
+            span.onset, span.release, span.midi, span.source,
+            MidiPlayback.VELOCITY, span.note_id,
+        )
+        self._preview_note_window(span.onset, span.release, fallback_row=row)
         self._status_bar.showMessage("Pitch feedback queued")
         self._learning.request_pitch()
 
@@ -593,7 +591,7 @@ class MainWindow(QMainWindow):
             self._learning.request_pitch()
             return
 
-        self._markers.remove_manual_pitch(t, midi)
+        self._markers.remove_manual_pitch(t, midi, origin="cqt_right_click")
         self._cqt_view.apply_pitch_feedback(t, midi, keep=False)
         self._status_bar.showMessage("Pitch feedback queued")
         self._learning.request_pitch()
@@ -692,7 +690,7 @@ class MainWindow(QMainWindow):
         }
         added = len(result_signature - self._pitch_suggestion_baseline)
         removed = len(self._pitch_suggestion_baseline - result_signature)
-        self._cqt_view.refresh()
+        self._cqt_view.refresh(pitch_rows=results)
         self._status_bar.showMessage(
             f"Pitch model applied to current view: {len(result_signature)} suggestions "
             f"({added} added, {removed} removed)")
@@ -815,8 +813,7 @@ class MainWindow(QMainWindow):
         mode = self._controls.get_mode()
         
         if mode == "Percussive":
-            # Export drum hits (beats/grid)
-            notes = self._markers.get_cached_drum_hits(0.0, self._markers.duration)
+            notes = self._markers.get_published_drum_hits()
             build_midi(notes, self._markers.grid.bpm, out_path, percussion=True)
         else:
             notes = self._markers.build_midi_notes()

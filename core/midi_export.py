@@ -7,6 +7,8 @@ MIDI file generation using mido.
 import mido
 from mido import MidiFile, MidiTrack, Message, MetaMessage
 
+from core.event_log import log_event
+
 
 def load_midi_timing(input_path: str) -> dict[str, float | int]:
     """Return initial tempo/meter and metadata-event counts from a MIDI file.
@@ -103,6 +105,13 @@ def build_midi(
 
     track.append(MetaMessage("end_of_track", time=0))
     mid.save(output_path)
+    log_event(
+        "midi_file_saved",
+        path=output_path,
+        note_count=len(notes),
+        bpm=bpm,
+        percussion=percussion,
+    )
     print(f"MIDI saved → {output_path}  ({len(notes)} notes)")
 
 

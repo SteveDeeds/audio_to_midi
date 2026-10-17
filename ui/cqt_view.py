@@ -285,12 +285,24 @@ class CQTGraphicsView(QGraphicsView):
         self._current_bar = 1
         self._navigate_to_bar(1)
 
-    def refresh(self, run_inference: bool = True) -> None:
+    def refresh(
+        self,
+        run_inference: bool = True,
+        pitch_rows: list[tuple] | None = None,
+    ) -> None:
         """Re-render the current view (e.g. after pitch detection finishes)."""
         if self._markers:
-            self._rebuild_scene(run_inference=run_inference)
+            self._rebuild_scene(run_inference=run_inference, pitch_rows=pitch_rows)
 
-    def apply_pitch_feedback(self, t: float, midi: int, keep: bool) -> None:
+    def apply_pitch_feedback(
+        self,
+        t: float,
+        midi: int,
+        keep: bool,
+        note_id: str | None = None,
+        onset: float | None = None,
+        release: float | None = None,
+    ) -> None:
         """Apply immediate visual feedback while model work runs in the background."""
         if self._current_mode == "Percussive":
             return
@@ -309,19 +321,32 @@ class CQTGraphicsView(QGraphicsView):
                 for rect in matching:
                     rect.setPen(pen)
                     rect.setData(4, "manual")
+                    if note_id is not None:
+                        rect.setData(0, note_id)
+                    if onset is not None and release is not None:
+                        rect.setRect(QRectF(
+                            float(onset),
+                            float(midi) - 0.45,
+                            float(release) - float(onset),
+                            0.9,
+                        ))
+                        rect.setData(1, float(onset))
+                        rect.setData(2, float(release))
                 self.viewport().update()
                 return
             if not self._markers:
                 return
-            note_window = self._markers.note_onset_window_at(float(t))
-            if note_window is None:
+            interval = self._markers.note_onset_interval_at(float(t))
+            if interval is None:
                 return
-            t0, t1 = note_window
+            t0, t1, _key = interval
             rect = self._scene.addRect(
                 QRectF(t0, float(midi) - 0.45, t1 - t0, 0.9),
                 pen, QBrush(Qt.BrushStyle.NoBrush),
             )
             rect.setZValue(9)
+            if note_id is not None:
+                rect.setData(0, note_id)
             rect.setData(1, t0)
             rect.setData(2, t1)
             rect.setData(3, int(midi))
@@ -615,16 +640,27 @@ class CQTGraphicsView(QGraphicsView):
             return m.cqt_flux_db, m.cqt_times
         return m.cqt_db, m.cqt_times
 
-    def _rebuild_scene(self, run_inference: bool = True) -> None:
+    def _rebuild_scene(
+        self,
+        run_inference: bool = True,
+        pitch_rows: list[tuple] | None = None,
+    ) -> None:
         if not self._markers or not self._grid:
             return
         t_start, t_end = self._time_window()
         m = self._markers
-        pitches = (
-            self.visible_recommendation_rows(t_start, t_end)
-            if run_inference
-            else self.rendered_note_rows(t_start, t_end)
-        )
+        if pitch_rows is not None:
+            pitches = [
+                row for row in pitch_rows
+                if self._recommendation_visible(
+                    str(row[3]), int(row[2]), float(row[0]), float(row[1]),
+                    t_start, t_end,
+                )
+            ]
+        elif run_inference:
+            pitches = self.visible_recommendation_rows(t_start, t_end)
+        else:
+            pitches = self.rendered_note_rows(t_start, t_end)
 
         self._cancel_release_drag()
         self._scene.clear()
@@ -1000,8 +1036,8 @@ class CQTGraphicsView(QGraphicsView):
             if self._release_rect_at(event.position().toPoint()) is not None
             else Qt.CursorShape.ArrowCursor
         )
-        self.viewport().setCursor(cursor)
         super().mouseMoveEvent(event)
+        self.viewport().setCursor(cursor)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
         if (

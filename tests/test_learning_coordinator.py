@@ -13,7 +13,25 @@ class TestLearningCoordinator(unittest.TestCase):
         return SimpleNamespace(
             has_pending_pitch_training=lambda: pitch_pending,
             has_pending_onset_training=lambda: False,
+            pending_onset_training_count=lambda: 0,
         )
+
+    def test_onset_training_takes_priority_over_pending_pitch(self) -> None:
+        coordinator = LearningCoordinator(lambda: (2.0, 4.0))
+        self.addCleanup(coordinator.shutdown)
+        markers = SimpleNamespace(
+            has_pending_pitch_training=lambda: False,
+            has_pending_onset_training=lambda: True,
+            pending_onset_training_count=lambda: 12,
+        )
+        coordinator.set_session(markers)
+        coordinator._pitch_pending = True
+        coordinator._onset_pending = True
+
+        coordinator._start_pitch()
+
+        self.assertIsNone(coordinator._pitch_worker)
+        self.assertTrue(coordinator._onset_timer.isActive())
 
     def test_pitch_requests_coalesce_while_debouncing(self) -> None:
         coordinator = LearningCoordinator(lambda: (2.0, 4.0))
@@ -25,6 +43,25 @@ class TestLearningCoordinator(unittest.TestCase):
 
         self.assertTrue(coordinator._pitch_pending)
         self.assertTrue(coordinator._pitch_timer.isActive())
+
+    def test_onset_request_tolerates_deleted_pitch_worker(self) -> None:
+        coordinator = LearningCoordinator(lambda: (2.0, 4.0))
+        self.addCleanup(coordinator.shutdown)
+        markers = SimpleNamespace(
+            has_pending_pitch_training=lambda: False,
+            has_pending_onset_training=lambda: True,
+            pending_onset_training_count=lambda: 1,
+        )
+        coordinator.set_session(markers)
+        coordinator._pitch_worker = SimpleNamespace(
+            isRunning=lambda: (_ for _ in ()).throw(RuntimeError("deleted")),
+            disconnect=lambda: (_ for _ in ()).throw(RuntimeError("deleted")),
+        )
+
+        coordinator.request_onset()
+
+        self.assertTrue(coordinator._onset_pending)
+        self.assertTrue(coordinator._onset_timer.isActive())
 
     def test_current_session_result_is_published(self) -> None:
         coordinator = LearningCoordinator(lambda: (2.0, 4.0))

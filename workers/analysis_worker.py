@@ -5,10 +5,13 @@ QThread workers for audio loading, CQT computation, chord analysis,
 and pitch detection (all off the GUI thread).
 """
 
+import time
+
 from PySide6.QtCore import QThread, Signal
 
 from core.audio_engine import AudioMarkers, TimeGrid
 from core.chord_analysis import analyze_chords, collapse_chords
+from core.event_log import log_event
 
 
 class LoadWorker(QThread):
@@ -84,15 +87,39 @@ class PitchWorker(QThread):
         self.t_end = t_end
 
     def run(self) -> None:
+        started = time.perf_counter()
         try:
+            had_pending_training = self.markers.has_pending_pitch_training()
+            training_started = time.perf_counter()
             generation = self.markers.process_pending_pitch_training()
+            training_ms = (time.perf_counter() - training_started) * 1000.0
+            inference_started = time.perf_counter()
             results = self.markers.compute_visible_block_pitches(
                 self.t_start, self.t_end)
+            inference_ms = (time.perf_counter() - inference_started) * 1000.0
             stale = generation != self.markers.pitch_edit_generation
             if stale:
                 self.markers._invalidate_note_spans()
+            log_event(
+                "pitch_analysis_completed",
+                elapsed_ms=round((time.perf_counter() - started) * 1000.0, 1),
+                training_ms=round(training_ms, 1),
+                inference_ms=round(inference_ms, 1),
+                had_pending_training=had_pending_training,
+                window_start=self.t_start,
+                window_end=self.t_end,
+                result_count=len(results),
+                generation=generation,
+                stale=stale,
+                model=self.markers.model.learning_metrics(),
+            )
             self.finished_ok.emit(results, generation, stale)
         except Exception as exc:
+            log_event(
+                "pitch_analysis_failed",
+                elapsed_ms=round((time.perf_counter() - started) * 1000.0, 1),
+                error=str(exc),
+            )
             self.error.emit(str(exc))
 
 
@@ -107,9 +134,24 @@ class OnsetWorker(QThread):
         self.markers = markers
 
     def run(self) -> None:
+        started = time.perf_counter()
         try:
+            example_count = self.markers.pending_onset_training_count()
             generation = self.markers.process_pending_onset_training()
             stale = generation != self.markers.onset_edit_generation
+            log_event(
+                "onset_training_completed",
+                elapsed_ms=round((time.perf_counter() - started) * 1000.0, 1),
+                example_count=example_count,
+                generation=generation,
+                stale=stale,
+                model=self.markers.model.learning_metrics(),
+            )
             self.finished_ok.emit(generation, stale)
         except Exception as exc:
+            log_event(
+                "onset_training_failed",
+                elapsed_ms=round((time.perf_counter() - started) * 1000.0, 1),
+                error=str(exc),
+            )
             self.error.emit(str(exc))

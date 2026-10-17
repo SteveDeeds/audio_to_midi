@@ -6,6 +6,7 @@ sensitivity sliders, action buttons.
 """
 
 import os
+import re
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QGroupBox, QPushButton, QLabel, QDoubleSpinBox,
@@ -15,6 +16,33 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal, QSize
 
 from core.mode_registry import get_mode, registered_modes
+
+
+_METER_PATTERN = re.compile(r"(?<!\d)([1-9]\d?)[-/]([1248]|16|32)(?!\d)")
+_BPM_PATTERN = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*bpm(?![a-z])", re.IGNORECASE)
+
+
+def infer_timing_from_path(
+    path: str,
+) -> tuple[float | None, tuple[int, int] | None]:
+    """Infer beat BPM and meter from a file name, then its parent folder."""
+    filename = os.path.splitext(os.path.basename(path))[0]
+    folder = os.path.basename(os.path.dirname(path))
+
+    bpm: float | None = None
+    meter: tuple[int, int] | None = None
+    for source in (filename, folder):
+        if bpm is None:
+            bpm_match = _BPM_PATTERN.search(source)
+            if bpm_match:
+                bpm = float(bpm_match.group(1))
+        if meter is None:
+            meter_match = _METER_PATTERN.search(source)
+            if meter_match:
+                meter = (int(meter_match.group(1)), int(meter_match.group(2)))
+        if bpm is not None and meter is not None:
+            break
+    return bpm, meter
 
 
 class ControlPanel(QWidget):
@@ -271,6 +299,18 @@ class ControlPanel(QWidget):
         except Exception:
             return 4
 
+    def _apply_inferred_timing(self, path: str) -> None:
+        bpm, meter = infer_timing_from_path(path)
+        if bpm is not None and self._bpm_spin.minimum() <= bpm <= self._bpm_spin.maximum():
+            self._bpm_spin.setValue(bpm)
+        if meter is not None:
+            signature = f"{meter[0]}/{meter[1]}"
+            index = self._timesig.findText(signature)
+            if index < 0:
+                self._timesig.addItem(signature)
+                index = self._timesig.findText(signature)
+            self._timesig.setCurrentIndex(index)
+
     def get_duration(self) -> str:
         """Return current note duration selection (e.g., '1/16')."""
         for btn in self._dur_group.buttons():
@@ -339,6 +379,7 @@ class ControlPanel(QWidget):
 
         self._wav_path = paths[0]
         self._stem_dir = os.path.dirname(paths[0])
+        self._apply_inferred_timing(self._wav_path)
         n = len(merged_paths)
         self._file_label.setText(
             os.path.basename(self._wav_path) if n == 1

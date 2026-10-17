@@ -7,12 +7,14 @@ from collections.abc import Callable
 from PySide6.QtCore import QObject, QThread, QTimer, Signal
 
 from core.audio_engine import AudioMarkers
+from core.event_log import log_event
 from workers.analysis_worker import OnsetWorker, PitchWorker
 
 
 class LearningCoordinator(QObject):
     pitch_started = Signal()
     pitches_ready = Signal(list, int, bool)
+    onset_started = Signal(int)
     onset_ready = Signal(int, bool)
     error = Signal(str, str)
 
@@ -66,6 +68,11 @@ class LearningCoordinator(QObject):
         if self._markers is None:
             return
         self._onset_pending = True
+        log_event(
+            "onset_training_queued",
+            pending_examples=self._markers.pending_onset_training_count(),
+            pitch_running=self._worker_running(self._pitch_worker),
+        )
         self._onset_timer.start()
 
     def shutdown(self) -> None:
@@ -75,10 +82,13 @@ class LearningCoordinator(QObject):
         markers = self._markers
         if markers is None or not self._pitch_pending:
             return
-        if self._onset_worker is not None and self._onset_worker.isRunning():
+        if self._onset_pending and markers.has_pending_onset_training():
+            self._onset_timer.start()
+            return
+        if self._worker_running(self._onset_worker):
             self._pitch_timer.start()
             return
-        if self._pitch_worker is not None and self._pitch_worker.isRunning():
+        if self._worker_running(self._pitch_worker):
             return
 
         self._pitch_pending = False
@@ -115,19 +125,19 @@ class LearningCoordinator(QObject):
             stale or self._pitch_pending or markers.has_pending_pitch_training()
         )
         self.pitches_ready.emit(results, edit_generation, pending)
-        if pending:
-            self.request_pitch()
-        elif self._onset_pending:
+        if self._onset_pending:
             self._onset_timer.start()
+        elif pending:
+            self.request_pitch()
 
     def _start_onset(self) -> None:
         markers = self._markers
         if markers is None or not self._onset_pending:
             return
-        if self._pitch_worker is not None and self._pitch_worker.isRunning():
+        if self._worker_running(self._pitch_worker):
             self._onset_timer.start()
             return
-        if self._onset_worker is not None and self._onset_worker.isRunning():
+        if self._worker_running(self._onset_worker):
             return
         if not markers.has_pending_onset_training():
             self._onset_pending = False
@@ -135,8 +145,10 @@ class LearningCoordinator(QObject):
 
         self._onset_pending = False
         generation = self._session_generation
+        pending_examples = markers.pending_onset_training_count()
         worker = OnsetWorker(markers)
         self._onset_worker = worker
+        self.onset_started.emit(pending_examples)
         worker.finished_ok.connect(
             lambda edit_generation, stale: self._finish_onset(
                 worker, generation, edit_generation, stale
@@ -179,15 +191,24 @@ class LearningCoordinator(QObject):
             self.error.emit(domain, message)
 
     @staticmethod
+    def _worker_running(worker: QThread | None) -> bool:
+        if worker is None:
+            return False
+        try:
+            return worker.isRunning()
+        except RuntimeError:
+            return False
+
+    @staticmethod
     def _stop_worker(worker: QThread | None, timeout_ms: int = 2000) -> None:
         if worker is None:
             return
         try:
-            if worker.isRunning():
+            if LearningCoordinator._worker_running(worker):
                 worker.requestInterruption()
                 worker.quit()
                 worker.wait(timeout_ms)
             worker.disconnect()
+            worker.deleteLater()
         except Exception:
             pass
-        worker.deleteLater()
