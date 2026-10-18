@@ -17,7 +17,7 @@ import tempfile
 import librosa
 import numpy as np
 
-# Search ranges match experimental-pitch/methods.py RANGES.
+# Search ranges from the pitch bake-off (experimental-pitch/methods.py, archived in commit d5ff7bb).
 RANGES = {
     "piano": dict(fmin=27.5, fmax=4200.0, midi=(21, 108)),
     "guitar": dict(fmin=75.0, fmax=1400.0, midi=(38, 88)),
