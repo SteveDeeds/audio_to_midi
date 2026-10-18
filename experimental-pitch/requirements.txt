@@ -1,0 +1,15 @@
+torch  # install CPU wheels: --index-url https://download.pytorch.org/whl/cpu
+basic-pitch[onnx]  # NOTE: uninstall the tensorflow it pulls in (breaks with numpy 2); ONNX runtime is used
+torchcrepe
+pesto-pitch
+piano_transcription_inference
+onnx
+librosa
+pretty_midi
+mir_eval
+matplotlib
+soundfile
+mido
+# drums (see setup_env.ps1): -e third_party/ADTOF-pytorch (git clone xavriley/ADTOF-pytorch)
+libnmfd
+# YourMT3+ runs in a separate .venv-mt3: mt3-infer==0.2.0 transformers==4.45.1 librosa pretty_midi

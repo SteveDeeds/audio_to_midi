@@ -1,0 +1,4 @@
+.venv/
+outputs/
+third_party/
+.venv-mt3/

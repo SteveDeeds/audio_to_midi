@@ -1,0 +1,71 @@
+{
+  "schema": 1,
+  "method": "pairwise AUC separation on actual first-ten-note UI correction labels",
+  "limitations": "30 positive and 17 negative labels across only three songs; not held-out ablation",
+  "positive_labels": 30,
+  "negative_labels": 17,
+  "per_dataset": {
+    "babyslakh_bass": {
+      "negative_labels": 10,
+      "positive_labels": 10
+    },
+    "babyslakh_piano": {
+      "negative_labels": 6,
+      "positive_labels": 10
+    },
+    "maestro_piano": {
+      "negative_labels": 1,
+      "positive_labels": 10
+    }
+  },
+  "features": [
+    {
+      "feature": "energy_db",
+      "positive_median": -17.7835341779392,
+      "negative_median": -15.294193059767709,
+      "auc_positive_higher": 0.3176470588235294,
+      "separation": 0.3647058823529412,
+      "direction": "negative_higher"
+    },
+    {
+      "feature": "onset",
+      "positive_median": 1.0,
+      "negative_median": 0.7723120450973511,
+      "auc_positive_higher": 0.5980392156862745,
+      "separation": 0.196078431372549,
+      "direction": "positive_higher"
+    },
+    {
+      "feature": "salience",
+      "positive_median": 0.4046328663825989,
+      "negative_median": 0.5897766947746277,
+      "auc_positive_higher": 0.42745098039215684,
+      "separation": 0.14509803921568631,
+      "direction": "negative_higher"
+    },
+    {
+      "feature": "energy_rel_db",
+      "positive_median": -0.19405245370746727,
+      "negative_median": -2.722621179105019,
+      "auc_positive_higher": 0.5450980392156862,
+      "separation": 0.09019607843137245,
+      "direction": "positive_higher"
+    },
+    {
+      "feature": "peel",
+      "positive_median": 0.394325315952301,
+      "negative_median": 0.21721190214157104,
+      "auc_positive_higher": 0.49117647058823527,
+      "separation": 0.01764705882352946,
+      "direction": "negative_higher"
+    },
+    {
+      "feature": "flux",
+      "positive_median": 0.0,
+      "negative_median": 0.0,
+      "auc_positive_higher": 0.5,
+      "separation": 0.0,
+      "direction": "positive_higher"
+    }
+  ]
+}

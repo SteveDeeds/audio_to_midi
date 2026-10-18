@@ -1,0 +1,134 @@
+{
+  "reference_notes": 326,
+  "missing": 0,
+  "channels": {
+    "model_gain": {
+      "median_true_rank": 58.0,
+      "true_rank_1_rate": 0.0,
+      "true_rank_top_3_rate": 0.0,
+      "true_rank_top_5_rate": 0.015337423312883436,
+      "top_pitch_deltas": [
+        [
+          -12,
+          250
+        ],
+        [
+          -11,
+          45
+        ],
+        [
+          -24,
+          14
+        ],
+        [
+          -19,
+          7
+        ],
+        [
+          -13,
+          5
+        ],
+        [
+          -28,
+          3
+        ],
+        [
+          -9,
+          2
+        ]
+      ]
+    },
+    "sustain_gain": {
+      "median_true_rank": 5.0,
+      "true_rank_1_rate": 0.0,
+      "true_rank_top_3_rate": 0.03987730061349693,
+      "true_rank_top_5_rate": 0.6257668711656442,
+      "top_pitch_deltas": [
+        [
+          -12,
+          324
+        ],
+        [
+          -42,
+          2
+        ]
+      ]
+    },
+    "peel_gain": {
+      "median_true_rank": 42.0,
+      "true_rank_1_rate": 0.0,
+      "true_rank_top_3_rate": 0.07975460122699386,
+      "true_rank_top_5_rate": 0.07975460122699386,
+      "top_pitch_deltas": [
+        [
+          -12,
+          295
+        ],
+        [
+          -19,
+          26
+        ],
+        [
+          -18,
+          2
+        ],
+        [
+          -31,
+          2
+        ],
+        [
+          -36,
+          1
+        ]
+      ]
+    },
+    "salience_gain": {
+      "median_true_rank": 60.0,
+      "true_rank_1_rate": 0.0,
+      "true_rank_top_3_rate": 0.0,
+      "true_rank_top_5_rate": 0.0,
+      "top_pitch_deltas": [
+        [
+          -12,
+          295
+        ],
+        [
+          -36,
+          29
+        ],
+        [
+          -22,
+          2
+        ]
+      ]
+    },
+    "onset_gain": {
+      "median_true_rank": 4.0,
+      "true_rank_1_rate": 0.08588957055214724,
+      "true_rank_top_3_rate": 0.3312883435582822,
+      "true_rank_top_5_rate": 0.8926380368098159,
+      "top_pitch_deltas": [
+        [
+          -12,
+          292
+        ],
+        [
+          0,
+          28
+        ],
+        [
+          -11,
+          2
+        ],
+        [
+          7,
+          2
+        ],
+        [
+          -38,
+          2
+        ]
+      ]
+    }
+  }
+}
