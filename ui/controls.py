@@ -55,6 +55,7 @@ class ControlPanel(QWidget):
     polyphony_changed = Signal(int)              # max simultaneous notes (1–10)
     pitch_model_changed = Signal(str)           # registered pitch-model policy name
     mode_changed = Signal(str)                  # "Pitched" or "Percussive"
+    drum_model_changed = Signal(str)            # "" (pitched), "nnls" or "adtof"
     play_requested = Signal(int)
     stop_requested = Signal()
     export_midi_requested = Signal()
@@ -326,6 +327,9 @@ class ControlPanel(QWidget):
         mode = get_mode(str(self._pitch_model_combo.currentData()))
         return mode.pitch_model_name or "standard"
 
+    def drum_model(self) -> str | None:
+        return get_mode(str(self._pitch_model_combo.currentData())).drum_model
+
     def set_pitch_model(self, name: str) -> None:
         index = self._pitch_model_combo.findData(str(name))
         self._pitch_model_combo.setCurrentIndex(index if index >= 0 else 0)
@@ -357,6 +361,17 @@ class ControlPanel(QWidget):
 
     def _on_pitch_model_changed(self, index: int) -> None:
         mode = get_mode(str(self._pitch_model_combo.itemData(index)))
+        policy = mode.create_pitch_policy()
+        mono = policy is not None and policy.mono_stem is not None
+        if mono and self._polyphony_slider.isEnabled():
+            self._polyphony_before_mono = self._polyphony_slider.value()
+        self._polyphony_slider.setEnabled(not mono)
+        if mono:
+            self._polyphony_slider.setValue(1)
+        elif hasattr(self, "_polyphony_before_mono"):
+            self._polyphony_slider.setValue(self._polyphony_before_mono)
+            del self._polyphony_before_mono
+        self.drum_model_changed.emit(mode.drum_model or "")
         self.mode_changed.emit(mode.ui_mode)
         self._sync_cqt_source_options(mode.id)
         if mode.pitch_model_name is not None:

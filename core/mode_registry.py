@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.learning_runtime import LearningDomain
-from core.pitch_models import PitchModelPolicy, create_pitch_model
+from core.pitch_models import VISIBLE_PITCH_MODEL_TYPES, PitchModelPolicy, create_pitch_model
 
 
 @dataclass(frozen=True)
@@ -17,6 +17,7 @@ class ModeDefinition:
     display_sources: tuple[str, ...]
     pitch_model_name: str | None = None
     midi_channel: int | None = None
+    drum_model: str | None = None
 
     def create_pitch_policy(self) -> PitchModelPolicy | None:
         if self.pitch_model_name is None:
@@ -40,6 +41,27 @@ _MODES = (
         domain=LearningDomain.DRUM,
         display_sources=("CQT (Percussive)", "STFT", "Mel"),
         midi_channel=9,
+        drum_model="nnls",
+    ),
+    ModeDefinition(
+        id="percussive_adtof",
+        label="Percussive: ADTOF",
+        ui_mode="Percussive",
+        domain=LearningDomain.DRUM,
+        display_sources=("CQT (Percussive)", "STFT", "Mel"),
+        midi_channel=9,
+        drum_model="adtof",
+    ),
+    *(
+        ModeDefinition(
+            id=model.name,
+            label=model.label,
+            ui_mode="Pitched",
+            domain=LearningDomain.PITCH,
+            display_sources=("db", "spectral peel", "pitch salience", "flux novelty"),
+            pitch_model_name=model.name,
+        )
+        for model in VISIBLE_PITCH_MODEL_TYPES
     ),
 )
 

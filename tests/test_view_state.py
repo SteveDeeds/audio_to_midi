@@ -134,11 +134,12 @@ class TestViewState(unittest.TestCase):
                 refresh=lambda **kwargs: calls.append(kwargs),
             ),
             _status_bar=SimpleNamespace(showMessage=lambda message: None),
+            _envelope_view=SimpleNamespace(refresh=lambda: calls.append("onsets refreshed")),
         )
 
         MainWindow._on_pitches_ready(window, rows, 1, False)
 
-        self.assertEqual(calls, [{"pitch_rows": rows}])
+        self.assertEqual(calls, [{"pitch_rows": rows}, "onsets refreshed"])
 
     def test_load_completion_imports_exact_name_companion_midi(self) -> None:
         source = inspect.getsource(MainWindow._on_load_done)

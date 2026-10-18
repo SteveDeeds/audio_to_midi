@@ -62,6 +62,12 @@ class LearningCoordinator(QObject):
         if self._markers is None:
             return
         self._pitch_pending = True
+        if (
+            getattr(self._markers, "uses_visible_pitch_model", False)
+            and self._worker_running(self._pitch_worker)
+            and self._pitch_worker is not None
+        ):
+            self._pitch_worker.requestInterruption()
         self._pitch_timer.start()
 
     def request_onset(self) -> None:
@@ -103,7 +109,7 @@ class LearningCoordinator(QObject):
             )
         )
         worker.error.connect(
-            lambda message: self._worker_error("Pitch", generation, message)
+            lambda message: self._pitch_error(worker, generation, message)
         )
         worker.finished.connect(worker.deleteLater)
         worker.start()
@@ -124,11 +130,24 @@ class LearningCoordinator(QObject):
         pending = bool(
             stale or self._pitch_pending or markers.has_pending_pitch_training()
         )
+        if hasattr(worker, "t_start") and hasattr(worker, "t_end"):
+            pending = pending or (worker.t_start, worker.t_end) != self._time_window()
         self.pitches_ready.emit(results, edit_generation, pending)
         if self._onset_pending:
             self._onset_timer.start()
         elif pending:
             self.request_pitch()
+        elif hasattr(worker, "t_start") and getattr(
+            markers, "has_pending_visible_analysis", lambda *_: False,
+        )(worker.t_start, worker.t_end):
+            self.request_pitch()
+
+    def _pitch_error(self, worker: PitchWorker, generation: int, message: str) -> None:
+        if self._pitch_worker is worker:
+            self._pitch_worker = None
+        self._worker_error("Pitch", generation, message)
+        if generation == self._session_generation and self._pitch_pending:
+            self._pitch_timer.start()
 
     def _start_onset(self) -> None:
         markers = self._markers

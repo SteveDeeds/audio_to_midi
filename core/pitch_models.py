@@ -1,4 +1,4 @@
-"""Selectable pitch-model policies applied after shared NNLS analysis."""
+"""Selectable NNLS policies and monophonic transcription presets."""
 
 from __future__ import annotations
 
@@ -11,6 +11,20 @@ class PitchModelPolicy:
     label = "Standard"
     max_polyphony: int | None = None
     uses_pitch_gate = True
+    mono_stem: str | None = None
+    mono_tracker: str | None = None
+    mono_legato_split = False
+    poly_stem: str | None = None
+    poly_tracker: str | None = None
+
+    @property
+    def visible_stem(self) -> str | None:
+        """Stem of the pretrained model applied to the visible region, if any."""
+        return self.mono_stem or self.poly_stem
+
+    @property
+    def visible_tracker(self) -> str | None:
+        return self.mono_tracker or self.poly_tracker
 
     def clone(self) -> "PitchModelPolicy":
         return copy.deepcopy(self)
@@ -93,9 +107,72 @@ class BassPitchModel(PitchModelPolicy):
         ][-self.MAX_OFFSET_SAMPLES:]
 
 
+class BassCrepeFull(PitchModelPolicy):
+    name = "bass__crepe_full+onset+key"
+    label = "Bass: CREPE full + onset + key"
+    max_polyphony = 1
+    mono_stem = "bass"
+    mono_tracker = "crepe_full"
+
+
+class BassCrepeTiny(BassCrepeFull):
+    name = "bass__crepe_tiny+onset+key"
+    label = "Bass: CREPE tiny + onset + key"
+    mono_tracker = "crepe_tiny"
+
+
+class VocalsPyin(PitchModelPolicy):
+    name = "vocals__pyin+key"
+    label = "Vocals: pYIN + key"
+    max_polyphony = 1
+    mono_stem = "vocals"
+    mono_tracker = "pyin"
+    mono_legato_split = True
+
+
+class VocalsCrepeFull(VocalsPyin):
+    name = "vocals__crepe_full+key"
+    label = "Vocals: CREPE full + key"
+    mono_tracker = "crepe_full"
+
+
+MONO_PITCH_MODEL_TYPES = (BassCrepeFull, BassCrepeTiny, VocalsPyin, VocalsCrepeFull)
+
+
+class PianoBasicPitch(PitchModelPolicy):
+    name = "piano__basic_pitch"
+    label = "Piano: Basic Pitch"
+    poly_stem = "piano"
+    poly_tracker = "basic_pitch"
+
+
+class PianoHighResolution(PianoBasicPitch):
+    name = "piano__piano_hr"
+    label = "Piano: high-resolution piano model"
+    poly_tracker = "piano_hr"
+
+
+class GuitarBasicPitch(PitchModelPolicy):
+    name = "guitar__basic_pitch"
+    label = "Guitar: Basic Pitch"
+    poly_stem = "guitar"
+    poly_tracker = "basic_pitch"
+
+
+class GuitarHighResolution(GuitarBasicPitch):
+    name = "guitar__piano_hr"
+    label = "Guitar: high-resolution piano model"
+    poly_tracker = "piano_hr"
+
+
+POLY_PITCH_MODEL_TYPES = (PianoBasicPitch, PianoHighResolution, GuitarBasicPitch, GuitarHighResolution)
+VISIBLE_PITCH_MODEL_TYPES = MONO_PITCH_MODEL_TYPES + POLY_PITCH_MODEL_TYPES
+
+
 PITCH_MODEL_TYPES = {
     PitchModelPolicy.name: PitchModelPolicy,
     BassPitchModel.name: BassPitchModel,
+    **{model.name: model for model in VISIBLE_PITCH_MODEL_TYPES},
 }
 
 

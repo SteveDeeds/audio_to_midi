@@ -150,6 +150,7 @@ class MainWindow(QMainWindow):
         self._controls.duration_changed.connect(self._on_duration_changed)
         self._controls.polyphony_changed.connect(self._on_polyphony_changed)
         self._controls.pitch_model_changed.connect(self._on_pitch_model_changed)
+        self._controls.drum_model_changed.connect(self._on_drum_model_changed)
         self._controls.play_requested.connect(self._on_play_mix)
         self._controls.stop_requested.connect(self._on_stop)
         self._controls.export_midi_requested.connect(self._on_export_midi)
@@ -266,6 +267,7 @@ class MainWindow(QMainWindow):
         if self._player is None:
             self._player = MidiPlayback()
         markers.set_pitch_model(self._controls.pitch_model())
+        markers.set_drum_model(self._controls.drum_model())
         keep_chords = self._preserve_chords_on_next_load and bool(self._chord_results)
         self._preserve_chords_on_next_load = False
 
@@ -468,7 +470,20 @@ class MainWindow(QMainWindow):
             self._envelope_view.refresh()
             self._learning.request_pitch()
             self._status_bar.showMessage(
-                f"Pitch model: {self._markers.pitch_model_summary}"
+                f"Applying {self._markers.pitch_model_summary} to visible notes and onsets..."
+                if self._markers.uses_visible_pitch_model
+                else f"Pitch model: {self._markers.pitch_model_summary}"
+            )
+
+    def _on_drum_model_changed(self, name: str) -> None:
+        if not self._markers:
+            return
+        self._markers.set_drum_model(name or None)
+        if name:
+            self._learning.request_pitch()
+        if name == "adtof":
+            self._status_bar.showMessage(
+                "Drum model: ADTOF (first use analyses the whole stem in the background)"
             )
 
     # â”€â”€ Onset editing (envelope view) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
@@ -671,10 +686,12 @@ class MainWindow(QMainWindow):
         self._pitch_suggestion_baseline = (
             self._cqt_view.rendered_suggestion_signature()
         )
+        if self._markers and self._markers.uses_visible_pitch_model:
+            self._status_bar.showMessage("Analyzing visible notes and onsets in the background...")
 
     def _on_pitches_ready(self, results: list, generation: int, pending: bool) -> None:
         if pending:
-            self._status_bar.showMessage("Pitch feedback queued")
+            self._status_bar.showMessage("View changed or edits queued; updating the latest visible region...")
             return
         result_signature = {
             (
@@ -691,6 +708,7 @@ class MainWindow(QMainWindow):
         added = len(result_signature - self._pitch_suggestion_baseline)
         removed = len(self._pitch_suggestion_baseline - result_signature)
         self._cqt_view.refresh(pitch_rows=results)
+        self._envelope_view.refresh()
         self._status_bar.showMessage(
             f"Pitch model applied to current view: {len(result_signature)} suggestions "
             f"({added} added, {removed} removed)")

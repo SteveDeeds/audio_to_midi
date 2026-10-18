@@ -75,7 +75,7 @@ class ChordWorker(QThread):
 
 
 class PitchWorker(QThread):
-    """Run pYIN pitch detection for a visible time window."""
+    """Train queued feedback and apply the selected model to a visible window."""
 
     finished_ok = Signal(list, int, bool)
     error = Signal(str)
@@ -95,9 +95,9 @@ class PitchWorker(QThread):
             training_ms = (time.perf_counter() - training_started) * 1000.0
             inference_started = time.perf_counter()
             results = self.markers.compute_visible_block_pitches(
-                self.t_start, self.t_end)
+                self.t_start, self.t_end, should_cancel=self.isInterruptionRequested)
             inference_ms = (time.perf_counter() - inference_started) * 1000.0
-            stale = generation != self.markers.pitch_edit_generation
+            stale = self.isInterruptionRequested() or generation != self.markers.pitch_edit_generation
             if stale:
                 self.markers._invalidate_note_spans()
             log_event(

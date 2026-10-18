@@ -9,6 +9,7 @@ import json
 import os
 import pathlib
 import threading
+from collections.abc import Callable
 from dataclasses import dataclass, replace
 import numpy as np
 import librosa
@@ -20,8 +21,11 @@ from core.analysis import (
     detect_key_from_chroma, detect_key_from_file,
     HOP_SIZE, CHROMA_HOP, CHROMA_SHIFT_THRESH,
 )
+from core.adtof_drums import AdtofDrumTranscriber, drum_class, velocity_from_strength
 from core.event_log import log_event
 from core.models import CorrectionModel
+from core.mono_pitch import MonoTranscriber
+from core.poly_pitch import PolyTranscriber
 from core.pitch_models import PitchModelPolicy, create_pitch_model
 from core.pitch_adaptation_models import MultiAtomNNLSModel
 from core.polyphonic_nnls import (
@@ -241,6 +245,11 @@ class AudioMarkers:
         self._pitch_models: dict[str, PitchModelPolicy] = {
             self._pitch_model.name: self._pitch_model,
         }
+        self._mono_transcriber: MonoTranscriber | None = None
+        self._poly_transcriber: PolyTranscriber | None = None
+        self._mono_baseline_active_keys: set[int] | None = None
+        self._drum_model: str | None = None
+        self._adtof: AdtofDrumTranscriber | None = None
         if bootstrap_from_profiles:
             self._bootstrap_candidate_model_from_profiles()
         self._current_min_dur_sec: float = 0.0
@@ -401,18 +410,63 @@ class AudioMarkers:
         if self._pitch_model.name == str(name):
             return
         requested = str(name)
+        self._restore_mono_baseline()
         self._pitch_model = self._pitch_models.get(requested) or create_pitch_model(requested)
         self._pitch_models[self._pitch_model.name] = self._pitch_model
+        if self.uses_visible_pitch_model:
+            self._mono_baseline_active_keys = set(self._candidate_active_keys)
         if self._pitch_model.max_polyphony is not None:
             self.set_polyphony(self._pitch_model.max_polyphony)
         if hasattr(self, "_multi_atom_model"):
             self._refresh_multi_atom_model()
         self._pitch_cache.clear()
+        with self._pitch_training_lock:
+            self._pitch_edit_generation += 1
+            self._published_note_spans = ()
         self._invalidate_note_spans()
 
     @property
     def pitch_model_name(self) -> str:
         return self._pitch_model.name
+
+    @property
+    def uses_visible_pitch_model(self) -> bool:
+        return (
+            getattr(self, "_drum_model", None) is None
+            and getattr(getattr(self, "_pitch_model", None), "visible_stem", None) is not None
+        )
+
+    @property
+    def uses_poly_visible_model(self) -> bool:
+        return self.uses_visible_pitch_model and self._pitch_model.poly_stem is not None
+
+    def _restore_mono_baseline(self) -> None:
+        """Drop mono onset evidence, keeping the user's forced onsets."""
+        baseline = getattr(self, "_mono_baseline_active_keys", None)
+        if baseline is None:
+            return
+        self._mono_baseline_active_keys = None
+        valid = set(self._candidate_features)
+        self._candidate_active_keys = (
+            (baseline & valid) | (self._candidate_forced_on_keys & valid)
+        ) - self._candidate_forced_off_keys
+        self._update_active_times()
+
+    def set_drum_model(self, name: str | None) -> None:
+        """Select the percussive engine: None (pitched), "nnls" or "adtof"."""
+        name = str(name) if name else None
+        if name == getattr(self, "_drum_model", None):
+            return
+        self._drum_model = name
+        if name == "adtof" and getattr(self, "_adtof", None) is None:
+            self._adtof = AdtofDrumTranscriber(self.wav_path)
+        with self._pitch_training_lock:
+            self._pitch_edit_generation += 1
+            self._published_drum_hits = ()
+
+    @property
+    def drum_model_name(self) -> str | None:
+        return getattr(self, "_drum_model", None)
 
     @property
     def pitch_model_summary(self) -> str:
@@ -488,6 +542,8 @@ class AudioMarkers:
         self._candidate_forced_on_keys &= valid_keys
         self._candidate_forced_off_keys &= valid_keys
         self._candidate_active_keys = active_keys
+        if getattr(self, "_mono_baseline_active_keys", None) is not None:
+            self._mono_baseline_active_keys = set(active_keys)
         self._update_active_times()
 
     def _update_active_times(self):
@@ -1435,9 +1491,11 @@ class AudioMarkers:
                     self._generated_note_spans_cache = computed
                     self._generated_note_spans_cache_window = window
                     published = getattr(self, "_published_note_spans", ())
+                    computed_ids = {span.note_id for span in computed}
                     retained = [
                         span for span in published
                         if span.release <= window[0] or span.onset >= window[1]
+                        if span.note_id not in computed_ids
                     ]
                     self._published_note_spans = tuple(sorted(
                         [*retained, *computed],
@@ -1451,6 +1509,181 @@ class AudioMarkers:
             span for span in spans
             if span.release > window[0] and span.onset < window[1]
         ]
+
+    MONO_DETECTOR_MIN_KEEP_PROB = 0.3
+    MONO_MODEL_ONLY_KEEP_PROB = 0.9
+    MONO_BATCHES_PER_PASS = 1
+
+    def _mono_context(self):
+        """(policy, transcriber) for the selected pretrained model (mono or poly)."""
+        if not self.uses_visible_pitch_model:
+            return None
+        transcriber = self._visible_transcriber()
+        if transcriber is None:
+            return None
+        return self._pitch_model, transcriber
+
+    def _visible_transcriber(self, create: bool = False):
+        poly = self.uses_poly_visible_model
+        attr = "_poly_transcriber" if poly else "_mono_transcriber"
+        transcriber = getattr(self, attr, None)
+        if transcriber is None and create:
+            transcriber = (PolyTranscriber if poly else MonoTranscriber)(self.audio, self.sr, self.wav_path)
+            setattr(self, attr, transcriber)
+        return transcriber
+
+    def _nearest_grid_time(self, t: float, tolerance: float) -> float | None:
+        raw = self._candidate_raw_array()
+        if not len(raw):
+            return None
+        i = int(np.searchsorted(raw, t))
+        j = min((k for k in (i - 1, i) if 0 <= k < len(raw)), key=lambda k: abs(raw[k] - t))
+        return float(raw[j]) if abs(raw[j] - t) <= tolerance else None
+
+    def _candidate_raw_array(self) -> np.ndarray:
+        cached = getattr(self, "_candidate_raw_array_cache", None)
+        if cached is None or cached[0] is not self._candidate_raw_times:
+            cached = (self._candidate_raw_times, np.asarray(self._candidate_raw_times, dtype=float))
+            self._candidate_raw_array_cache = cached
+        return cached[1]
+
+    def _apply_mono_onset_evidence(self, t_start: float, t_end: float) -> tuple[int, int]:
+        """Blend pretrained-model evidence into the trained grid-onset decisions.
+
+        For analysed, unforced grid candidates a note start needs pitched sound
+        after it plus either a detector attack the trained model does not reject,
+        a very confident trained model, or (vocals) a held pitch change.
+        Returns (removed, added) like apply_ml_suggestions_window.
+        """
+        context = self._mono_context()
+        if context is None or not self._candidate_raw_times:
+            return 0, 0
+        policy, transcriber = context
+        stem, tracker = policy.visible_stem, policy.visible_tracker
+        poly = policy.poly_stem is not None
+        grid = max(float(self._current_min_dur_sec), 1e-3)
+        half = 0.5 * grid
+        attack_keys = {
+            self._cand_key(g)
+            for t in transcriber.onset_times(stem, tracker)
+            if t_start - half <= t < t_end + half
+            for g in [self._nearest_grid_time(float(t), half)] if g is not None
+        }
+        legato_keys = {
+            self._cand_key(g)
+            for t in transcriber.pitch_changes(t_start - grid, t_end + grid, stem, tracker)
+            for g in [self._nearest_grid_time(t, half)] if g is not None
+        } if policy.mono_legato_split else set()
+        trained = bool(self.model._cand_trained)
+        raw = self._candidate_raw_array()
+        keep_keys: set[int] = set()
+        drop_keys: set[int] = set()
+        for t in raw[(raw >= t_start) & (raw < t_end)]:
+            t = float(t)
+            key = self._cand_key(t)
+            if key in self._candidate_forced_on_keys or key in self._candidate_forced_off_keys:
+                continue
+            if not transcriber.covers(t - half, t + grid, stem, tracker):
+                continue
+            sounding = (
+                (poly and key in attack_keys)
+                or transcriber.sounding_fraction(t, t + grid, stem, tracker) >= 0.5
+            )
+            prob = None
+            feat = self._candidate_features.get(key)
+            if trained and feat is not None:
+                prob = self.model.candidate_keep_prob(
+                    *feat, self._candidate_percussive_spikes.get(key, 0.0),
+                )
+            keep = key in legato_keys or (sounding and (
+                (key in attack_keys and (prob is None or prob >= self.MONO_DETECTOR_MIN_KEEP_PROB))
+                or (prob is not None and prob >= self.MONO_MODEL_ONLY_KEEP_PROB)
+            ))
+            (keep_keys if keep else drop_keys).add(key)
+        added = keep_keys - self._candidate_active_keys
+        removed = drop_keys & self._candidate_active_keys
+        if not added and not removed:
+            return 0, 0
+        for key in added:
+            self._candidate_active_keys.add(key)
+        for key in removed:
+            self._candidate_active_keys.discard(key)
+        self._update_active_times()
+        return len(removed), len(added)
+
+    def _collect_mono_block_rows(self, t_start: float, t_end: float) -> list[tuple]:
+        """One pretrained-model pitch per onset block; releases stop at the view edge."""
+        context = self._mono_context()
+        if context is None:
+            return []
+        policy, transcriber = context
+        stem, tracker = policy.mono_stem, policy.mono_tracker
+        grid = max(float(self._current_min_dur_sec), 1e-3)
+        onsets = transcriber.onset_times(stem)
+        with self._pitch_training_lock:
+            rejected = {key: set(midis) for key, midis in self._rejected_pitches.items()}
+            labelled = set(self._pitch_interval_labels)
+        boundaries = self._analysis_boundaries()
+        rows = []
+        for t0, t1 in zip(boundaries[:-1], boundaries[1:]):
+            t0, t1 = float(t0), float(t1)
+            if t1 <= t_start or t0 >= t_end:
+                continue
+            key = (int(t0 * self.sr), int(min(t1 * self.sr, len(self.audio))))
+            if key in labelled:
+                continue
+            i = int(np.searchsorted(onsets, t0 - 0.5 * grid))
+            precise = float(onsets[i]) if i < len(onsets) and onsets[i] <= t0 + 0.5 * grid else None
+            result = transcriber.block_pitch(t0, t1, stem, tracker, attack_start=precise)
+            if result is None:
+                continue
+            ranked, release = result
+            midi = next((m for m in ranked if m not in rejected.get(key, ())), None)
+            if midi is None:
+                continue
+            if release < t1:
+                steps = max(1, int(np.ceil((release - t0) / grid - 1e-6)))
+                release = min(t1, t0 + steps * grid)
+            release = min(release, float(t_end))
+            if release <= t0:
+                continue
+            rows.append((t0, release, int(midi), "ml", self._harmonic_block_energy(t0, release, midi), key))
+        return rows
+
+    def _collect_poly_block_rows(self, t_start: float, t_end: float) -> list[tuple]:
+        """Pretrained polyphonic notes per onset block; held notes carry across onsets."""
+        context = self._mono_context()
+        if context is None:
+            return []
+        policy, transcriber = context
+        stem, tracker = policy.poly_stem, policy.poly_tracker
+        grid = max(float(self._current_min_dur_sec), 1e-3)
+        with self._pitch_training_lock:
+            rejected = {key: set(midis) for key, midis in self._rejected_pitches.items()}
+            labelled = set(self._pitch_interval_labels)
+        boundaries = self._analysis_boundaries()
+        rows = []
+        for t0, t1 in zip(boundaries[:-1], boundaries[1:]):
+            t0, t1 = float(t0), float(t1)
+            if t1 <= t_start or t0 >= t_end:
+                continue
+            key = (int(t0 * self.sr), int(min(t1 * self.sr, len(self.audio))))
+            if key in labelled:
+                continue
+            notes = [
+                note for note in transcriber.block_notes(t0, t1, stem, tracker, 0.5 * grid)
+                if note.midi not in rejected.get(key, ())
+            ][:self._nnls_max_polyphony]
+            for note in notes:
+                release = note.release
+                if release < t1:
+                    steps = max(1, int(np.ceil((release - t0) / grid - 1e-6)))
+                    release = min(t1, t0 + steps * grid)
+                release = min(release, float(t_end))
+                if release <= t0:
+                    continue
+                rows.append((t0, release, note.midi, "ml", note.velocity, key, note.continues))
+        return rows
 
     def _invalidate_note_spans(self) -> None:
         lock = getattr(self, "_pitch_training_lock", None)
@@ -1470,30 +1703,32 @@ class AudioMarkers:
 
     def _analysis_boundaries(self) -> np.ndarray:
         return np.sort(np.unique(np.concatenate([
-            [0.0], self.onset_times, self.chroma_times, [self.duration]
+            [0.0], self.onset_times, self.chroma_times, [self.duration],
         ])))
 
     def _assemble_note_spans(self, rows: list[tuple]) -> list[PitchedNoteSpan]:
         active: dict[int, PitchedNoteSpan] = {}
         completed: list[PitchedNoteSpan] = []
 
-        for t0, t1, midi, source, energy in sorted(rows, key=lambda row: (row[0], row[2])):
+        for row in sorted(rows, key=lambda row: (row[0], row[2])):
+            t0, t1, midi, source, energy = row[:5]
             midi = int(midi)
-            block_key = (
+            block_key = row[5] if len(row) > 5 else (
                 int(float(t0) * self.sr),
                 int(min(float(t1) * self.sr, len(self.audio))),
             )
             previous = active.get(midi)
+            continues = bool(row[6]) if len(row) > 6 else False
             touches_previous = (
                 previous is not None
                 and abs(previous.release - float(t0)) <= (1.0 / max(float(self.sr), 1.0))
                 and previous.source == str(source)
-                and not np.any(np.isclose(
+                and (continues or not np.any(np.isclose(
                     self.onset_times,
                     float(t0),
                     atol=(1.0 / max(float(self.sr), 1.0)),
                     rtol=0.0,
-                ))
+                )))
             )
             if touches_previous:
                 previous_duration = max(previous.release - previous.onset, 0.0)
@@ -1679,6 +1914,8 @@ class AudioMarkers:
         Rows match pitch shape: (t0, t1, midi, source, velocity).
         source is "manual" for user-confirmed hits and "ml" for NNLS predictions.
         """
+        if getattr(self, "_drum_model", None) == "adtof":
+            return self._adtof_drum_rows(t_start, t_end)
         bpm = float(self.grid.bpm)
         beats_per_bar = int(self.grid.beats_per_bar)
         duration_str = self._current_min_dur_label
@@ -1745,11 +1982,75 @@ class AudioMarkers:
         return visible_rows
 
     def get_published_drum_hits(self) -> list[tuple[float, float, int, str, int]]:
+        if getattr(self, "_drum_model", None) == "adtof":
+            return self._adtof_drum_rows(0.0, self.duration)
         with self._pitch_training_lock:
             return list(getattr(self, "_published_drum_hits", ()))
 
-    def compute_visible_block_pitches(self, t_start, t_end):
+    def _adtof_drum_rows(self, t_start: float, t_end: float) -> list[tuple[float, float, int, str, int]]:
+        """ADTOF hits snapped to the nearest grid slice, with user edits applied on top."""
+        duration_str = self._current_min_dur_label
+        slice_dur = self.get_beat_slice_duration(
+            float(self.grid.bpm), int(self.grid.beats_per_bar), duration_str)
+        if slice_dur <= 0.0:
+            return []
+        adtof = self._adtof
+        slots: dict[tuple[int, int], tuple[str, float | None]] = {}
+        for beat_index, midis in list(self._manual_drums.items()):
+            for midi in list(midis):
+                slots[(int(beat_index), int(midi))] = ("manual", None)
+        if adtof is not None and adtof.ready:
+            for hit in adtof.hits():
+                beat_index = int(round(hit.time / slice_dur))
+                key = (beat_index, hit.midi)
+                if key in slots or hit.midi in self._manual_drum_rejects.get(beat_index, ()):
+                    continue
+                slots[key] = ("ml", hit.strength)
+        rows = []
+        for (beat_index, midi), (source, strength) in slots.items():
+            t0 = beat_index * slice_dur
+            t1 = min(self.duration, t0 + slice_dur)
+            if t1 <= t_start or t0 >= t_end:
+                continue
+            if strength is None and adtof is not None and adtof.ready:
+                strength = adtof.strength_in(t0, t1, midi)
+            velocity = 100 if strength is None else max(48, velocity_from_strength(strength))
+            rows.append((
+                float(max(t0, t_start)), float(min(t1, t_end)), int(midi), source, velocity,
+            ))
+        return sorted(rows, key=lambda row: (row[0], row[2]))
+
+    def compute_visible_block_pitches(
+        self, t_start, t_end, should_cancel: Callable[[], bool] | None = None,
+    ):
+        drum_model = getattr(self, "_drum_model", None)
+        if drum_model == "adtof" and self._adtof is not None:
+            self._adtof.prepare()
+        if drum_model is not None:
+            return self.get_cached_drum_hits(t_start, t_end)
+        policy = self._pitch_model
+        if self.uses_visible_pitch_model:
+            completed = self._visible_transcriber(create=True).prepare(
+                t_start, t_end, policy.visible_stem, policy.visible_tracker, should_cancel,
+                max_batches=self.MONO_BATCHES_PER_PASS,
+            )
+            self._apply_mono_onset_evidence(t_start, t_end)
+            self._invalidate_note_spans()
+            if should_cancel is not None and should_cancel():
+                return []
+            if not completed:
+                log_event("mono_pitch_partial", window_start=t_start, window_end=t_end)
         return self.get_cached_block_pitches(t_start, t_end)
+
+    def has_pending_visible_analysis(self, t_start: float, t_end: float) -> bool:
+        """True while the selected pretrained model still has unanalysed visible audio."""
+        context = self._mono_context()
+        if not self.uses_visible_pitch_model:
+            return False
+        if context is None:
+            return True
+        policy, transcriber = context
+        return not transcriber.covers(t_start, t_end, policy.visible_stem, policy.visible_tracker)
 
     # ── MIDI export ───────────────────────────────────────────────────────
 
@@ -2004,6 +2305,10 @@ class AudioMarkers:
         ]
 
     def _collect_block_note_rows(self, t_start, t_end):
+        if self.uses_visible_pitch_model:
+            if self.uses_poly_visible_model:
+                return self._collect_poly_block_rows(t_start, t_end)
+            return self._collect_mono_block_rows(t_start, t_end)
         boundaries = self._analysis_boundaries()
         with self._pitch_training_lock:
             rejected_pitches = {
@@ -2160,6 +2465,8 @@ class AudioMarkers:
 
     def apply_ml_suggestions_window(self, t_start, t_end,
                                      delete_threshold=0.30, pin_threshold=0.80):
+        if self._mono_context() is not None:
+            return self._apply_mono_onset_evidence(t_start, t_end)
         if not self.model._cand_trained:
             return 0, 0
         n_del = n_pin = 0
@@ -2268,6 +2575,9 @@ class AudioMarkers:
             self._pitch_models[self._pitch_model.name] = self._pitch_model
             if self._pitch_model.max_polyphony is not None:
                 self.set_polyphony(self._pitch_model.max_polyphony)
+            with self._pitch_training_lock:
+                self._pitch_edit_generation += 1
+                self._published_note_spans = ()
         elif not merge:
             self.set_pitch_model("standard")
         self._refresh_multi_atom_model()
@@ -2405,6 +2715,7 @@ class AudioMarkers:
         rejects = self._manual_drum_rejects.get(int(beat_index))
         if rejects is not None:
             rejects.discard(int(drum_midi))
+        self._record_adtof_feedback(beat_index, drum_midi, bpm, beats_per_bar, duration_str, True)
         with self._pitch_training_lock:
             self._pending_drum_training.append((
                 int(beat_index), int(drum_midi), float(bpm), int(beats_per_bar),
@@ -2427,6 +2738,7 @@ class AudioMarkers:
             if not manual:
                 self._manual_drums.pop(int(beat_index), None)
         self._manual_drum_rejects.setdefault(int(beat_index), set()).add(int(drum_midi))
+        self._record_adtof_feedback(beat_index, drum_midi, bpm, beats_per_bar, duration_str, False)
         with self._pitch_training_lock:
             self._pending_drum_training.append((
                 int(beat_index), int(drum_midi), float(bpm), int(beats_per_bar),
@@ -2434,6 +2746,14 @@ class AudioMarkers:
             ))
             self._pitch_edit_generation += 1
         return True
+
+    def _record_adtof_feedback(self, beat_index: int, drum_midi: int, bpm: float,
+                               beats_per_bar: int, duration_str: str, keep: bool) -> None:
+        if getattr(self, "_adtof", None) is None or drum_class(drum_midi) is None:
+            return
+        t0 = self.beat_index_to_time(beat_index, bpm, beats_per_bar, duration_str)
+        slice_dur = self.get_beat_slice_duration(bpm, beats_per_bar, duration_str)
+        self._adtof.record_feedback(t0, t0 + slice_dur, int(drum_midi), keep)
 
     def _process_drum_training(self, beat_index: int, drum_midi: int, bpm: float,
                                beats_per_bar: int, duration_str: str, keep: bool) -> bool:
