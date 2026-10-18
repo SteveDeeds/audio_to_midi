@@ -16,27 +16,47 @@ $mods = Get-ChildItem tests\test_*.py | % { "tests." + $_.BaseName }
 ## 1. Target workflow
 
 ```
-full song (mix)
-  ├─► key, time signature, tempo (beats + downbeats)
-  ├─► fixed-tempo version of the song, bar 1 beat 1 at t = 0
-  ├─► block-chord MIDI track (one chord per beat/bar span)
-  └─► stems (6-stem separation)
-         ├─ drums   ─► drum MIDI   (user-editable)
-         ├─ bass    ─► MIDI        (user-editable)
-         ├─ vocals  ─► MIDI        (user-editable)
-         ├─ piano   ─► MIDI        (user-editable)
-         ├─ guitar  ─► MIDI        (user-editable)
-         └─ other   ─► no MIDI (used only as harmony context for key/chords)
+1. original song (mix)
+2.   ─► key, time signature, tempo map (beats + downbeats)
+3.   ─► WARP the full mix to an exact fixed tempo, bar 1 beat 1 at t = 0
+4.   ─► block-chord MIDI track from the warped mix (one chord per beat/bar span)
+5.   ─► 6-stem separation of the WARPED mix
+6.        ├─ drums   ─► drum MIDI   (user-editable)
+          ├─ bass    ─► MIDI        (user-editable)
+          ├─ vocals  ─► MIDI        (user-editable)
+          ├─ piano   ─► MIDI        (user-editable)
+          ├─ guitar  ─► MIDI        (user-editable)
+          └─ other   ─► no MIDI (used only as harmony context for key/chords)
 ```
+
+### Decisions (confirmed by the user)
+
+- **Warp before separation.** Warping is more accurate on the full track, and
+  every stem then inherits exactly the same timing. Never warp stems
+  individually.
+- **The workflow can be picked up at any stage**, including with **external
+  warping** (for example, Ableton) and **external stem separation** (for example,
+  UVR or EchoGrid). Each stage must therefore read and write plain artefacts on
+  disk (see §5, "Stage artefacts and entry points") rather than in-memory-only state.
+- **No pitch bends in MIDI.** Every note is one fixed MIDI pitch. Show only the
+  primary pitch:
+  - A **slur** (a held pitch change between two clearly sustained pitches) becomes
+    **two notes**, split at the pitch change.
+  - **Bending into a note** becomes just the target note, starting at the attack.
+  - A **fall** (or any glide off the end of a note) is absorbed into the note it
+    ends; the note keeps its primary pitch.
+  - Rule of thumb: short, transitional pitch segments are absorbed into the
+    neighbouring stable pitch. Only a stable (held) new pitch starts a new note.
 
 Hard rule learned in this project: **keep onset detection separate from pitch
 detection.** The algorithms are good at one or the other, not both (see §3).
 
-Today the first three steps happen outside the app. Ableton warps the song to a
+Today the first steps happen outside the app. Ableton warps the song to a
 fixed tempo; UVR or EchoGrid produce stems. The user then types BPM and beats per
 bar, and the app assumes the file starts on a downbeat at t = 0 (`TimeGrid` in
-`core/audio_engine.py` has no offset or tempo map). The new workflow moves tempo,
-downbeat, warping and separation into the app.
+`core/audio_engine.py` has no offset or tempo map). The new workflow adds tempo,
+downbeat, warping and separation to the app, while keeping those external tools as
+supported entry points.
 
 ## 2. What the current app does (and what to keep)
 
@@ -114,8 +134,11 @@ downbeat, warping and separation into the app.
 Key-aware cleaning (`clean_key_contour`): a non-diatonic run held under 0.25 s that is
 not in the local harmony takes the neighbouring in-key pitch (it is a slide or bend).
 It only relabels pitches, never boundaries. Folding created spurious legato splits when it also
-moved boundaries. Caveat: real chromatic passing tones under 0.25 s get folded. Pitch
-bends would be more faithful for long glides.
+moved boundaries. Caveat: real chromatic passing tones under 0.25 s get folded. This
+matches the user's "primary pitch only, no pitch bends" decision (§1). Today only
+vocals split on held pitch changes (`mono_legato_split`). The rewrite should apply
+the slur rule (a stable new pitch ⇒ a new note; transitional bend-ins and falls are absorbed)
+to every mono stem, including bass, and for poly stems the model's notes already behave this way.
 
 ### Drums (ADT, 5 classes → GM 36/38/42/47/49)
 
@@ -193,20 +216,43 @@ decisions.
    (beats only, weak on downbeats). Output a tempo map plus downbeats.
 2. **Time signature.** Infer from the downbeat spacing in beats; let the user confirm.
    Remember triplet/compound feels (12/8 versus 4/4 with triplets).
-3. **Fixed-tempo rendering.** Time-stretch between beat anchors to a constant BPM
-   and trim or pad so bar 1 beat 1 is at t = 0. For example, use Rubber Band (pyrubberband)
-   piecewise, or a phase vocoder. Decide whether to warp the mix before separation
-   (one stretch; possibly slightly worse separation) or to separate the original and
-   apply the same warp map to every stem (better separation, N stretches). The
-   second keeps the stems and the mix aligned by construction, and is recommended.
+3. **Fixed-tempo rendering of the full mix** (decided: before separation). Time-stretch
+   between beat anchors to a constant BPM and trim or pad so bar 1 beat 1 is at
+   t = 0. For example, use Rubber Band (pyrubberband) piecewise, or a phase vocoder.
+   Let the user correct beat and downbeat anchors before rendering. Save the warp map,
+   so MIDI can also be mapped back to original time if ever needed.
 4. **Key detection** on the full mix (or all pitched stems), with a user override.
    The existing Krumhansl–Kessler code is fine as a start.
 5. **Block-chord MIDI.** `chord_analysis.analyze_chords` and `collapse_chords` already
    work per beat; feed them the warped mix plus the Other stem as harmony context.
    Possibly evaluate a learned chord recogniser later.
-6. **Stem separation in-app** (htdemucs_6s), run once per song and cached.
+6. **Stem separation in-app** (htdemucs_6s) on the warped mix, run once per song and
+   cached.
 7. **Per-stem tracks in one project**: each with its own onset model, pitch model,
    edits, rejections and export. Other gets no MIDI.
+
+### Stage artefacts and entry points
+
+A project is a folder. Each stage reads the previous stage's artefact and writes
+its own, so any stage can be skipped by supplying that artefact from outside.
+
+| Stage | Artefact (suggested) | External alternative |
+|---|---|---|
+| Original mix | `original.wav` | Any audio file |
+| Analysis | `song.json`: key, time signature, BPM, tempo map / beat and downbeat anchors | User enters key, meter and BPM by hand |
+| Warp | `warped.wav` (fixed BPM, bar 1 beat 1 at t = 0) + `warp_map.json` | Already-warped mix from Ableton: import as `warped.wav` with user BPM and meter; no warp map |
+| Chords | `chords.mid` (block chords) + editable chord list | Import an existing chord MIDI |
+| Stems | `stems/{drums,bass,vocals,piano,guitar,other}.wav` | Stems from UVR, EchoGrid, etc. Map files to roles by name or let the user assign them; missing roles are allowed (for example, a 4-stem split has no piano or guitar). |
+| Per-stem MIDI | `midi/<stem>.mid` + per-stem edit state | Import an existing MIDI for a stem as a starting point (the app already loads companion MIDI) |
+
+Rules:
+- When starting from externally warped audio or stems, the app must not re-warp them.
+  It only needs BPM, meter and the downbeat at t = 0 (offer a small offset nudge if
+  the first downbeat is not exactly at 0).
+- External stems must be validated against the warped mix (same length and sample
+  rate, or resample/pad, with a warning) so that all tracks share the grid.
+- Re-running an earlier stage must warn before invalidating later artefacts that
+  have user edits.
 
 ## 6. Refactor or rewrite: options
 
@@ -259,8 +305,8 @@ core/
   timebase.py       TempoMap / Grid in beats (downbeat offset, straight + triplet)
   pipeline/
     beats.py        beat/downbeat/tempo + time signature
-    warp.py         fixed-tempo rendering of the mix and stems
-    separate.py     htdemucs_6s, cached
+    warp.py         fixed-tempo rendering of the full mix (before separation) + warp map
+    separate.py     htdemucs_6s on the warped mix, cached; or import external stems
     key.py, chords.py
   onsets/           candidate features, trained grid onset model, evidence fusion
   pitch/            mono (CREPE/pYIN + key cleaning), poly (Basic Pitch, piano_hr)
@@ -273,12 +319,13 @@ workers/            background jobs with cancel + visible-window priority
 
 ## 7. Open questions for the user
 
+Answered: warp before separation; any stage can be entered, including external
+warping and separation; no pitch bends (see §1).
+
+Still open:
+
 1. Rewrite (B) or refactor (A)? This document recommends B.
-2. Warp-then-separate or separate-then-warp?
-3. Should Ableton still be supported as an input path (an already-warped song plus
-   user-entered BPM)? That is a cheap bypass of steps 1–3.
-4. Is non-commercial licensing acceptable for now (ADTOF; check the piano_hr checkpoint),
+2. Is non-commercial licensing acceptable for now (ADTOF; check the piano_hr checkpoint),
    or is retraining in scope?
-5. Should edits keep training the onset model per song only, or across songs
+3. Should edits keep training the onset model per song only, or across songs
    (profiles)?
-6. Pitch bends for long glides, or keep folding them to in-key notes?
