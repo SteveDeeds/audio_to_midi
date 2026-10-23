@@ -1,6 +1,7 @@
 """Lead-sheet chord symbols, voicings and a baseline chroma recognizer.
 
-Vocabulary: triads (maj, m, dim, aug, sus2, sus4), sevenths (7, maj7, m7, m7b5,
+Vocabulary: triads (maj, m, dim, aug, sus4; sus2 is accepted but named as the
+sus4 a fifth up, Csus2 = Gsus4/C), sevenths (7, maj7, m7, m7b5,
 dim7, mMaj7) and slash chords (``C/E``); ``N.C.`` means no chord. The
 recognizer is a deliberately simple baseline until a published lead-sheet
 recognizer is evaluated (see docs/ui-redesign-plan.md). It recovers spectral
@@ -54,6 +55,9 @@ def parse(symbol: str) -> tuple[int, str, int | None] | None:
 
 
 def symbol(root: int, quality: str, bass: int | None = None) -> str:
+    """Canonical symbol; sus2 is named as the same notes' sus4 a fifth up (Csus2 -> Gsus4/C)."""
+    if quality == "sus2":
+        root, quality, bass = root + 7, "sus4", root if bass is None else bass
     text = NAMES[root % 12] + quality
     return text + (f"/{NAMES[bass % 12]}" if bass is not None and bass % 12 != root % 12 else "")
 
@@ -82,6 +86,40 @@ def pitch_classes(text: str) -> set[int]:
     root, quality, bass = parsed
     tones = {(root + i) % 12 for i in QUALITIES[quality]}
     return tones | ({bass} if bass is not None else set())
+
+
+def from_tones(tones, root: int | None = None, bass: int | None = None, require=(), exclude=()) -> str:
+    """Symbol whose pitch classes equal ``tones``, else the closest one in the vocabulary.
+
+    Candidates must contain every ``require`` and no ``exclude`` pitch class. Ties
+    keep the bass, avoid new slash chords, then keep the root.
+    """
+    tones = {int(pc) % 12 for pc in tones}
+    if not tones:
+        return NO_CHORD
+    require, exclude = set(require), set(exclude)
+    keep_bass = bass if bass is not None else root
+    best, best_key = None, None
+    for order, (quality, intervals) in enumerate(QUALITIES.items()):
+        if quality == "sus2":
+            continue  # every sus2 is a sus4 a fifth up (with a bass), ranked below
+        for r in range(12):
+            chord = {(r + i) % 12 for i in intervals}
+            for b in [None, *range(12)]:
+                if b == r:
+                    continue
+                notes = chord | ({b} if b is not None else set())
+                if not require <= notes or notes & exclude:
+                    continue
+                hit = len(notes & tones)
+                score = 2 * hit / (len(notes) + len(tones))
+                key = (
+                    notes == tones, round(score, 6), (r if b is None else b) == keep_bass,
+                    b is None, r == root, -order,
+                )
+                if best_key is None or key > best_key:
+                    best, best_key = symbol(r, quality, b), key
+    return best or NO_CHORD
 
 
 def voicing(text: str) -> list[int]:
@@ -116,6 +154,8 @@ def _best(
         return [(NO_CHORD, 1.0)]
     ranked = []
     for quality, intervals in QUALITIES.items():
+        if quality == "sus2" and bass is None:
+            continue  # same notes as the sus4 a fifth up, which is ranked anyway
         for root in range(12):
             tones = {(root + i) % 12 for i in intervals}
             hit = sum(active[pc] for pc in tones)
@@ -130,7 +170,8 @@ def _best(
             slash = bass if bass is not None and bass != root else None
             ranked.append((symbol(root, quality, slash), float(score)))
     ranked.sort(key=lambda item: -item[1])
-    return ranked
+    seen = set()
+    return [item for item in ranked if not (item[0] in seen or seen.add(item[0]))]
 
 
 def fold_chroma(cqt: np.ndarray, low_pitch: int, reduce: str = "sum") -> np.ndarray:

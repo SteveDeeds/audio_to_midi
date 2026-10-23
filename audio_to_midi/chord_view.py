@@ -137,7 +137,7 @@ class ChordView(QWidget):
         painter.setPen(QColor("#8994a7"))
         painter.drawText(
             8, 13, "Chords: double-click a chord to type it, right-click for alternatives, split, merge "
-            "or N.C.; drag a chord change to move it",
+            "or N.C.; drag a chord change to move it; click a note row to add it, right-click to remove it",
         )
         # Amplitude lane.
         if self.envelope is not None and len(self.envelope):
@@ -207,6 +207,10 @@ class ChordView(QWidget):
             painter.drawLine(round(x), self.HEADER, round(x), height)
 
     # Interaction ----------------------------------------------------------
+    def _pitch_class(self, y: float) -> int | None:
+        """Pitch class of the chroma row under ``y`` (B on top), or None outside the chroma."""
+        row = int((y - self._chroma_top()) // self._row_height())
+        return 11 - row if y >= self._chroma_top() and 0 <= row < 12 else None
     def _boundary(self, x: float, y: float) -> int | None:
         """Index of the segment whose start edge is under the cursor (between two chords)."""
         if not self._lane_top() <= y < self._chroma_top():
@@ -233,6 +237,13 @@ class ChordView(QWidget):
             return
         index = self.segment_at(self._beat(x))
         self._select(index)
+        pc = self._pitch_class(y)
+        if pc is not None and index is not None:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self.toggle_tone(index, pc, True)
+            elif event.button() == Qt.MouseButton.RightButton:
+                self.toggle_tone(index, pc, False)
+            return
         if event.button() == Qt.MouseButton.RightButton:
             self._menu(index, self._snap(x), event.globalPosition().toPoint())
 
@@ -302,6 +313,21 @@ class ChordView(QWidget):
         old = segments[index]
         segments[index] = ChordSegment(old.start, old.end, chord_logic.normalize(symbol), "authored", 1.0, old.alternatives)
         self._emit(segments)
+
+    def toggle_tone(self, index: int, pc: int, add: bool) -> None:
+        """Add or remove one pitch class and rename the chord to match (closest symbol if none is exact)."""
+        segment = self.segments[index]
+        tones = chord_logic.pitch_classes(segment.symbol)
+        if (pc in tones) == add:
+            return
+        parsed = chord_logic.parse(segment.symbol)
+        root, bass = (parsed[0], parsed[2]) if parsed else (pc, None)
+        new = chord_logic.from_tones(
+            tones | {pc} if add else tones - {pc}, root=root, bass=bass,
+            require={pc} if add else (), exclude=() if add else {pc},
+        )
+        if new != segment.symbol:
+            self.set_symbol(index, new)
 
     def split(self, index: int, beat: Fraction) -> None:
         segments = self.segments

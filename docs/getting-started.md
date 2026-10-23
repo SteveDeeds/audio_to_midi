@@ -255,6 +255,8 @@ chroma, and bar/beat lines run through every lane.
 
 - **Edit > Detect chords** proposes chords on the beat grid
   (triads, sevenths, suspended and slash chords). It requires a warped mix.
+  Suspended chords are named as sus4: the notes of Csus2 show as `Gsus4/C`,
+  and a typed `Csus2` becomes `Gsus4/C`.
   Separate stems first for the best results: with current stems, chords come
   from piano + guitar + other + bass, the slash bass comes from the bass stem
   alone, drums are ignored, and vocals (slides, vibrato, melody passing tones)
@@ -300,6 +302,11 @@ chroma, and bar/beat lines run through every lane.
 - **Right-click** for *Alternatives*, *Split at this beat*, *Merge with next
   chord* and *No chord*.
 - **Drag** the boundary between two chords to move the change.
+- **Click** a note row in the 12-note grid under a chord to add that note;
+  **right-click** a row to remove it. The chord is renamed to the symbol with
+  exactly those notes (adding A to C gives `Am7/C`, the notes of C6), or to
+  the closest symbol in the vocabulary if none matches exactly. The outlined
+  rows show the result.
 - **File > Import chord MIDI...** turns a MIDI file of block chords into
   symbols.
 

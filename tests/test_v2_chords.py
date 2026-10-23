@@ -50,6 +50,26 @@ class SymbolTests(unittest.TestCase):
         self.assertEqual(chords.name_notes([57, 60, 64, 67]), "Am7")
         self.assertEqual(chords.name_notes([]), "N.C.")
 
+    def test_sus2_is_named_as_sus4_a_fifth_up(self):
+        self.assertEqual(chords.normalize("Csus2"), "Gsus4/C")
+        self.assertEqual(chords.normalize("Csus2/E"), "Gsus4/E")
+        self.assertEqual(chords.pitch_classes("Csus2"), chords.pitch_classes("Gsus4/C"))
+        self.assertEqual(chords.from_tones({0, 2, 7}), "Gsus4")
+        self.assertEqual(chords.name_notes([55, 60, 62]), "Gsus4")
+        self.assertEqual(chords.name_notes([48, 55, 62]), "Gsus4/C")
+        self.assertFalse(any("sus2" in name for name, _ in chords._best(np.eye(12)[[0, 2, 7]].sum(axis=0), None)))
+
+    def test_from_tones_prefers_exact_then_keeps_bass_and_root(self):
+        self.assertEqual(chords.from_tones({0, 4, 7, 10}, root=0), "C7")
+        self.assertEqual(chords.from_tones({0, 4, 7, 9}, root=0), "Am7/C")  # C6 sound: bass stays C
+        self.assertEqual(chords.from_tones({0, 4, 7, 2}, root=0), "C/D")
+        self.assertEqual(chords.from_tones({0, 3, 7}, root=0, bass=4, exclude={4}), "Cm")
+        self.assertEqual(chords.from_tones({0, 4, 7, 11}, root=0, bass=4), "Cmaj7/E")
+        self.assertEqual(chords.from_tones({4, 7}, root=0, exclude={0}), "Em")
+        self.assertEqual(chords.from_tones({9}, root=9, require={9}), "A")
+        self.assertEqual(chords.from_tones(set()), "N.C.")
+        self.assertNotIn(4, chords.pitch_classes(chords.from_tones({0, 7, 10}, root=0, exclude={4})))
+
     def test_segment_validates_and_normalizes(self):
         segment = ChordSegment(F(0), F(2), "Dbmaj7", alternatives=("C#",))
         self.assertEqual((segment.symbol, segment.alternatives), ("C#maj7", ("C#",)))

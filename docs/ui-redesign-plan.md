@@ -34,7 +34,7 @@ under "Implementation notes".
 | Backward compatibility | None. Older projects and preparation folders need not open; the project format and stage data can be redesigned cleanly. |
 | Chords | A dedicated Chords view (see below), selected as `Chords` in the track selector. |
 | Chord recognition | Use a lead-sheet chord recognizer from open source, chosen by evaluating candidates. Until then, a simple placeholder recognizer (below). |
-| Chord vocabulary | Triads (maj, min, dim, aug, sus2, sus4), sevenths (7, maj7, m7, m7b5, dim7, mMaj7), and slash chords. |
+| Chord vocabulary | Triads (maj, min, dim, aug, sus4; sus2 is named as the sus4 a fifth up, Csus2 = Gsus4/C), sevenths (7, maj7, m7, m7b5, dim7, mMaj7), and slash chords. |
 | Chord export | Voiced MIDI chord track, and a MusicXML lead sheet. |
 | Licensing | GPL and non-commercial weights are acceptable for personal use, behind the existing acknowledgement gate. |
 

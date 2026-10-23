@@ -668,7 +668,36 @@ class EditorTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(window.grab().toImage().isNull())
 
-    def test_chroma_display_suppresses_adjacent_bin_leakage(self):
+    def test_clicking_chroma_rows_adds_and_removes_chord_tones(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        from audio_to_midi.domain import ChordSegment
+
+        window = self.window
+        self._mix_only(seconds=2.0)
+        window.project.chords = [ChordSegment(F(0), F(4), "C"), ChordSegment(F(4), F(8), "N.C.")]
+        window.tracks.setCurrentIndex(window.tracks.findData("__chords__"))
+        self.wait_idle()
+        window.resize(1200, 800)
+        window.show()
+        self.app.processEvents()
+        view = window.chord_view
+        view.start, view.end = F(0), F(8)
+
+        def click(beat, pc, button=Qt.MouseButton.LeftButton):
+            y = view._chroma_top() + (11 - pc + 0.5) * view._row_height()
+            QTest.mouseClick(view, button, Qt.KeyboardModifier.NoModifier, QPoint(round(view._x(F(beat))), round(y)))
+            return [c.symbol for c in window.project.chords]
+
+        self.assertEqual(click(1, 10), ["C7", "N.C."])
+        self.assertEqual(window.project.chords[0].source, "authored")
+        self.assertEqual(click(1, 4, Qt.MouseButton.RightButton), ["Cm7", "N.C."])
+        self.assertEqual(click(1, 10, Qt.MouseButton.RightButton), ["Cm", "N.C."])
+        self.assertEqual(click(1, 0, Qt.MouseButton.RightButton), ["Eb", "N.C."])
+        self.assertEqual(click(1, 4, Qt.MouseButton.RightButton), ["Eb", "N.C."])  # E not in Eb: no change
+        self.assertEqual(click(5, 9), ["Eb", "A"])
+        window._undo()
+        self.assertEqual([c.symbol for c in window.project.chords], ["Eb", "N.C."])
         view = self.window.chord_view
         view.project = self.window.project
         view.cqt = np.zeros((88, 100), dtype=np.float32)
