@@ -56,12 +56,12 @@ def transcribe_notes(y: np.ndarray, sr: int, stem: str, tracker: str) -> list[tu
         global _BASIC_PITCH_MODEL
         try:
             import soundfile as sf
-            from basic_pitch import ICASSP_2022_MODEL_PATH
+            from basic_pitch import FilenameSuffix, build_icassp_2022_model_path
             from basic_pitch.inference import Model, predict
         except ModuleNotFoundError as exc:
             raise _missing_model("Basic Pitch") from exc
         if _BASIC_PITCH_MODEL is None:
-            _BASIC_PITCH_MODEL = Model(ICASSP_2022_MODEL_PATH)
+            _BASIC_PITCH_MODEL = Model(build_icassp_2022_model_path(FilenameSuffix.onnx))
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "excerpt.wav")
             sf.write(path, librosa.resample(y, orig_sr=sr, target_sr=22050), 22050)

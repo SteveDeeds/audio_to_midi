@@ -24,6 +24,7 @@ from core.analysis import (
 from core.adtof_drums import AdtofDrumTranscriber, drum_class, velocity_from_strength
 from core.event_log import log_event
 from core.models import CorrectionModel
+from core import onset_features
 from core.mono_pitch import MonoTranscriber
 from core.poly_pitch import PolyTranscriber
 from core.pitch_models import PitchModelPolicy, create_pitch_model
@@ -280,92 +281,20 @@ class AudioMarkers:
     # ── Feature extraction ────────────────────────────────────────────────
 
     def _window_rms_db(self, t0, t1):
-        s0 = max(0, int(t0 * self.sr))
-        s1 = min(len(self.audio), int(t1 * self.sr))
-        if s1 <= s0:
-            return -80.0
-        seg = self.audio[s0:s1]
-        rms = float(np.sqrt(np.mean(seg * seg) + 1e-12))
-        return float(20.0 * np.log10(max(rms, 1e-6)))
+        return onset_features.rms_db(self.audio, self.sr, t0, t1)
 
     def _window_abs_transient_intensity(self, t0, t1):
-        times = self._transient_times_np
-        if len(times) == 0:
-            return 0.0
-        mid = 0.5 * (t0 + t1)
-        i0 = int(np.searchsorted(times, t0))
-        im = int(np.searchsorted(times, mid))
-        i1 = int(np.searchsorted(times, t1, side='right'))
-        if im <= i0 or i1 <= im:
-            return 0.0
-        pre = self._transient_env_np[i0:im]
-        post = self._transient_env_np[im:i1]
-        if len(pre) == 0 or len(post) == 0:
-            return 0.0
-        return float(max(0.0, float(np.max(post)) - float(np.median(pre))))
+        return onset_features.transient_intensity(
+            self._transient_times_np, self._transient_env_np, t0, t1,
+        )
 
     def _chroma_delta_at_grid(self, g, grid):
-        ct = self._chroma_times
-        half = 0.5 * grid
-        b0 = int(np.searchsorted(ct, g - half))
-        b1 = int(np.searchsorted(ct, g))
-        a0 = b1
-        a1 = int(np.searchsorted(ct, g + half))
-        if b1 <= b0 or a1 <= a0:
-            return 0.0
-        b = self._chroma_full[:, b0:b1].mean(axis=1)
-        a = self._chroma_full[:, a0:a1].mean(axis=1)
-        bin_diffs = np.abs(a - b)
-        top_k = min(2, len(bin_diffs))
-        largest = np.partition(bin_diffs, -top_k)[-top_k:]
-        return float(np.sum(largest))
+        return onset_features.chroma_delta(self._chroma_times, self._chroma_full, g, grid)
 
     def _percussive_spike_at_grid(self, g, grid):
-        """Calculate normalized percussive spike (onset sharpness).
-        
-        Returns a value in [0, 1] where:
-        - 0: energy distributed equally across center and wings (flat envelope)
-        - 1: all energy concentrated at center (sharp percussive onset)
-        
-        Normalized to be independent of recording loudness/gain.
-        Prioritizes low "needle" energy (C0-C3) while retaining a small full-band cue.
-        """
-        ct = self.cqt_times
-        quarter = 0.25 * grid
-        half = 0.5 * grid
-        o0 = int(np.searchsorted(ct, g - half))
-        o1 = int(np.searchsorted(ct, g - quarter))
-        i0 = o1
-        i1 = int(np.searchsorted(ct, g + quarter))
-        o2 = i1
-        o3 = int(np.searchsorted(ct, g + half))
-
-        # Helper: normalized peak-vs-wings score in [0, 1].
-        # 0 means center energy is not stronger than both wings combined.
-        # 1 means nearly all band energy is concentrated in the center.
-        def _peak_score(b0: int, b1: int) -> float:
-            if b1 <= b0:
-                return 0.0
-            inner = float(np.sum(self.cqt_mag[b0:b1, i0:i1]))
-            outer_l = float(np.sum(self.cqt_mag[b0:b1, o0:o1])) if o1 > o0 else 0.0
-            outer_r = float(np.sum(self.cqt_mag[b0:b1, o2:o3])) if o3 > o2 else 0.0
-            outer = outer_l + outer_r
-            total = inner + outer
-            if total <= 1e-12:
-                return 0.0
-            return float(max(0.0, (inner - outer) / total))
-
-        # Low "needle" band emphasized by user observation: C0..C3.
-        lo_midi = max(int(self.cqt_fmin_midi), 12)
-        hi_midi = min(int(self.cqt_fmin_midi + self.cqt_n_bins - 1), 48)
-        lo_bin = max(0, lo_midi - int(self.cqt_fmin_midi))
-        hi_bin = min(self.cqt_mag.shape[0], hi_midi - int(self.cqt_fmin_midi) + 1)
-
-        low_score = _peak_score(lo_bin, hi_bin)
-        full_score = _peak_score(0, self.cqt_mag.shape[0])
-
-        # Low-band score carries most weight; full-band adds robustness.
-        return float(0.80 * low_score + 0.20 * full_score)
+        return onset_features.percussive_spike(
+            self.cqt_times, self.cqt_mag, g, grid, self.cqt_fmin_midi,
+        )
 
     def transient_envelope_slice(self, t0, t1):
         times = self._transient_times_np
