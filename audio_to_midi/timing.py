@@ -160,16 +160,16 @@ class BeatSession:
         return bar if beat == 1 else bar + 1
 
     # -- taps -------------------------------------------------------------
-    def tap_first_bar(self, tap: float) -> int:
+    def tap_first_bar(self, tap: float, *, lag_seconds: float = beat_logic.TYPICAL_TAP_LAG) -> int:
         if not self.fit:
             return 1
         bar_q = self.units()[0]
-        quarter = (tap - beat_logic.TYPICAL_TAP_LAG - self.fit.intercept) / self.fit.slope
+        quarter = (tap - lag_seconds - self.fit.intercept) / self.fit.slope
         return round(quarter / float(bar_q)) + 1
 
-    def apply_taps(self, taps, first_bar: int) -> beat_logic.TapResult:
+    def apply_taps(self, taps, first_bar: int, *, lag_seconds: float | None = None) -> beat_logic.TapResult:
         """Pin the beats nearest tapped downbeats, adopt the meter they imply, and recount."""
-        result = beat_logic.from_taps(self.beats, sorted(taps))
+        result = beat_logic.from_taps(self.beats, sorted(taps), lag_seconds=lag_seconds)
         saved = [beat.mark for beat in self.beats]
         old_meter = self.numerator, self.denominator
         low, high = min(taps) - result.bar_seconds, max(taps) + result.bar_seconds
@@ -215,6 +215,18 @@ class BeatSession:
         if not self.fit:
             raise ValueError("Pin bar 1's downbeat (and a second downbeat later) before warping.")
         return beat_logic.anchors(self.beats, self.labels, mode, self.units()[0], self.fit.downbeat)
+
+    def tempo_map(self) -> list[tuple[float, float]] | None:
+        """(source seconds, quarter) points of the counted tempo curve, as a smoothed warp would use them.
+
+        Lets the Mix view draw bars where the pins say they are before the mix is warped.
+        """
+        if not self.fit:
+            return None
+        try:
+            return self.warp_anchors("smooth")
+        except ValueError:
+            return None
 
     def summary(self) -> str:
         if not self.pins:

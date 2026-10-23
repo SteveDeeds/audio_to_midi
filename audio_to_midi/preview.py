@@ -6,6 +6,7 @@ external-MIDI path cannot share a clock with the audio device; it applies a
 user-measured latency offset instead.
 """
 
+import math
 import threading
 import time
 
@@ -18,7 +19,66 @@ ATTACK_SECONDS = 0.005
 RELEASE_SECONDS = 0.03
 HEADROOM = 0.95
 MIDI_PAN_LEFT = 16
+
+
+BALANCE_RANGE_DB = 40.0  # fade of the turned-down side just before the end of the slider
+
+
+def balance_gains(balance: int) -> tuple[float, float]:
+    """(audio, synth) gains for a balance from -100 (audio only) to 100 (synth only); 0 plays both fully.
+
+    The turned-down side fades evenly in decibels (half way is -20 dB) and is silent at the end.
+    """
+    balance = max(-100, min(100, int(balance)))
+    fade = 0.0 if abs(balance) == 100 else 10 ** (-BALANCE_RANGE_DB * abs(balance) / 100 / 20)
+    return (fade, 1.0) if balance > 0 else (1.0, fade)
+
+
+def midi_volume(gain: float) -> int:
+    """CC7 value for a linear gain; General MIDI synths attenuate 40*log10(cc/127) dB."""
+    return round(127 * math.sqrt(max(0.0, min(1.0, gain))))
+
+
 SYNC_TEST_PITCH = 76  # GM hi wood block on the drum channel
+TAP_CALIBRATION_BEAT = 0.6  # 100 BPM, 4/4
+TAP_CALIBRATION_START = 1.0
+TAP_CALIBRATION_BARS = 8
+
+
+def tapping_calibration(sample_rate: int = 44100) -> tuple[np.ndarray, np.ndarray]:
+    """One count-in bar, then eight measured bars; accented ticks are downbeats."""
+    bar = 4 * TAP_CALIBRATION_BEAT
+    downbeats = TAP_CALIBRATION_START + np.arange(TAP_CALIBRATION_BARS + 1) * bar
+    weak = [start + beat * TAP_CALIBRATION_BEAT for start in downbeats for beat in (1, 2, 3)]
+    length = round((downbeats[-1] + bar) * sample_rate)
+    audio = click_track(downbeats, length, sample_rate, 1600, 0.7)
+    audio += click_track(weak, length, sample_rate, 1000, 0.45)
+    return mix(audio), downbeats[1:]
+
+
+def tapping_offset(taps, downbeats) -> tuple[float, float, int]:
+    """Median tap delay in seconds, spread, and count; reject inconsistent calibration."""
+    taps, downbeats = np.asarray(taps, dtype=float), np.asarray(downbeats, dtype=float)
+    if taps.ndim != 1 or downbeats.ndim != 1 or not len(downbeats):
+        raise ValueError("Calibration needs tap times and reference downbeats.")
+    if not np.all(np.isfinite(taps)) or not np.all(np.isfinite(downbeats)):
+        raise ValueError("Calibration times must be finite.")
+    residuals = {}
+    for tap in taps:
+        index = int(np.argmin(np.abs(downbeats - tap)))
+        delay = float(tap - downbeats[index])
+        if abs(delay) <= 0.5 and index not in residuals:
+            residuals[index] = delay
+    values = np.array(list(residuals.values()))
+    if len(values) < 6:
+        raise ValueError("Tap on at least six accented ticks, once per bar. Retry the calibration.")
+    median = float(np.median(values))
+    deviations = np.abs(values - median)
+    keep = deviations <= max(0.04, 3 * float(np.median(deviations)))
+    values = values[keep]
+    if len(values) < 6 or float(np.std(values)) > 0.06:
+        raise ValueError("The taps were too inconsistent. Retry, tapping only on the accented tick.")
+    return float(np.median(values)), float(np.std(values)), len(values)
 
 
 def render_notes(rows, start_seconds: float, length: int, sample_rate: int, drums: bool = False) -> np.ndarray:
@@ -67,15 +127,19 @@ def click_track(times, length: int, sample_rate: int, frequency: float = 1000.0,
     return out
 
 
-def mix(audio: np.ndarray, notes: np.ndarray | None = None) -> np.ndarray:
-    """Return int16 stereo: stem mostly right and notes mostly left, or a centered stem alone."""
+def mix(audio: np.ndarray, notes: np.ndarray | None = None, audio_gain: float = 1.0,
+        note_gain: float = 1.0) -> np.ndarray:
+    """Return int16 stereo: stem mostly right and notes mostly left, or a centered stem alone.
+
+    ``audio_gain`` / ``note_gain`` (0..1) set the user's balance after the stem is normalized.
+    """
     audio = np.asarray(audio, dtype=np.float32)
     peak = float(np.max(np.abs(audio))) if len(audio) else 0.0
-    audio = audio / peak * 0.8 if peak > 1e-6 else np.zeros_like(audio)
+    audio = audio / peak * 0.8 * audio_gain if peak > 1e-6 else np.zeros_like(audio)
     if notes is None:
         stereo = np.column_stack([audio, audio])
     else:
-        notes = np.asarray(notes, dtype=np.float32)[: len(audio)]
+        notes = np.asarray(notes, dtype=np.float32)[: len(audio)] * note_gain
         notes = np.pad(notes, (0, len(audio) - len(notes)))
         stereo = np.column_stack([
             audio * AUDIO_GAINS[0] + notes * NOTE_GAINS[0],
@@ -141,7 +205,7 @@ class Preview:
         self._sound(stereo, sample_rate).play()
 
     def play_with_midi(self, stereo: np.ndarray, sample_rate: int, notes, device: str,
-                       channel: int, latency_seconds: float) -> None:
+                       channel: int, latency_seconds: float, volume: int = 127) -> None:
         """Play the stem and send `notes` (seconds from the segment start) to `device`."""
         self.stop()
         port = self._open(device)
@@ -149,7 +213,7 @@ class Preview:
         stop_event = threading.Event()
         self._stop_event = stop_event
         self._thread = threading.Thread(
-            target=self._run, args=(port, sound, notes, channel, latency_seconds, stop_event),
+            target=self._run, args=(port, sound, notes, channel, latency_seconds, stop_event, volume),
             daemon=True, name="midi-preview",
         )
         self._thread.start()
@@ -171,11 +235,11 @@ class Preview:
         raise ValueError(f"MIDI output {device!r} is not available.")
 
     @staticmethod
-    def _run(port, sound, notes, channel, latency_seconds, stop_event) -> None:
+    def _run(port, sound, notes, channel, latency_seconds, stop_event, volume=127) -> None:
         active: set[int] = set()
         try:
             port.write_short(0xB0 | channel, 10, MIDI_PAN_LEFT)
-            port.write_short(0xB0 | channel, 7, 127)
+            port.write_short(0xB0 | channel, 7, max(0, min(127, int(volume))))
             begin = time.perf_counter()
             for when, kind, pitch, velocity in midi_schedule(notes, latency_seconds):
                 while not stop_event.is_set():

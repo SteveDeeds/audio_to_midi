@@ -356,7 +356,7 @@ class TapResult:
     ignored: int  # double taps and taps that do not fit the bar spacing
 
 
-def from_taps(beats: list[Beat], taps) -> TapResult:
+def from_taps(beats: list[Beat], taps, *, lag_seconds: float | None = None) -> TapResult:
     """Turn tapped downbeat times into bar numbers, snapped downbeat pins and a meter guess.
 
     Every tap that fits the bar spacing counts bars; only taps near a confident
@@ -370,7 +370,9 @@ def from_taps(beats: list[Beat], taps) -> TapResult:
         raise ValueError("No beat candidates to snap the taps to; detect beats first.")
     times = np.array([beats[i].time for i in candidates])
     weights = np.array([beats[i].confidence for i in candidates])
-    lag = _tap_lag(taps, times, weights)
+    if lag_seconds is not None and not math.isfinite(lag_seconds):
+        raise ValueError("Tap lag must be finite.")
+    lag = _tap_lag(taps, times, weights) if lag_seconds is None else lag_seconds
     corrected = taps - lag
     keep = np.concatenate([[True], np.diff(corrected) > 0.25])
     ignored = int((~keep).sum())

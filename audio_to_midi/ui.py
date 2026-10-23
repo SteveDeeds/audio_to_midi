@@ -18,7 +18,7 @@ from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QPushButton, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from audio_to_midi import beats as beat_logic
@@ -30,17 +30,17 @@ from audio_to_midi.application import (
     mix_cqt, publish, record_drum, record_onset, replace_stem, stale, stems_for_chords, token, track_end,
 )
 from audio_to_midi.chord_view import ChordView
-from audio_to_midi.dialogs import NoteInfoDialog, PlaybackSettingsDialog, TimingDialog, WarpDialog
+from audio_to_midi.dialogs import NoteInfoDialog, PlaybackSettingsDialog, TappingCalibrationDialog, TimingDialog, WarpDialog
 from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.midi import export_midi, export_musicxml, import_notes
 from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, parse_number, position,
 )
-from audio_to_midi.preview import SYNC_TEST_PITCH, click_track, midi_outputs, mix, render_notes
+from audio_to_midi.preview import SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs, midi_volume, mix, render_notes
 from audio_to_midi.spectrogram import colorize, cqt_image, song_reference
 from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
-from audio_to_midi.timeline import PITCH_RANGES, Timeline  # noqa: F401  (re-exported)
+from audio_to_midi.timeline import PITCH_RANGES, Timeline, follow_curve  # noqa: F401  (re-exported)
 from audio_to_midi.timing import BeatSession
 
 MIX, CHORDS = "__mix__", "__chords__"
@@ -117,6 +117,14 @@ class ProjectWindow(QMainWindow):
         self.settings = QSettings("audio_to_midi", "v2")
         self.sound_device = self.settings.value("preview/output", "") or None
         self.latency_ms = int(self.settings.value("preview/midi_latency_ms", 0))
+        try:
+            self.balance = max(-100, min(100, int(self.settings.value("preview/balance", 0))))
+        except (TypeError, ValueError):
+            self.balance = 0
+        self.tap_offset_seconds = (
+            float(self.settings.value("timing/tap_offset_ms")) / 1000
+            if self.settings.contains("timing/tap_offset_ms") else None
+        )
         self._history: dict[str, list[tuple]] = {}
         self._future: dict[str, list[tuple]] = {}
         self._rows = []
@@ -204,6 +212,8 @@ class ProjectWindow(QMainWindow):
         edit.addSeparator()
         self._act(edit, "detect", "&Detect tempo, meter, and key", self._detect)
         self._act(edit, "tap", "&Tap downbeats (Space)", self._toggle_tap, checkable=True)
+        self._act(edit, "clear_pins", "Clear all pins", self._clear_pins)
+        self._act(edit, "calibrate_tapping", "Calibrate tapping...", self._calibrate_tapping)
         self._act(edit, "set_timing", "Set tempo, meter, and &key...", self._edit_timing)
         edit.addSeparator()
         self._act(edit, "warp", "&Warp mix to tempo...", self._warp)
@@ -216,8 +226,10 @@ class ProjectWindow(QMainWindow):
         self._act(edit, "clear_all", "Clear all", self._clear_all)
 
         view = bar.addMenu("&View")
-        self._act(view, "previous", "&Previous bars", lambda: self._navigate(-1), "PgUp")
-        self._act(view, "next", "&Next bars", lambda: self._navigate(1), "PgDown")
+        self._act(view, "previous", "&Previous bars", lambda: self._navigate(-1), "Left").setShortcuts(
+            [QKeySequence("Left"), QKeySequence("PgUp")])
+        self._act(view, "next", "&Next bars", lambda: self._navigate(1), "Right").setShortcuts(
+            [QKeySequence("Right"), QKeySequence("PgDown")])
         self._act(view, "zoom_in", "Zoom &in", lambda: self._zoom(-1), "Ctrl+=")
         self._act(view, "zoom_out", "Zoom &out", lambda: self._zoom(1), "Ctrl+-")
         view.addSeparator()
@@ -293,6 +305,8 @@ class ProjectWindow(QMainWindow):
         row = QHBoxLayout()
         for text, step in (("Previous", -1), ("Next", 1)):
             button = QPushButton(text)
+            button.setToolTip(f"Scroll half a screen {'back' if step < 0 else 'forward'} "
+                              f"({'Left / PgUp' if step < 0 else 'Right / PgDown'})")
             button.clicked.connect(lambda checked=False, s=step: self._guard(lambda: self._navigate(s)))
             row.addWidget(button)
             if step < 0:
@@ -325,6 +339,21 @@ class ProjectWindow(QMainWindow):
             self.tool_buttons[name] = button
             row.addWidget(button)
         row.addStretch(1)
+        row.addWidget(QLabel("Audio"))
+        self.balance_slider = QSlider(Qt.Orientation.Horizontal)
+        self.balance_slider.setRange(-100, 100)
+        self.balance_slider.setPageStep(25)
+        self.balance_slider.setFixedWidth(120)
+        self.balance_slider.setValue(self.balance)
+        self.balance_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)  # keep arrow keys for navigation
+        self.balance_slider.setToolTip(
+            "Playback mix: left plays only the audio, right only the synth (notes and clicks), "
+            "center both at full level. Double-click to center.")
+        self.balance_slider.valueChanged.connect(self._balance_changed)
+        self.balance_slider.mouseDoubleClickEvent = lambda event: self.balance_slider.setValue(0)
+        row.addWidget(self.balance_slider)
+        row.addWidget(QLabel("Synth"))
+        row.addSpacing(8)
         for text, slot in (("Play", self._play), ("Stop", self._stop)):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, f=slot: self._guard(f))
@@ -365,6 +394,8 @@ class ProjectWindow(QMainWindow):
             ("U", self._unpin_selected),
         ):
             shortcut = QShortcut(QKeySequence(key), self)
+            if key == "Space":
+                shortcut.setAutoRepeat(False)
             shortcut.activated.connect(lambda f=slot: self._guard(f))
             self.shortcuts[key] = shortcut
         self.debounce = QTimer(self)
@@ -374,6 +405,10 @@ class ProjectWindow(QMainWindow):
         self.clock = QTimer(self)
         self.clock.setInterval(30)
         self.clock.timeout.connect(self._tick)
+        self.rebalance = QTimer(self)
+        self.rebalance.setSingleShot(True)
+        self.rebalance.setInterval(200)
+        self.rebalance.timeout.connect(lambda: self._guard(self._replay_balanced))
 
     def _guard(self, action) -> None:
         try:
@@ -399,11 +434,14 @@ class ProjectWindow(QMainWindow):
             self.timeline.selected = None
         self.timeline.beats = self._lane_beats() if view == MIX else []
         self.timeline.taps = list(self.taps) if view == MIX else []
+        self.timeline.tempo_map = (
+            self.session.tempo_map() if view == MIX and self.session is not None and not self.warped else None
+        )
         self.timeline.update()
         self.chord_view.start, self.chord_view.end = self.timeline.start, self.timeline.end
         self.chord_view.update()
-        first = bar_and_beat(grid, self.timeline.start)[0]
-        last = bar_and_beat(grid, max(self.timeline.start, self.timeline.end - grid.subdivision))[0]
+        first = bar_and_beat(grid, self.timeline.counted(self.timeline.start))[0]
+        last = bar_and_beat(grid, self.timeline.counted(max(self.timeline.start, self.timeline.end - grid.subdivision)))[0]
         self.window_label.setText(f"Bar {first}" if first == last else f"Bars {first}\u2013{last}")
         self.zoom_label.setText(f"{self.bars} bar{'s' if self.bars != 1 else ''}/screen")
         self.actions["zoom_in"].setEnabled(self.bars > ZOOMS[0])
@@ -465,6 +503,9 @@ class ProjectWindow(QMainWindow):
             "detect": (has_mix and not tapping, "Import a mix first (File > Import mix)."),
             "tap": (tapping or (self.session is not None and not warped),
                     "Detect tempo first; tapping counts bars before the mix is warped."),
+            "clear_pins": (bool(self.session and self.session.pins) and not warped,
+                           "Return to original mix to clear pins." if warped else "No downbeat pins to clear."),
+            "calibrate_tapping": (not tapping and not busy, "Finish tapping or cancel the current task first."),
             "warp": (has_mix and not warped,
                      "Import a mix first." if not has_mix else "Already warped - use Return to original mix to redo."),
             "unwarp": (warped, "The mix is not warped."),
@@ -781,8 +822,9 @@ class ProjectWindow(QMainWindow):
         self.timeline.end = self.timeline.start + self.bars * self.project.grid.bar_beats
 
     def _navigate(self, direction: int) -> None:
+        """Scroll half a screen so the previous view's edge stays in sight."""
         self._cancel(analysis_only=True)
-        self._set_window(self.timeline.start + (self.timeline.end - self.timeline.start) * direction)
+        self._set_window(self.timeline.start + (self.timeline.end - self.timeline.start) / 2 * direction)
         self._load_envelope()
         self._refresh()
         self._queue_visible()
@@ -1635,6 +1677,19 @@ class ProjectWindow(QMainWindow):
         self._remove_beat(self._selected_index())
 
     # -- tapping ------------------------------------------------------------
+    def _calibrate_tapping(self) -> None:
+        self._stop()
+        dialog = TappingCalibrationDialog(self)
+        if dialog.exec() == TappingCalibrationDialog.DialogCode.Accepted:
+            self.tap_offset_seconds = dialog.offset_seconds
+            if self.tap_offset_seconds is None:
+                self.settings.remove("timing/tap_offset_ms")
+                self.status.setText("Tapping uses automatic lag correction.")
+            else:
+                milliseconds = self.tap_offset_seconds * 1000
+                self.settings.setValue("timing/tap_offset_ms", milliseconds)
+                self.status.setText(f"Tapping calibrated: {milliseconds:+.0f} ms. Applies to new taps only.")
+
     def _toggle_tap(self, checked: bool) -> None:
         if not checked:
             self._stop()
@@ -1660,7 +1715,7 @@ class ProjectWindow(QMainWindow):
             seconds = self._now()
             if seconds is None:
                 return
-        self.taps.append(float(seconds))
+        self.taps.append(float(seconds) - (self.tap_offset_seconds or 0.0))
         self.timeline.taps = list(self.taps)
         self.timeline.update()
 
@@ -1673,15 +1728,22 @@ class ProjectWindow(QMainWindow):
             self.status.setText("Tap at least two downbeats to count bars.")
             return
         session = self._require_session()
+        lag = None if self.tap_offset_seconds is None else 0.0
+        first_guess = session.tap_first_bar(
+            taps[0], lag_seconds=beat_logic.TYPICAL_TAP_LAG if lag is None else lag,
+        )
         first, ok = QInputDialog.getInt(
-            self, "Tapped downbeats", "Bar number of your first tap", session.tap_first_bar(taps[0]), -999, 9999,
+            self, "Tapped downbeats", "Bar number of your first tap", first_guess, -999, 9999,
         )
         if not ok:
             return
-        session.apply_taps(taps, first)
+        session.apply_taps(taps, first, lag_seconds=lag)
         self.taps = []
         self._session_changed()
-        self.status.setText(session.tap_note)
+        self.status.setText(session.tap_note + (
+            f" Calibrated correction: {self.tap_offset_seconds * 1000:+.0f} ms."
+            if self.tap_offset_seconds is not None else ""
+        ))
 
     def _space(self) -> None:
         if self.tapping:
@@ -1938,22 +2000,42 @@ class ProjectWindow(QMainWindow):
     def _clicks(self, a: float, b: float, length: int, rate: int) -> np.ndarray:
         grid = self.project.grid
         unit = beat_length(grid)
-        steps = grid.seconds_to_beat(a) / unit
+        curve = self.timeline.counted_times() if self.view == MIX else None
+        if curve is None:
+            to_seconds = grid.beat_to_seconds
+            first = grid.seconds_to_beat(a)
+        else:
+            # Mix view before warping: click on the counted beats drawn on screen, not a constant tempo.
+            seconds, quarters = curve
+            to_seconds = lambda beat: follow_curve(float(beat), quarters, seconds)  # noqa: E731
+            first = Fraction(follow_curve(a, seconds, quarters)).limit_denominator(100_000)
+        steps = first / unit
         beat = -((-steps.numerator) // steps.denominator) * unit
         strong, weak = [], []
-        while (seconds := grid.beat_to_seconds(beat)) < b:
-            if seconds >= a:
-                (strong if beat % grid.bar_beats == 0 else weak).append(seconds - a)
+        while (seconds_at := to_seconds(beat)) < b:
+            if seconds_at >= a:
+                (strong if beat % grid.bar_beats == 0 else weak).append(seconds_at - a)
             beat += unit
         return click_track(strong, length, rate, 1600.0, 0.7) + click_track(weak, length, rate, 1000.0, 0.45)
 
-    def _play(self) -> None:
+    def _balance_changed(self, value: int) -> None:
+        self.balance = int(value)
+        self.settings.setValue("preview/balance", self.balance)
+        if self._now() is not None:
+            self.rebalance.start()  # re-render the playing buffer once the slider settles
+
+    def _replay_balanced(self) -> None:
+        now = self._now()
+        if now is not None:
+            self._play(now)
+
+    def _play(self, start_seconds: float | None = None) -> None:
         view, track = self.view, self.active
         path = self.project.mix_path if view in (MIX, CHORDS) else (track.audio_path if track else None)
         if not path:
             raise ValueError("Import a mix or choose a track.")
         grid = self.project.grid
-        a = max(0.0, grid.beat_to_seconds(self.timeline.start))
+        a = max(0.0, grid.beat_to_seconds(self.timeline.start) if start_seconds is None else start_seconds)
         with sf.SoundFile(path) as audio:
             rate = audio.samplerate
             audio.seek(min(len(audio), round(a * rate)))
@@ -1981,17 +2063,19 @@ class ProjectWindow(QMainWindow):
                     rows.extend((max(a, start), min(b, end), pitch, 70) for pitch in voicing(chord.symbol))
         device = self.sound_device if track else None
         player = self._player()
+        audio_gain, synth_gain = balance_gains(self.balance)
         if device is None:
             if rows:
                 extra = extra + render_notes(rows, a, len(segment), rate, drums)
-            player.play_audio(mix(segment, extra if rows or clicks else None), rate)
+            player.play_audio(mix(segment, extra if rows or clicks else None, audio_gain, synth_gain), rate)
             self.status.setText(
                 "Playing" + (": audio mostly right, notes and clicks mostly left (sample-aligned)." if rows or clicks else ".")
                 + " Space stops."
             )
         else:
             relative = [(start - a, end - a, pitch, velocity) for start, end, pitch, velocity in rows]
-            player.play_with_midi(mix(segment, extra), rate, relative, device, 9 if drums else 0, self.latency_ms / 1000)
+            player.play_with_midi(mix(segment, extra, audio_gain, synth_gain), rate, relative, device,
+                                  9 if drums else 0, self.latency_ms / 1000, midi_volume(synth_gain))
             self.status.setText(
                 f"Playing with MIDI out '{device}' at {self.latency_ms} ms latency compensation "
                 "(File > Playback settings)."
@@ -2022,6 +2106,7 @@ class ProjectWindow(QMainWindow):
     def _clear_playhead(self) -> None:
         self._clock = None
         self.clock.stop()
+        self.rebalance.stop()
         self.timeline.playhead = self.chord_view.playhead = None
         self.timeline.update()
         self.chord_view.update()

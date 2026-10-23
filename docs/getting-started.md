@@ -116,16 +116,43 @@ app which beats are downbeats, and it counts every other beat from them.
 - **Right-click** a beat for *Downbeat of bar N*, *Downbeat of bar...* (type
   the number), *Unpin* and *Remove this beat*. Right-click between beats to
   *Add a beat here*, or to *Clear all pins*.
+- **Edit > Clear all pins** also resets downbeat pins without removing beat
+  candidates. It is available when pins exist and the mix has not been warped.
 - Pin two downbeats several bars apart; the tempo comes from your pins, not
   from the detector's guess. Add more pins where the count drifts.
+- Until the mix is warped, the bar lines and the "Bar N" labels follow your
+  counted beats, so a downbeat pinned to bar N sits exactly on the Bar N line.
+  If the music speeds up or slows down, the bars get narrower or wider instead
+  of drifting away from the pins. A bar that looks squeezed or stretched
+  usually means an extra or missed tap, or a pin set to the wrong bar. The
+  audio itself is not stretched until you warp.
 
 **Tap downbeats instead.** Check **Edit > Tap downbeats**. The mix plays from
 the current window, and you press **Space** on the "one" of every bar. Your
-taps appear as markers. Uncheck the item when done (tap at least four bars in
+taps appear as markers on the initial keypress; holding Space does not add
+repeated taps. Uncheck the item when done (tap at least four bars in
 a clear section). The app asks which bar your first tap was, snaps each tap to
 the nearest detected beat, pins them, and infers the meter from the beats
 between taps. The status line reports how many bars were counted and how late
 you tapped on average.
+
+**If the tap arrows consistently land late or early**, use **Edit > Calibrate
+tapping...**. It plays a 100 BPM, 4/4 **TICK tock tock tock** pattern. Listen to
+one count-in bar, then press **Space on the accented TICK** for eight bars.
+Save the measured correction when the run finishes (or use **Finish** after at
+least six steady taps). Inconsistent runs ask you to retry.
+
+The correction measures audio-output, keyboard, and your own tapping delay
+together; it is not a sound-card-only measurement. It is saved on this machine,
+not in the song, and shifts **new** taps and their arrows before snapping.
+Existing pins, audio, notes, and the playback cursor are unchanged. Recalibrate
+after changing speakers/headphones or audio settings. **Use automatic correction**
+in the calibration dialog removes the saved correction and restores the previous
+song-based lag estimate. Calibrated taps are not automatically lag-corrected a
+second time. This is separate from external MIDI latency in Playback settings.
+To check your raw timing without either calibration or the automatic estimate,
+choose **Use taps as pressed (no correction)** in that dialog. Automatic correction
+runs only after tapping ends; it does not delay live arrow display.
 
 When you are not tapping, **Space** plays and stops. **View > Metronome click**
 adds clicks (high on downbeats) so you can hear whether the count lines up.
@@ -184,7 +211,8 @@ are analyzed automatically. **Model > Analyze visible bars** and
 **Analyze whole track** run it on demand; **Cancel analysis** (Esc, or the
 button in the status bar) stops it.
 
-**Navigate** with **Previous** / **Next** (PgUp / PgDn). The label between them
+**Navigate** with **Previous** / **Next** (Left / Right arrow, or PgUp / PgDn);
+each step scrolls half a screen. The label between them
 shows the visible bars. **Zoom out (-)** / **Zoom in (+)** next to them (also
 Ctrl + mouse wheel, View > Zoom, Ctrl+- / Ctrl+=) show 1, 2, 4, 8 or 16 bars per
 screen; the readout beside the buttons shows the current setting. The plain mouse wheel scrolls pitch; **Ctrl + Shift + wheel**
@@ -319,6 +347,14 @@ it, and the view follows the playhead. In a stem view you hear the stem mostly
 on the right and the notes mostly on the left; in the Chords view you hear the
 mix with the chords.
 
+The **Audio ↔ Synth** slider next to **Play** sets the balance: all the way
+left plays only the audio, all the way right only the synth (notes, chords and
+metronome clicks), and the center plays both at full level. The other side
+fades evenly in loudness: a quarter of the way is about 10 dB quieter, half way
+20 dB, and it is silent at the end. Double-click it to
+center. Moving it during playback restarts the sound from the playhead with the
+new balance. With **MIDI out**, it also sets the synthesizer's channel volume.
+The setting is remembered.
 **File > Playback settings...** chooses how notes sound:
 
 - **Built-in tones** (default) are rendered into the same buffer as the audio,

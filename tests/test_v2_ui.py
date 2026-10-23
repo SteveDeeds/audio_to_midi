@@ -116,6 +116,8 @@ class EditorTests(unittest.TestCase):
         second = add_stem(self.window.project, self.wav, "vocals")
         self.window._sync_tracks()
         self.window._navigate(1)
+        self.assertEqual(self.window.timeline.start, F(4))  # half of the 2-bar screen
+        self.window._navigate(1)
         self.window.tracks.setCurrentIndex(1)
         self.assertEqual(self.window.active.id, second.id)
         self.assertEqual(self.window.timeline.start, F(8))
@@ -124,6 +126,28 @@ class EditorTests(unittest.TestCase):
         image = self.window.grab().toImage()
         self.assertGreater(image.width(), 500)
         self.assertFalse(image.isNull())
+
+    def test_arrow_keys_and_page_keys_scroll_half_a_screen(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        window.show()
+        window.activateWindow()
+        window.timeline.setFocus()
+        self.app.processEvents()
+        width = window.timeline.end - window.timeline.start
+        self.assertEqual(window.timeline.start, F(0))
+        QTest.keyClick(window.timeline, Qt.Key.Key_Right)
+        self.assertEqual(window.timeline.start, width / 2)
+        self.assertEqual(window.timeline.end - window.timeline.start, width)
+        QTest.keyClick(window.timeline, Qt.Key.Key_PageDown)
+        self.assertEqual(window.timeline.start, width)
+        QTest.keyClick(window.timeline, Qt.Key.Key_Left)
+        self.assertEqual(window.timeline.start, width / 2)
+        QTest.keyClick(window.timeline, Qt.Key.Key_PageUp)
+        QTest.keyClick(window.timeline, Qt.Key.Key_Left)
+        self.assertEqual(window.timeline.start, F(0))
 
     def test_save_reopen_preserves_edit_state(self):
         self.window.folder = self.root / "project"
@@ -381,6 +405,89 @@ class EditorTests(unittest.TestCase):
         saved = window.project.stages["timing"]["beats"]
         self.assertEqual(len(saved["beats"]), 72)
 
+    def test_mix_view_bar_lines_pass_through_pinned_downbeats(self):
+        from fractions import Fraction
+
+        from audio_to_midi.beats import Beat
+        from audio_to_midi.timing import BeatSession
+
+        window = self.window
+        self._mix_only()
+        times = [i * 0.5 for i in range(16)] + [8.0 + i * 0.4 for i in range(16)]
+        window.session = BeatSession([Beat(t, 0.9) for t in times], 120, 20, 4, 4)
+        window._session_changed()
+        for index, bar in ((0, 1), (8, 3), (16, 5), (24, 7)):
+            window._pin(index, bar)
+        timeline = window.timeline
+        self.assertIsNotNone(timeline.tempo_map)
+        timeline.resize(1400, 300)
+        timeline.start, timeline.end = Fraction(0), Fraction(28)
+        bars = {int(beat / 4) + 1: x for beat, x in timeline._grid_lines() if beat % 4 == 0}
+        grid = window.project.grid
+        drift = 0
+        for index, bar in ((0, 1), (8, 3), (16, 5), (24, 7)):
+            pin_x = timeline._x_seconds(times[index])
+            self.assertLessEqual(abs(bars[bar] - pin_x), 1, f"bar {bar}")
+            drift = max(drift, abs(timeline._x(Fraction((bar - 1) * 4)) - pin_x))
+        self.assertGreater(drift, 10)  # a constant-tempo grid would miss the pins
+        labels = {label: round(timeline._x_seconds(s)) for s, kind, label in timeline.beats if kind == "pin"}
+        self.assertEqual(set(labels), {"1", "3", "5", "7"})
+        self.assertEqual(timeline.counted(grid.seconds_to_beat(times[16])), 16)
+
+        calls = []
+        with patch("audio_to_midi.ui.click_track", side_effect=lambda t, *a: calls.append(list(t)) or 0):
+            window._clicks(0.0, 14.5, 1, 8000)
+        downbeats, weak = calls
+        for index in (0, 8, 16, 24):
+            self.assertTrue(any(abs(t - times[index]) < 1e-6 for t in downbeats), times[index])
+        self.assertTrue(any(abs(t - 8.4) < 0.03 for t in weak))  # follows the faster second half
+
+        timeline.mode = "notes"
+        straight = [x for _, x in timeline._grid_lines()]
+        self.assertEqual(len(straight), int(28 / grid.subdivision))
+
+        window.project.stages["preparation"] = {"warp_revision": "warp"}
+        window._refresh()
+        self.assertIsNone(timeline.tempo_map)
+
+    def test_edit_menu_clear_all_pins_preserves_beats_and_updates_gating(self):
+        from audio_to_midi.beats import Beat
+        from audio_to_midi.timing import BeatSession
+
+        window = self.window
+        action = window.actions["clear_pins"]
+        edit = window.menuBar().actions()[1].menu()
+        actions = edit.actions()
+        self.assertEqual(action.text(), "Clear all pins")
+        self.assertEqual(actions.index(action), actions.index(window.actions["tap"]) + 1)
+        self.assertLess(actions.index(action), actions.index(window.actions["set_timing"]))
+        self.assertFalse(action.isEnabled())
+        self._mix_only()
+        window.session = BeatSession([Beat(i * 0.5, 0.9) for i in range(32)], 120, 20, 4, 4)
+        window._session_changed()
+        self.assertFalse(action.isEnabled())
+        window._pin(0, 1)
+        window._pin(8, 2)
+        self.assertTrue(action.isEnabled())
+
+        window.project.stages["preparation"] = {"warp_revision": "warp"}
+        window._update_actions()
+        self.assertFalse(action.isEnabled())
+        window.project.stages.pop("preparation")
+        window._update_actions()
+        self.assertTrue(action.isEnabled())
+
+        times = [beat.time for beat in window.session.beats]
+        action.trigger()
+        self.assertEqual(window.session.pins, [])
+        self.assertIsNone(window.session.fit)
+        self.assertEqual([beat.time for beat in window.session.beats], times)
+        self.assertTrue(all(beat.mark is None for beat in window.session.beats))
+        self.assertEqual({kind for _, kind, _ in window.timeline.beats}, {"uncounted"})
+        self.assertFalse(action.isEnabled())
+        saved = window.project.stages["timing"]["beats"]
+        self.assertTrue(all(len(beat) == 2 for beat in saved["beats"]))
+
     def test_warp_as_is_check_confirm_and_return_to_original(self):
         from PySide6.QtWidgets import QDialog
         from audio_to_midi.application import stale
@@ -614,6 +721,163 @@ class EditorTests(unittest.TestCase):
         self.assertIn("8 bars counted", window.status.text())
         self.assertRegex(window.status.text(), r"\b(7[5-9]|8[0-5]) ms late")
 
+    def test_calibrated_taps_move_arrows_and_skip_automatic_second_correction(self):
+        from audio_to_midi.beats import Beat
+        from audio_to_midi.timing import BeatSession
+
+        window = self.window
+        self._mix_only(seconds=40)
+        window.session = BeatSession([Beat(.1 + .25 * i, .9) for i in range(160)], 240, 40, 4, 4)
+        window.tap_offset_seconds = .32
+        for bar in range(8):
+            with patch.object(window, "_now", return_value=.1 + 2 * bar + .32):
+                window._tap()
+        np.testing.assert_allclose(window.timeline.taps, [.1 + 2 * bar for bar in range(8)])
+        with patch("audio_to_midi.ui.QInputDialog.getInt", return_value=(1, True)), \
+                patch("audio_to_midi.beats._tap_lag", side_effect=AssertionError("double correction")):
+            window._finish_taps()
+        self.assertEqual(window.session.beats[0].mark, (1, 1))
+        self.assertEqual(window.session.beats[56].mark, (8, 1))
+        self.assertIn("+320 ms", window.status.text())
+
+    def test_space_key_records_tap_on_press_and_ignores_keyboard_repeat(self):
+        from PySide6.QtCore import QEvent, Qt
+        from PySide6.QtGui import QKeyEvent
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        self._mix_only(seconds=40)
+        window.actions["tap"].setChecked(True)
+        window.show()
+        window.activateWindow()
+        window.timeline.setFocus()
+        self.app.processEvents()
+        self.assertFalse(window.shortcuts["Space"].autoRepeat())
+        with patch.object(window, "_now", return_value=1.25):
+            QTest.keyPress(window.timeline, Qt.Key.Key_Space)
+        self.assertEqual(window.taps, [1.25])
+        self.assertEqual(window.timeline.taps, [1.25])
+        repeated = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Space, Qt.KeyboardModifier.NoModifier, " ", True)
+        with patch.object(window, "_now", return_value=1.75):
+            self.app.sendEvent(window.timeline, repeated)
+        self.assertEqual(window.taps, [1.25])
+        QTest.keyRelease(window.timeline, Qt.Key.Key_Space)
+        window.actions["tap"].setChecked(False)
+
+    def test_tapping_calibration_save_cancel_reset_and_reload_settings(self):
+        from audio_to_midi.dialogs import TappingCalibrationDialog
+
+        window = self.window
+        action = window.actions["calibrate_tapping"]
+        self.assertTrue(action.isEnabled())
+        with patch("audio_to_midi.ui.TappingCalibrationDialog") as dialog:
+            dialog.DialogCode = TappingCalibrationDialog.DialogCode
+            dialog.return_value.exec.return_value = dialog.DialogCode.Accepted
+            dialog.return_value.offset_seconds = .32
+            action.trigger()
+        self.assertEqual(window.tap_offset_seconds, .32)
+        self.assertEqual(float(window.settings.value("timing/tap_offset_ms")), 320)
+        reopened = ProjectWindow()
+        self.assertEqual(reopened.tap_offset_seconds, .32)
+        reopened.close()
+        reopened.deleteLater()
+        with patch("audio_to_midi.ui.TappingCalibrationDialog") as dialog:
+            dialog.DialogCode = TappingCalibrationDialog.DialogCode
+            dialog.return_value.exec.return_value = dialog.DialogCode.Rejected
+            dialog.return_value.offset_seconds = .1
+            window._calibrate_tapping()
+        self.assertEqual(window.tap_offset_seconds, .32)
+        with patch("audio_to_midi.ui.TappingCalibrationDialog") as dialog:
+            dialog.DialogCode = TappingCalibrationDialog.DialogCode
+            dialog.return_value.exec.return_value = dialog.DialogCode.Accepted
+            dialog.return_value.offset_seconds = None
+            window._calibrate_tapping()
+        self.assertIsNone(window.tap_offset_seconds)
+        self.assertFalse(window.settings.contains("timing/tap_offset_ms"))
+        window.actions["tap"].setChecked(True)
+        window._update_actions()
+        self.assertFalse(action.isEnabled())
+        window.actions["tap"].setChecked(False)
+
+    def test_tapping_calibration_dialog_measures_stops_and_does_not_modify_project(self):
+        from PySide6.QtWidgets import QDialogButtonBox
+        from unittest.mock import Mock
+        from audio_to_midi.dialogs import TappingCalibrationDialog
+
+        window = self.window
+        window.preview = Mock()
+        project = window.project
+        dialog = TappingCalibrationDialog(window)
+        self.addCleanup(dialog.close)
+        save = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self.assertFalse(save.isEnabled())
+        with patch("audio_to_midi.dialogs.time.monotonic", return_value=100):
+            dialog._start()
+        window.preview.play_audio.assert_called_once()
+        with patch("audio_to_midi.dialogs.time.monotonic", return_value=101.32):
+            dialog._tap()
+        self.assertEqual(dialog.taps, [])
+        for downbeat in dialog.downbeats:
+            with patch("audio_to_midi.dialogs.time.monotonic", return_value=100 + downbeat + .32):
+                dialog._tap()
+        dialog._finish()
+        self.assertAlmostEqual(dialog.offset_seconds, .32)
+        self.assertTrue(save.isEnabled())
+        self.assertFalse(dialog.timer.isActive())
+        self.assertIsNone(dialog.started)
+        window.preview.stop.assert_called_once()
+        self.assertIs(window.project, project)
+        self.assertIsNone(window.tap_offset_seconds)
+        dialog._start()
+        self.assertFalse(save.isEnabled())
+        dialog.reject()
+        self.assertIsNone(dialog.started)
+        self.assertFalse(dialog.timer.isActive())
+        self.assertEqual(window.preview.stop.call_count, 2)
+
+    def test_calibration_dialog_failed_retry_and_uncorrected_mode(self):
+        from PySide6.QtWidgets import QDialogButtonBox
+        from unittest.mock import Mock
+        from audio_to_midi.dialogs import TappingCalibrationDialog
+
+        window = self.window
+        window.preview = Mock()
+        dialog = TappingCalibrationDialog(window)
+        self.addCleanup(dialog.close)
+        save = dialog.buttons.button(QDialogButtonBox.StandardButton.Ok)
+        dialog._start()
+        dialog.taps = list(dialog.downbeats + .1)
+        dialog._finish()
+        self.assertTrue(save.isEnabled())
+        dialog._start()
+        dialog.taps = [float(dialog.downbeats[0] + .1)]
+        dialog._finish()
+        self.assertFalse(save.isEnabled())
+        self.assertIn("at least six", dialog.status.text())
+        dialog.uncorrected.click()
+        self.assertEqual(dialog.result(), dialog.DialogCode.Accepted)
+        self.assertEqual(dialog.offset_seconds, 0)
+
+        reset = TappingCalibrationDialog(window)
+        reset.offset_seconds = .32
+        reset.reset.click()
+        self.assertIsNone(reset.offset_seconds)
+        self.assertEqual(reset.result(), reset.DialogCode.Accepted)
+        reset.close()
+
+    def test_calibration_playback_failure_is_visible_and_does_not_start_clock(self):
+        from unittest.mock import Mock
+        from audio_to_midi.dialogs import TappingCalibrationDialog
+
+        self.window.preview = Mock()
+        self.window.preview.play_audio.side_effect = RuntimeError("Device unavailable")
+        dialog = TappingCalibrationDialog(self.window)
+        self.addCleanup(dialog.close)
+        dialog._start()
+        self.assertIn("Device unavailable", dialog.status.text())
+        self.assertIsNone(dialog.started)
+        self.assertFalse(dialog.timer.isActive())
+
     def test_chords_model_box_lists_chord_recognizers_in_sync_with_menu(self):
         from PySide6.QtCore import QSettings
 
@@ -738,7 +1002,8 @@ class EditorTests(unittest.TestCase):
             window._set_mix(mix_path)
         self.wait_cqt()
         loud_red = int(window.timeline._cqt_buffer[..., 0].max())
-        window._navigate(1)  # bars 3-4: the quiet half
+        window._navigate(1)
+        window._navigate(1)  # two half-screen steps: bars 3-4, the quiet half
         quiet_red = int(window.timeline._cqt_buffer[..., 0].max())
         self.assertGreater(loud_red, 200)
         self.assertLess(quiet_red, 60)
@@ -994,6 +1259,46 @@ class EditorTests(unittest.TestCase):
         self.assertGreater(left[4000:4100].max(), 0)
         self.assertGreater(left[4100:7900].max(), 1000)
         self.assertEqual(left[8000:].max(), 0)
+
+    def test_audio_synth_balance_slider_sets_gains_persists_and_replays_while_playing(self):
+        from PySide6.QtCore import QSettings
+
+        window = self.window
+        window.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
+        window.sound_device = None
+        window._add_note(F(1), 60, F(2))
+        slider = window.balance_slider
+        self.assertEqual((slider.minimum(), slider.maximum(), slider.value()), (-100, 100, 0))
+        played, mixed = [], []
+        window.preview = type("FakePreview", (), {
+            "play_audio": lambda _, stereo, rate: played.append(stereo),
+            "stop": lambda _: None, "close_port": lambda _: None,
+        })()
+        import audio_to_midi.ui as ui_module
+
+        real_mix = ui_module.mix
+
+        def spy(audio, notes=None, audio_gain=1.0, note_gain=1.0):
+            mixed.append((audio_gain, note_gain))
+            return real_mix(audio, notes, audio_gain, note_gain)
+
+        with patch("audio_to_midi.ui.mix", side_effect=spy):
+            window._play()
+            slider.setValue(-100)
+            self.assertTrue(window.rebalance.isActive(), "moving the slider while playing re-renders")
+            with patch.object(window, "_now", return_value=0.25):
+                window.rebalance.timeout.emit()
+            window._stop()
+            slider.setValue(100)
+            self.assertFalse(window.rebalance.isActive())
+            window._play()
+            window._stop()
+        self.assertEqual(mixed, [(1.0, 1.0), (1.0, 0.0), (0.0, 1.0)])
+        self.assertEqual(len(played[1]), len(played[0]) - 2000)  # replayed from 0.25 s at 8 kHz
+        self.assertEqual(np.abs(played[1][:, 0].astype(int)).max(), 0, "audio only: no synth on the left")
+        self.assertEqual(int(window.settings.value("preview/balance")), 100)
+        slider.mouseDoubleClickEvent(None)
+        self.assertEqual((slider.value(), window.balance), (0, 0))
 
 
 if __name__ == "__main__":

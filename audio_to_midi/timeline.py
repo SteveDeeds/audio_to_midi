@@ -6,6 +6,7 @@ Drum tracks swap the piano keys for ADTOF's five lanes under a half-height spect
 from __future__ import annotations
 
 from fractions import Fraction
+import math
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
@@ -57,6 +58,15 @@ BEAT_COLORS = {
 }
 
 
+def follow_curve(value: float, xs: np.ndarray, ys: np.ndarray) -> float:
+    """Piecewise-linear map through (xs, ys); continues at the end segments' slope outside them."""
+    if value <= xs[0]:
+        return float(ys[0] + (value - xs[0]) * (ys[1] - ys[0]) / (xs[1] - xs[0]))
+    if value >= xs[-1]:
+        return float(ys[-1] + (value - xs[-1]) * (ys[-1] - ys[-2]) / (xs[-1] - xs[-2]))
+    return float(np.interp(value, xs, ys))
+
+
 class Timeline(QWidget):
     """In "notes" mode the lane holds onsets; in "mix" mode it holds detected beats."""
 
@@ -95,6 +105,8 @@ class Timeline(QWidget):
         self.beats: list[tuple[float, str, str]] = []
         self.selected_beat: float | None = None
         self.taps: list[float] = []
+        # Mix view before warping: (seconds, quarter) points so bar lines follow the counted beats.
+        self.tempo_map: list[tuple[float, float]] | None = None
         self.playhead: float | None = None
         self.tool = "brush"
         self._drag = None
@@ -239,9 +251,7 @@ class Timeline(QWidget):
         if not self.project:
             return
         grid = self.project.grid
-        beat = self.start
-        while beat < self.end:
-            x = round(self._x(beat))
+        for beat, x in self._grid_lines():
             if beat % grid.bar_beats == 0:
                 painter.setPen(QColor(180, 195, 225, 150))
                 painter.drawText(x + 3, height - 3, f"Bar {int(beat / grid.bar_beats) + 1}")
@@ -250,7 +260,6 @@ class Timeline(QWidget):
             else:
                 painter.setPen(QColor(120, 135, 165, 35))
             painter.drawLine(x, self.LANE_TOP + 8, x, bottom)
-            beat += grid.subdivision
         if self.mode == "mix":
             self._paint_beats(painter, bottom)
         elif self.track is not None:
@@ -280,6 +289,44 @@ class Timeline(QWidget):
             if self.KEYS <= x <= width:
                 painter.setPen(QPen(QColor("#ffffff"), 1))
                 painter.drawLine(x, self.LANE_TOP, x, bottom)
+
+    def counted_times(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """(seconds, quarters) of the Mix view's counted tempo map, or None when the grid is constant."""
+        if self.mode != "mix" or not self.tempo_map or len(self.tempo_map) < 2:
+            return None
+        return (np.array([t for t, _ in self.tempo_map], dtype=float),
+                np.array([q for _, q in self.tempo_map], dtype=float))
+
+    def counted(self, beat: Fraction) -> Fraction:
+        """The counted (tempo-map) beat at a grid position; the beat itself when no map applies."""
+        curve = self.counted_times()
+        if curve is None or self.project is None:
+            return beat
+        value = follow_curve(self.project.grid.beat_to_seconds(beat), *curve)
+        return Fraction(value).limit_denominator(1000)
+
+    def _grid_lines(self):
+        """(beat, x) of each visible grid line; in the Mix view they follow the counted tempo map."""
+        grid = self.project.grid
+        step = grid.subdivision
+        if self.mode != "mix" or not self.tempo_map or len(self.tempo_map) < 2:
+            beat = self.start
+            while beat < self.end:
+                yield beat, round(self._x(beat))
+                beat += step
+            return
+        seconds = np.array([t for t, _ in self.tempo_map], dtype=float)
+        quarters = np.array([q for _, q in self.tempo_map], dtype=float)
+        first = follow_curve(grid.beat_to_seconds(self.start), seconds, quarters)
+        last = follow_curve(grid.beat_to_seconds(self.end), seconds, quarters)
+        beat = math.floor(first / float(step)) * step
+        limit = 4 * int((self.end - self.start) / step) + 256
+        while float(beat) < last and limit > 0:
+            x = round(self._x_seconds(follow_curve(float(beat), quarters, seconds)))
+            if x >= self.KEYS:
+                yield beat, x
+            beat += step
+            limit -= 1
 
     def _paint_lanes(self, painter: QPainter) -> None:
         top, height, width = self._rows_top(), self._row_height(), self.width()
