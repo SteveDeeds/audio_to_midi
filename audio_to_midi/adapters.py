@@ -1,4 +1,4 @@
-"""Adapters for the proven legacy providers; no dependency on AudioMarkers."""
+"""Project adapters for the shared transcription providers."""
 
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""Run the v2 GUI, or use its headless project commands."""
+"""Run the Audio to MIDI project editor or its headless project commands."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 
 
 def parser() -> argparse.ArgumentParser:
-    root = argparse.ArgumentParser(description="Audio to MIDI v2 preview (legacy: python app.py)")
+    root = argparse.ArgumentParser(description="Audio to MIDI project editor")
     commands = root.add_subparsers(dest="command")
     commands.add_parser("doctor", help="Inspect environment without installing or downloading models")
     create = commands.add_parser("create", help="Create an externally warped project")
@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
 
             warm_up()
             app = QApplication(sys.argv[:1])
-            app.setApplicationName("Audio to MIDI v2 preview")
+            app.setApplicationName("Audio to MIDI")
             window = ProjectWindow()
             if getattr(args, "folder", None):
                 window.project = load_project(args.folder)

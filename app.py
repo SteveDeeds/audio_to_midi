@@ -1,20 +1,10 @@
 #!/usr/bin/env python
-"""
-app.py — Entry point for the unified Audio → MIDI application.
-"""
+"""Compatibility entry point for the Audio to MIDI project editor and CLI."""
 
 import sys
-from PySide6.QtWidgets import QApplication
-from ui.main_window import MainWindow
 
-
-def main() -> None:
-    app = QApplication(sys.argv)
-    app.setApplicationName("Audio to MIDI")
-    win = MainWindow()
-    win.show()
-    sys.exit(app.exec())
+from audio_to_midi.__main__ import main
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

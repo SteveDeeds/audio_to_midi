@@ -1,4 +1,4 @@
-"""Pure v2 project state and bounded, reversible note edits.
+"""Pure project state and bounded, reversible note edits.
 
 Intervals are half-open. Authored notes win over generated notes of the same
 pitch only; a pitch-less rejection is a rest across all generated voices.

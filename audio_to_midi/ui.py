@@ -1,4 +1,4 @@
-"""Main window of the v2 application: menu bar, Mix / track / Chords views and background jobs.
+"""Main window: menu bar, Mix / track / Chords views and background jobs.
 
 Stages: import mix -> detect beats -> count bars (tap or pin) -> warp
 -> separate or import stems -> transcribe notes -> chords -> export.
@@ -103,7 +103,7 @@ class ProjectWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Audio to MIDI v2")
+        self.setWindowTitle("Audio to MIDI")
         self.resize(1280, 820)
         self.project = Project.create("Untitled", Grid())
         self.folder: Path | None = None
@@ -417,7 +417,7 @@ class ProjectWindow(QMainWindow):
         self._building = building
         self.summary.setText(self._summary_text())
         self.stages.setText(self._stage_text())
-        self.setWindowTitle(f"{self.project.name} - Audio to MIDI v2")
+        self.setWindowTitle(f"{self.project.name} - Audio to MIDI")
         self._update_actions()
 
     def _summary_text(self) -> str:
@@ -2082,7 +2082,7 @@ class ProjectWindow(QMainWindow):
 
     def _about(self) -> None:
         QMessageBox.about(self, "About Audio to MIDI", (
-            "Audio to MIDI v2\n\nTranscribes a song into editable MIDI: tempo and bars from the mix, notes from "
+            "Audio to MIDI\n\nTranscribes a song into editable MIDI: tempo and bars from the mix, notes from "
             "separated stems, and a lead-sheet chord track.\nThird-party models (CREPE, basic-pitch, ADTOF, Demucs, "
             "...) keep their own licenses; see the README."
         ))

@@ -4,8 +4,6 @@ from pathlib import Path
 import tempfile
 import time
 import unittest
-import subprocess
-import sys
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -19,17 +17,6 @@ from audio_to_midi.adapters import Prediction
 from audio_to_midi.application import add_stem, publish, token
 from audio_to_midi.domain import Note
 from audio_to_midi.ui import ProjectWindow
-
-
-class IsolatedEditorSuite(unittest.TestCase):
-    def test_editor_in_separate_qapplication(self):
-        # Legacy coordinator tests own a QCoreApplication in the parent process.
-        subprocess.run(
-            [sys.executable, "-X", "utf8", "-m", "unittest", "discover",
-             "-s", "tests", "-p", "test_v2_ui.py"],
-            cwd=Path(__file__).resolve().parents[1],
-            env={**os.environ, "QT_QPA_PLATFORM": "offscreen"}, check=True,
-        )
 
 
 class EditorTests(unittest.TestCase):
@@ -105,7 +92,8 @@ class EditorTests(unittest.TestCase):
 
     def test_async_publication_and_stale_edit_rejection(self):
         result = Prediction(F(0), F(4), (Note("g", F(0), F(1), 60),), (F(0),))
-        with patch.object(self.window.service, "predict", return_value=result):
+        with patch.object(self.window.service, "predict", return_value=result), \
+                patch("audio_to_midi.provision.missing", return_value=[]):
             self.window._analyze(False)
             self.wait_idle()
         self.assertEqual(len(self.window._rows), 1)
@@ -116,7 +104,8 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(self.track.notes.resolved()), 2)
 
     def test_worker_error_is_visible_and_window_remains_editable(self):
-        with patch.object(self.window.service, "predict", side_effect=RuntimeError("missing model")):
+        with patch.object(self.window.service, "predict", side_effect=RuntimeError("missing model")), \
+                patch("audio_to_midi.provision.missing", return_value=[]):
             self.window._analyze(False)
             self.wait_idle()
         self.assertIn("missing model", self.window.status.text())
@@ -260,7 +249,8 @@ class EditorTests(unittest.TestCase):
             calls.append((a, b))
             return Prediction(a, b, (), ())
 
-        with patch.object(self.window.service, "predict", side_effect=predict):
+        with patch.object(self.window.service, "predict", side_effect=predict), \
+                patch("audio_to_midi.provision.missing", return_value=[]):
             self.window._analyze(True)
             timeout = time.monotonic() + 10
             while not complete(self.window.project, self.track) and time.monotonic() < timeout:
@@ -975,12 +965,6 @@ class EditorTests(unittest.TestCase):
         self.assertGreater(left[4000:4100].max(), 0)
         self.assertGreater(left[4100:7900].max(), 1000)
         self.assertEqual(left[8000:].max(), 0)
-
-
-def load_tests(loader, tests, pattern):
-    instance = QApplication.instance()
-    cls = IsolatedEditorSuite if instance is not None and not isinstance(instance, QApplication) else EditorTests
-    return loader.loadTestsFromTestCase(cls)
 
 
 if __name__ == "__main__":

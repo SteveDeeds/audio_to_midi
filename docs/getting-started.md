@@ -1,4 +1,4 @@
-# Getting started with Audio to MIDI v2
+# Getting started with Audio to MIDI
 
 Audio to MIDI turns a song into editable MIDI. You work through stages, each
 shown in the strip at the top right of the window:
@@ -22,8 +22,8 @@ Open PowerShell in the repository folder. For a new isolated installation,
 use Python 3.12 and run:
 
 ```powershell
-.\install-v2.ps1
-.\.venv-v2\Scripts\python.exe -X utf8 -m audio_to_midi
+.\install.ps1
+.\.env\Scripts\python.exe -X utf8 -m audio_to_midi
 ```
 
 The base installation supports the editor, MIDI import/export, the `pyin`
@@ -40,16 +40,35 @@ To install all the transcription models ahead of time instead (for example
 before going offline):
 
 ```powershell
-.\install-v2.ps1 -Models
+.\install.ps1 -Models
 ```
 
-If the existing development environment is already installed, launch with:
+If your existing environment is already installed, keep using its Python.
+For the repository's default environment, either launch command opens the same
+project editor:
 
 ```powershell
-.\.venv\Scripts\python.exe -X utf8 -m audio_to_midi
+.\.env\Scripts\python.exe -X utf8 -m audio_to_midi
+.\.env\Scripts\python.exe -X utf8 app.py
 ```
 
-Do not use `python app.py` for this guide: that opens the legacy application.
+The former single-stem application is retired and its unused engine, window,
+and workers have been removed. This does not delete or migrate any projects,
+audio, MIDI, profiles, logs, or model caches. Existing project-editor projects
+and preferences keep their current formats and settings location. Compatible
+onset examples can still be imported from older profiles; legacy session state
+is not converted automatically.
+
+The unversioned installer uses `.env` by default (matching `activate.ps1`).
+Use `.\install.ps1 -Environment .venv-v2` to update an existing preview
+environment, or `-Environment .venv` for another environment. The old
+`install-v2.ps1` command is a deprecated forwarding wrapper that keeps its
+`.venv-v2` default; the versioned requirements files are compatibility aliases.
+
+For historical access to the retired app, revision
+`0a571a3fdcb703465c89b0b266f01daaa12ab07f` is the last pre-cutover snapshot.
+Open it in a separate checkout and use that revision's own dependencies and
+`python app.py`; do not mix its modules with the current editor.
 
 ## 2. Create a project and import the mix
 
@@ -320,14 +339,14 @@ mix with the chords.
 | Many red beats after warping | Return to the original mix, add pins where it drifts, and warp again. |
 | A track is marked (stale) | Its audio came from a different warp of the mix. Re-separate or re-import it. |
 | No notes appear | Check the model selector and the status bar for errors. `other` never produces notes. |
-| Model install fails | First-use installs need an internet connection and write access to the app's Python environment (use a virtual environment rather than a system-wide Python). ADTOF also needs `git`. Or pre-install with `.\install-v2.ps1 -Models`. For a base-only trial, use vocals with `pyin`. |
+| Model install fails | First-use installs need an internet connection and write access to the app's Python environment (use a virtual environment rather than a system-wide Python). ADTOF also needs `git`. Or pre-install with `.\install.ps1 -Models`. For a base-only trial, use vocals with `pyin`. |
 | Notes sound late with a MIDI device | Run **MIDI sync test** in **File > Playback settings** and raise the latency. |
 | Reopening reports missing media | Restore referenced files to their expected locations; projects do not embed the original mix. |
 
 For an environment report, run:
 
 ```powershell
-.\.venv-v2\Scripts\python.exe -X utf8 -m audio_to_midi doctor
+.\.env\Scripts\python.exe -X utf8 -m audio_to_midi doctor
 ```
 
 For architecture and validation notes, see the

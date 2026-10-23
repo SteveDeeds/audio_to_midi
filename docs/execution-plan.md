@@ -1,5 +1,13 @@
 # Audio-to-MIDI v2: decision and execution plan
 
+> Historical implementation plan. The project editor is now the supported
+> default; `python app.py` forwards to `python -m audio_to_midi`. Legacy-only
+> orchestration and UI code have been removed, while shared providers remain
+> in `core`. Coexistence instructions and acceptance counts below describe
+> earlier milestones, not the current release status. Use
+> [Getting started](getting-started.md) for current installation and launch
+> commands, compatibility details, and the pre-cutover revision.
+
 ## Implementation status (2026-10-18)
 
 A runnable side-by-side **v2 preview** now exists in [audio_to_midi](../audio_to_midi).
@@ -270,8 +278,9 @@ installation on a clean machine.
   transcription model research, or pretrained-model retraining in this project.
 
 Use a distinct `audio_to_midi` package with `python -m audio_to_midi` as its
-eventual entry point. Leave [app.py](../app.py), [core](../core), [ui](../ui), and
-[workers](../workers) intact during migration. Organize the new package into
+eventual entry point. During migration, the original instruction was to leave
+[app.py](../app.py), [core](../core), `ui`, and `workers` intact (the latter two
+were removed at cutover). Organize the new package into
 domain, application, infrastructure, and UI responsibilities, introducing
 modules only as the vertical slices need them.
 

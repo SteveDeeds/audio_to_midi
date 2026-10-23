@@ -1,5 +1,11 @@
 # Handoff: refactor or rewrite of audio_to_midi
 
+> Historical pre-rewrite handoff. The project editor now replaces the old app;
+> paths and launch instructions below describe the retired implementation.
+> See [Getting started](getting-started.md) for the supported workflow and the
+> pre-cutover revision. Shared transcription providers and regression metrics
+> remain in `core`; the old UI, workers, and engine do not.
+
 This document is for the agent that picks up the next phase. It summarises what
 the project has learned, what is worth keeping, and the decisions to make
 before restructuring the app around the new workflow.

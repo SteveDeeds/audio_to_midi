@@ -1,9 +1,9 @@
 import unittest
 
 import numpy as np
+from scipy.optimize import nnls
 
 from core.instrument_dictionary import InstrumentDictionary
-from core.polyphonic_nnls import solve_single_frame
 
 
 class TestInstrumentDictionary(unittest.TestCase):
@@ -23,7 +23,7 @@ class TestInstrumentDictionary(unittest.TestCase):
             + 0.5 * dictionary[:, labels.index(60)]
             + 0.3 * dictionary[:, labels.index(64)]
         )
-        activations = solve_single_frame(dictionary, observation)
+        activations, _ = nnls(dictionary, observation)
         grouped = model.aggregate_activations(activations, labels)
 
         self.assertEqual(set(grouped), {55, 60, 64})

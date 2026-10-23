@@ -1,4 +1,4 @@
-"""Headless, durable domain for the side-by-side v2 application."""
+"""Audio to MIDI project editor and headless project workflow."""
 
 from .domain import Note, NoteStore, Project, Track
 from .timebase import Grid

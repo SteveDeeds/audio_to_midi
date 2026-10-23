@@ -1,1 +1,0 @@
-# workers — QThread background processing

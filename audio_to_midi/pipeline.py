@@ -1,4 +1,4 @@
-"""Optional, headless v2 preparation (no UI or project-domain dependencies).
+"""Optional, headless preparation (no UI or project-domain dependencies).
 
 Public entry points: analyze_mix(full_mix, *, bpm, meter, downbeat_seconds,
 beat_anchors), render_full_mix(full_mix, destination, warp_map, *, lead_in),

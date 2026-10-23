@@ -1,10 +1,2 @@
--r requirements-v2.txt
-torchcrepe>=0.0.23
-piano-transcription-inference>=0.0.6
-onnxruntime>=1.16
-mir_eval>=0.7
-resampy>=0.4,<0.4.3
-scikit-learn>=1.3
-adtof-pytorch @ git+https://github.com/xavriley/ADTOF-pytorch@85c192e78f716ea0b111cc8a5ee4a8f6a3a4f8a9
-# Separately: python -m pip install --no-deps basic-pitch==0.4.0
-# Its TensorFlow metadata is incompatible with Python 3.12; v2 uses ONNX only.
+# Compatibility alias; use requirements-models.txt for new installations.
+-r requirements-models.txt

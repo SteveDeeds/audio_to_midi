@@ -1,18 +1,8 @@
+# Editor, project/MIDI interchange, preparation, and pYIN. Neural backends are optional.
 librosa>=0.10.0
 numpy>=1.24.0
 mido>=1.3.0
 soundfile>=0.12.1
-matplotlib>=3.8.0
 scipy>=1.10.0
 PySide6>=6.4.0
 pygame>=2.1.0
-torchcrepe>=0.0.23
-# Piano/Guitar modes
-piano-transcription-inference>=0.0.6
-onnxruntime>=1.16
-mir_eval>=0.7
-resampy>=0.4
-scikit-learn>=1.3
-# basic-pitch pins tensorflow, which has no Python 3.12 build; install it separately:
-#   pip install --no-deps basic-pitch==0.4.0
-adtof-pytorch @ git+https://github.com/xavriley/ADTOF-pytorch@85c192e78f716ea0b111cc8a5ee4a8f6a3a4f8a9
