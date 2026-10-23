@@ -4,13 +4,17 @@ This document is for the agent that picks up the next phase. It summarises what
 the project has learned, what is worth keeping, and the decisions to make
 before restructuring the app around the new workflow.
 
+Follow-up: [decision and execution plan](execution-plan.md) recommends a
+side-by-side replacement core in this repository, keeping the current app
+usable until the external-stem workflow passes its replacement gates.
+
 State at handoff: `main` at commit `c508071`. 174 unit tests pass.
-Run them with the module list (there is no `tests/__init__.py`, so discovery fails):
+Reverified at `56a1d48`: explicit test discovery works without
+`tests/__init__.py`. Use UTF-8 output to avoid Windows console encoding errors:
 
 ```powershell
 $env:QT_QPA_PLATFORM='offscreen'
-$mods = Get-ChildItem tests\test_*.py | % { "tests." + $_.BaseName }
-.\.venv\Scripts\python.exe -m unittest @mods
+.\.venv\Scripts\python.exe -X utf8 -m unittest discover -s tests -p 'test_*.py'
 ```
 
 ## 1. Target workflow

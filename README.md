@@ -6,6 +6,11 @@ App Goal:
 A machine learning assisted audio to MIDI converter.
 It focus on getting human input specific to the song being worked on to train a simple model to reconize chord changes, note onsets, and pitches.
 
+A side-by-side v2 project editor is available as a preview; the existing app
+remains supported. See [Getting started with the v2 GUI](docs/getting-started.md)
+for installation and a step-by-step user manual, or the
+[execution plan](docs/execution-plan.md) for scope and remaining acceptance gates.
+
 Fundamental constraint:
 Models must remain lightweight enough to learn from each user edit and rerun inference on the visible notes in real time. Analysis and inference for the rest of the file can run in the background, but the edit-to-training-to-screen-update loop must stay interactive.
 

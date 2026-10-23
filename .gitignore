@@ -1,5 +1,6 @@
 # Virtual environments
 .venv/
+.venv-v2/
 .env/
 
 # Python cache/bytecode
@@ -17,6 +18,7 @@ logs/
 
 # Project-specific local assets
 input/
+/test project/
 10000_Reasons/
 *.mid
 Firm Foundation (He Won't)/
