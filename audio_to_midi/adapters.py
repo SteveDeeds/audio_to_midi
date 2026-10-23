@@ -12,6 +12,7 @@ import numpy as np
 import soundfile as sf
 
 from audio_to_midi.domain import Note, Project, Track
+from audio_to_midi import velocity
 from core.models import CorrectionModel
 from core import onset_features
 
@@ -76,6 +77,8 @@ class TrackBackend:
         self.project_key = project.key
         self.provider = None
         self._feature_data = None
+        self._cqt_data = None
+        self._drum_levels = None
         self._path = track.audio_path
         self._license_acknowledged = track.settings.get("license_acknowledged", False)
         self.features: dict[Fraction, tuple[float, float, float, float]] = {}
@@ -164,12 +167,8 @@ class TrackBackend:
             chroma = librosa.feature.chroma_cqt(
                 y=self.audio, sr=self.sr, hop_length=512, bins_per_octave=36,
             )
-            magnitude = np.abs(librosa.cqt(
-                self.audio, sr=self.sr, hop_length=512,
-                fmin=librosa.midi_to_hz(12), n_bins=83,
-            )).astype(np.float32)
+            cqt_times, magnitude = self._cqt()
             times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr, hop_length=512)
-            cqt_times = librosa.frames_to_time(np.arange(magnitude.shape[1]), sr=self.sr, hop_length=512)
             self._feature_data = samples / self.sr, envelope[samples], times, chroma, cqt_times, magnitude
         env_times, envelope, times, chroma, cqt_times, magnitude = self._feature_data
         a, b = max(0.0, time - half), min(self.duration, time + half)
@@ -180,6 +179,26 @@ class TrackBackend:
         result = transient, delta, energy_db, spike
         self.features[beat] = result
         return result
+
+    CQT_LOW_MIDI = 12
+
+    def _cqt(self) -> tuple[np.ndarray, np.ndarray]:
+        """Whole-stem semitone CQT magnitude (MIDI 12..94), computed once per backend."""
+        if self._cqt_data is None:
+            magnitude = np.abs(librosa.cqt(
+                self.audio, sr=self.sr, hop_length=512,
+                fmin=librosa.midi_to_hz(self.CQT_LOW_MIDI), n_bins=83,
+            )).astype(np.float32)
+            times = librosa.frames_to_time(np.arange(magnitude.shape[1]), sr=self.sr, hop_length=512)
+            self._cqt_data = times, magnitude, velocity.reference_power(magnitude)
+        times, magnitude, _ = self._cqt_data
+        return times, magnitude
+
+    def _velocity(self, pitch: int, t0: float, t1: float) -> int:
+        """Velocity from the CQT power of the note's first harmonics at its attack."""
+        times, magnitude = self._cqt()
+        power = velocity.harmonic_power(times, magnitude, self.CQT_LOW_MIDI, pitch, t0, t1)
+        return velocity.velocity(power, self._cqt_data[2])
 
     def predict(
         self, track: Track, start: Fraction, end: Fraction,
@@ -208,16 +227,17 @@ class TrackBackend:
                         float(label["start"]), float(label["end"]),
                         int(label["pitch"]), bool(label["keep"]),
                     )
-            from core.adtof_drums import velocity_from_strength
+            from core.adtof_drums import drum_class
 
+            if self._drum_levels is None:
+                self._drum_levels = velocity.DrumLevels(self.audio, self.sr)
+            hits = list(provider.hits())
+            levels = self._drum_levels.velocities([(hit.time, drum_class(hit.midi)) for hit in hits])
             notes = []
-            for hit in provider.hits():
+            for hit, level in zip(hits, levels):
                 beat = max(Fraction(0), grid.snap(grid.seconds_to_beat(hit.time)))
                 if start <= beat < end:
-                    notes.append(self._note(
-                        beat, min(end, beat + grid.subdivision), hit.midi,
-                        velocity_from_strength(hit.strength),
-                    ))
+                    notes.append(self._note(beat, min(end, beat + grid.subdivision), hit.midi, level))
             if cancelled():
                 raise Cancelled()
             return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
@@ -283,7 +303,7 @@ class TrackBackend:
                     continue
                 pitches, release = answer
                 stop = min(b, max(a + grid.subdivision, grid.snap(grid.seconds_to_beat(release))))
-                candidate = self._note(a, stop, pitches[0], 100)
+                candidate = self._note(a, stop, pitches[0], self._velocity(pitches[0], ta, release))
                 if a == start and a not in active:
                     previous = next((
                         n for n in track.notes.generated
@@ -308,7 +328,12 @@ class TrackBackend:
                             previous.velocity, previous.source,
                         ))
                     else:
-                        candidate = self._note(a, stop, answer.midi, max(1, round(answer.velocity * 127)))
+                        # piano_hr predicts real key velocities; Basic Pitch's amplitude is closer to confidence.
+                        level = (
+                            max(1, round(answer.velocity * 127)) if self.model == "piano_hr"
+                            else self._velocity(answer.midi, ta, answer.release)
+                        )
+                        candidate = self._note(a, stop, answer.midi, level)
                         if answer.continues and a == start:
                             previous = next((
                                 n for n in track.notes.generated

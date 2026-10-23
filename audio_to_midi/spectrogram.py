@@ -27,29 +27,51 @@ def warm_up() -> None:
     threading.Thread(target=cqt_image, args=(noise, SAMPLE_RATE), daemon=True, name="cqt-warm-up").start()
 
 
-def cqt_image(audio: np.ndarray, sample_rate: int) -> np.ndarray:
-    """Return semitone rows (LOW_PITCH..HIGH_PITCH, low first) scaled to 0..1.
+def _magnitude(mono: np.ndarray) -> np.ndarray:
+    return np.abs(librosa.cqt(
+        mono, sr=SAMPLE_RATE, hop_length=HOP_LENGTH,
+        fmin=librosa.midi_to_hz(LOW_PITCH), n_bins=HIGH_PITCH - LOW_PITCH + 1, bins_per_octave=12,
+    ))
 
-    Each window is normalized to its own peak, so quiet passages remain visible.
-    """
-    rows = HIGH_PITCH - LOW_PITCH + 1
+
+def _mono(audio: np.ndarray, sample_rate: int) -> np.ndarray:
     mono = np.asarray(audio, dtype=np.float32)
     if mono.ndim == 2:
         mono = mono.mean(axis=1)
-    if len(mono) == 0 or not np.all(np.isfinite(mono)):
-        return np.zeros((rows, 0), dtype=np.float32)
-    if sample_rate != SAMPLE_RATE:
+    if len(mono) and np.all(np.isfinite(mono)) and sample_rate != SAMPLE_RATE:
         mono = librosa.resample(mono, orig_sr=sample_rate, target_sr=SAMPLE_RATE)
+    return mono
+
+
+def song_reference(path: str) -> float:
+    """Peak CQT magnitude of a whole file, so every window shares the song's brightness scale."""
+    import soundfile as sf
+
+    data, rate = sf.read(path, dtype="float32", always_2d=True)
+    mono = _mono(data, rate)
+    if len(mono) < HOP_LENGTH or not np.all(np.isfinite(mono)):
+        return 0.0
+    return float(_magnitude(mono).max())
+
+
+def cqt_image(audio: np.ndarray, sample_rate: int, reference: float | None = None) -> np.ndarray:
+    """Return semitone rows (LOW_PITCH..HIGH_PITCH, low first) scaled to 0..1.
+
+    Values are dB below ``reference`` (default: this audio's own peak), floored at FLOOR_DB.
+    Pass a whole-song reference so a quiet passage stays dark instead of being stretched.
+    """
+    rows = HIGH_PITCH - LOW_PITCH + 1
+    raw = np.asarray(audio)
+    if len(raw) == 0 or not np.all(np.isfinite(raw)):
+        return np.zeros((rows, 0), dtype=np.float32)
+    mono = _mono(raw, sample_rate)
     if len(mono) < HOP_LENGTH or float(np.max(np.abs(mono))) < 1e-6:
         return np.zeros((rows, max(1, len(mono) // HOP_LENGTH)), dtype=np.float32)
-    magnitude = np.abs(librosa.cqt(
-        mono, sr=SAMPLE_RATE, hop_length=HOP_LENGTH,
-        fmin=librosa.midi_to_hz(LOW_PITCH), n_bins=rows, bins_per_octave=12,
-    ))
-    peak = float(magnitude.max())
+    magnitude = _magnitude(mono)
+    peak = float(magnitude.max()) if reference is None else float(reference)
     if peak <= 0:
         return np.zeros_like(magnitude, dtype=np.float32)
-    decibels = 20 * np.log10(np.maximum(magnitude / peak, 10 ** (-FLOOR_DB / 20)))
+    decibels = 20 * np.log10(np.clip(magnitude / peak, 10 ** (-FLOOR_DB / 20), 1))
     return ((decibels + FLOOR_DB) / FLOOR_DB).astype(np.float32)
 
 

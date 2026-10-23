@@ -47,16 +47,18 @@ under "Implementation notes".
 | Stage | Done when | Unlocks |
 |---|---|---|
 | Mix | A full mix is imported | Detect, tap, beat editing, warp |
-| Timing | A warp (or "use as-is") revision exists and the user ticked **Timing confirmed** | Separate stems, import stems |
-| Stems | At least one stem track exists from the confirmed timing | Model selection, analysis, editing |
+| Timing | A warp (or "use as-is") revision exists | Separate stems, import stems, detect chords |
+| Stems | At least one stem track exists from the current warp | Model selection, analysis, editing |
 | Transcribe | Notes exist on at least one stem track | Export |
 
 A slim **stage strip** under the menu bar shows the stages and the single
 next action, e.g. `✔ Mix  ● Timing: drift 42 ms — warp needed  ○ Stems  ○ Transcribe`.
 
-Stage state is stored in `project.stages["timing"]`, holding the warp
-revision id and the confirmed flag, alongside the existing
-`project.stages["preparation"]`.
+Stage state is stored in `project.stages["timing"]` (beats, pins and the
+warp check), alongside the existing `project.stages["preparation"]` that holds
+the warp revision id. An earlier design had a separate **Timing confirmed**
+checkbox; it was dropped because warping already expresses that the bars are
+right, and **Return to original mix** undoes it.
 
 ## Menus
 
@@ -67,7 +69,7 @@ File
   Save                    Ctrl+S
   ─────────────
   Import mix…
-  Import stems…           [needs confirmed timing]
+  Import stems…           [needs a warp]
   Import MIDI…            [needs a stem track]
   Import chord MIDI…
   ─────────────
@@ -85,9 +87,8 @@ Edit
   Detect tempo, meter, and key
   Tap downbeats           [toggle; mix selected]
   Warp to fixed tempo…    [mix selected, ≥2 downbeats]
-  Timing confirmed        [checkbox; needs a warp]
   ─────────────
-  Separate stems (Demucs)…  [needs confirmed timing]
+  Separate stems (Demucs)…  [needs a warp]
 
 View
   Brush tool (B) / Info tool (I)
@@ -170,24 +171,23 @@ With `Mix` selected:
    revision, and the view switches to the warped mix.
 6. **Validation view.** After a warp, beats are re-detected on the warped audio
    and drawn against the grid, so misalignment is visible. Listen with the click.
-7. **Timing confirmed** checkbox (Edit menu, also clickable in the stage strip)
-   unlocks stage 3.
+   Warping unlocks stage 3 directly (no separate confirmation step).
 
 Preparation artifacts are written to `<project folder>/preparation/`. This
 is why **New project** asks for the folder up front.
 
 ## Stage 3 — Stems
 
-- **Separate stems (Demucs)…** runs on the confirmed warp revision. It asks once,
+- **Separate stems (Demucs)…** runs on the current warp revision. It asks once,
   then installs Demucs and downloads its weights automatically on first use; the
   user never picks a Python or model folder.
 - **Import stems…** is for external separations (UVR, etc.). The dialog states
-  that stems must come from the confirmed warped mix. Existing duration and
+  that stems must come from the current warped mix. Existing duration and
   sample-rate checks apply.
 
 ## Re-warping after stems or notes exist
 
-Unchecking **Timing confirmed**, or warping again, shows a warning that lists:
+Returning to the original mix, or warping again, shows a warning that lists:
 
 - the number of notes and edits on each track: they keep their bar/beat
   positions but may no longer sit on the audio;
@@ -246,7 +246,7 @@ confirmation and can be undone during the session.
 | Lead-in policy / Warp anchors / BPM / bar-1 time | Warp to fixed tempo… dialog |
 | Register without warping | Warp dialog > Use as-is |
 | Warp original mix | Warp dialog > Warp |
-| Confirm checkbox | Edit > Timing confirmed |
+| Confirm checkbox | Removed: warping unlocks stems |
 | New revision checkbox | Implicit: re-warp warning |
 | Attach to empty project | Automatic |
 | Audition prepared mix | Normal Play on the Mix track |
@@ -284,7 +284,8 @@ song-generator test set exists:
 ## Chords view
 
 Selected as `Chords` in the track selector, like `Mix` is for timing. It needs
-confirmed timing, and it always analyzes the **warped full mix**, not the stems.
+a warped mix, and it analyzes current harmony stems when they exist (else the
+**warped full mix**).
 
 ```text
 Track: [Chords ▾]    Model: [<chord recognizer> ▾]
@@ -432,7 +433,7 @@ Choices made without a decision; revisit any of them.
 - The warp dialog defaults to **keep audio before bar 1** (pickup) and to
   **Use as-is** when the detected tempo is steady.
 - After warping, beats within ±30 ms of the grid are green, others red.
-- Chord detection requires confirmed timing; chord MIDI import needs a mix.
+- Chord detection requires a warped mix; chord MIDI import needs a mix.
 - Chord playback and voiced-MIDI export: the bass (or slash) note in octave 2
   (MIDI 36–47), chord tones in close position from middle C.
 - Placeholder recognizer: the CQT is raised to the 4th power and folded into a

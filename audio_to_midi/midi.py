@@ -112,7 +112,7 @@ def export_musicxml(project: Project, path: Path) -> None:
         raise ValueError("There are no chords to export.")
     _validate_export_path(project, path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(musicxml(project.chords, project.grid, project.name), encoding="utf-8")
+    path.write_text(musicxml(project.chords, project.grid, project.name, project.key), encoding="utf-8")
 
 
 def _append_track(mid: mido.MidiFile, name: str, notes: list[Note], channel: int) -> None:

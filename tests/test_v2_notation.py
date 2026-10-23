@@ -2,7 +2,8 @@ from fractions import Fraction as F
 import unittest
 
 from audio_to_midi.notation import (
-    bar_and_beat, format_number, note_value, parse_number, parse_pitch, pitch_name, position,
+    bar_and_beat, format_number, key_fifths, note_value, parse_number, parse_pitch, pc_name, pitch_name,
+    position, preferred_key,
 )
 from audio_to_midi.timebase import Grid
 
@@ -34,6 +35,46 @@ class NotationTests(unittest.TestCase):
         self.assertEqual(parse_pitch("60"), 60)
         self.assertEqual(pitch_name(63, "Bb"), "Eb4 (63)")
         self.assertEqual(note_value(F(3, 2)), "dotted quarter")
+
+    def test_key_signatures_and_preferred_spelling(self):
+        cases = {"C": 0, "Am": 0, "B": 5, "G#m": 5, "F#": 6, "Bb": -2, "Gm": -2, "Db": -5, "A#": -2}
+        for key, fifths in cases.items():
+            with self.subTest(key=key):
+                self.assertEqual(key_fifths(key), fifths)
+        self.assertEqual(key_fifths("B major"), 5)
+        self.assertEqual(key_fifths("C minor"), -3)
+        self.assertEqual(key_fifths(""), 0)
+        self.assertEqual(preferred_key("C#"), "Db")
+        self.assertEqual(preferred_key("Abm"), "G#m")
+        self.assertEqual(preferred_key("F#"), "F#")
+        self.assertEqual(preferred_key("Ebm"), "Ebm")
+        self.assertEqual(preferred_key(""), "")
+
+    def test_scale_spelling_follows_the_key(self):
+        self.assertEqual(
+            [pc_name(pc, "B") for pc in (11, 1, 3, 4, 6, 8, 10)], ["B", "C#", "D#", "E", "F#", "G#", "A#"],
+        )
+        self.assertEqual(
+            [pc_name(pc, "Eb") for pc in (3, 5, 7, 8, 10, 0, 2)], ["Eb", "F", "G", "Ab", "Bb", "C", "D"],
+        )
+        self.assertEqual(pc_name(5, "F#"), "E#")
+        self.assertEqual(pc_name(11, "Gb"), "Cb")
+        self.assertEqual(pc_name(8, "Am"), "G#", "the leading tone of a minor key is raised")
+        self.assertEqual(pc_name(1, "Dm"), "C#")
+        self.assertEqual(pc_name(10, "D"), "Bb", "bVI of D major is lowered, not A#")
+        self.assertEqual(pc_name(4, "Bb"), "E", "#4 of Bb major is E, not Fb")
+        self.assertEqual(pc_name(4, "Ab"), "E", "chromatic notes avoid Fb")
+        self.assertEqual([pc_name(pc, "") for pc in (1, 3, 6, 8, 10)], ["C#", "Eb", "F#", "Ab", "Bb"])
+
+    def test_pitch_names_follow_key_and_keep_octaves(self):
+        self.assertEqual(pitch_name(68, "B"), "G#4 (68)")
+        self.assertEqual(pitch_name(68, "Eb"), "Ab4 (68)")
+        self.assertEqual(pitch_name(65, "F#"), "E#4 (65)")
+        self.assertEqual(pitch_name(59, "Gb"), "Cb4 (59)")
+        self.assertEqual(pitch_name(60, "C#"), "B#3 (60)")
+        self.assertEqual(parse_pitch("B#3"), 60)
+        self.assertEqual(parse_pitch("Cb4"), 59)
+        self.assertEqual(parse_pitch("E#4"), 65)
 
     def test_rejects_ambiguous_or_out_of_bar_values(self):
         grid = Grid(120, 4, 4)

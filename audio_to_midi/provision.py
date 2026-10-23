@@ -31,10 +31,11 @@ FEATURES: dict[str, list[tuple[str, list[str]]]] = {
         "adtof-pytorch @ git+https://github.com/xavriley/ADTOF-pytorch@85c192e78f716ea0b111cc8a5ee4a8f6a3a4f8a9",
     ])],
     "demucs": [("torch", ["torch"]), ("demucs", ["demucs>=4.0.1"])],
+    "btc": [("torch", ["torch"])],
 }
 LABELS = {
     "crepe_tiny": "CREPE", "crepe_full": "CREPE", "basic_pitch": "Basic Pitch", "piano_hr": "Piano-HR",
-    "adtof": "ADTOF", "demucs": "Demucs",
+    "adtof": "ADTOF", "demucs": "Demucs", "btc": "BTC chord model",
 }
 PIANO_HR_CHECKPOINT = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
 PIANO_HR_URL = "https://zenodo.org/record/4034264/files/CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1"
@@ -53,7 +54,15 @@ def missing(feature: str) -> list[str]:
     needs = [args[-1] for module, args in FEATURES.get(feature, []) if not _installed(module)]
     if feature == "piano_hr" and not _checkpoint_ready():
         needs.append("Piano-HR checkpoint (~165 MB)")
+    if feature == "btc" and not _btc_ready():
+        needs.append("BTC chord weights (~12 MB)")
     return needs
+
+
+def _btc_ready() -> bool:
+    from audio_to_midi.btc_paths import CHECKPOINT, CHECKPOINT_BYTES
+
+    return CHECKPOINT.is_file() and CHECKPOINT.stat().st_size == CHECKPOINT_BYTES
 
 
 def _checkpoint_ready() -> bool:
@@ -77,6 +86,13 @@ def ensure(feature: str, progress=None, cancel=None) -> None:
             raise RuntimeError(f"Installed {args[-1]}, but '{module}' still cannot be imported; restart the app.")
     if feature == "piano_hr" and not _checkpoint_ready():
         download(PIANO_HR_URL, PIANO_HR_CHECKPOINT, "Piano-HR checkpoint", report, cancel)
+    if feature == "btc" and not _btc_ready():
+        from audio_to_midi.btc_paths import CHECKPOINT, CHECKPOINT_URL
+
+        download(CHECKPOINT_URL, CHECKPOINT, "BTC chord weights", report, cancel)
+        if not _btc_ready():
+            CHECKPOINT.unlink(missing_ok=True)
+            raise RuntimeError("The BTC chord weights downloaded incompletely; try again.")
 
 
 def download(url: str, target: Path, label: str, progress=None, cancel=None) -> None:

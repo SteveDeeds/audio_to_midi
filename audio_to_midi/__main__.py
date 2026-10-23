@@ -37,8 +37,11 @@ def parser() -> argparse.ArgumentParser:
     analyze.add_argument("--accept-noncommercial", action="store_true", help="Acknowledge ADTOF non-commercial weight restriction")
     analyze.add_argument("--accept-checkpoint-terms", action="store_true", help="Acknowledge piano-HR terms and possible checkpoint download")
     commands.add_parser("gui", help="Open the project editor").add_argument("folder", type=Path, nargs="?")
-    for name in ("info", "chords"):
-        commands.add_parser(name).add_argument("folder", type=Path)
+    commands.add_parser("info").add_argument("folder", type=Path)
+    chords = commands.add_parser("chords", help="Detect chords from the stems or the mix")
+    chords.add_argument("folder", type=Path)
+    chords.add_argument("--model", choices=["template", "btc"], default="template",
+                        help="template: built-in chord templates; btc: BTC transformer (downloads ~12 MB once)")
     export = commands.add_parser("export", help="Export resolved tracks plus chords with tempo and meter")
     export.add_argument("folder", type=Path)
     export.add_argument("output", type=Path)
@@ -225,7 +228,11 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "chords":
             if project.chords:
                 raise ValueError("Chord data already exists. Preserve it before requesting a replacement.")
-            project.key, project.chords = analyze_harmony(project)
+            if args.model == "btc":
+                from audio_to_midi import provision
+
+                provision.ensure("btc", print)
+            project.key, project.chords = analyze_harmony(project, model=args.model)
             save_project(project, args.folder)
         elif args.command == "export":
             selected = project.tracks if args.role is None else (

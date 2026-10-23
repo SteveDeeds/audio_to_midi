@@ -437,6 +437,32 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(store.manifest["revisions"][-1]["status"], "failed")
         self.assertFalse(list(store.root.glob(".stage-*")))
 
+    def test_demucs_accepts_stems_matching_a_decoded_mp3_mix(self):
+        # MP3 headers can overstate the length; stems match what decoders return.
+        mp3 = self.root / "mix.mp3"
+        audio, rate = sf.read(self.mix, always_2d=True)
+        sf.write(mp3, audio, rate, format="MP3")
+        mp3.write_bytes(mp3.read_bytes()[: mp3.stat().st_size * 3 // 4])
+        decoded, _ = sf.read(mp3, always_2d=True)
+        self.assertNotEqual(sf.info(mp3).frames, len(decoded))
+        store = ArtifactStore(self.root / "artifacts")
+
+        def builder(staging):
+            (staging / "mix.mp3").write_bytes(mp3.read_bytes())
+            return {"full_mix": "mix.mp3"}, {}
+
+        warp = store.run("warp", inputs=[mp3], parameters={}, backend="test", builder=builder)
+
+        def fake_process(argv, **kwargs):
+            output = Path(argv[-1])
+            output.mkdir(parents=True)
+            for role in ("drums", "bass", "other", "vocals", "guitar", "piano"):
+                sf.write(output / (role + ".wav"), decoded, rate, subtype="FLOAT")
+
+        ensure, version = self.demucs_ready()
+        with ensure, version, patch("audio_to_midi.pipeline._run_process", side_effect=fake_process):
+            self.assertEqual(len(separate_mix(store, warp["id"])["outputs"]), 6)
+
     def test_demucs_cancellation_cleans_staging_and_records_state(self):
         store = ArtifactStore(self.root / "artifacts")
         warp = self.fake_warp(store)

@@ -15,6 +15,7 @@ import soundfile as sf
 
 from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.adapters import MODELS, Prediction, TrackBackend, normalize_key
+from audio_to_midi.notation import preferred_key
 
 
 def add_stem(project: Project, path: Path, role: str) -> Track:
@@ -37,17 +38,18 @@ def add_stem(project: Project, path: Path, role: str) -> Track:
 
 
 def _stem_info(project: Project, path: Path) -> sf._SoundFileInfo:
+    from audio_to_midi.pipeline import decoded_frames
+
     info = sf.info(path)
     if info.frames <= 0:
         raise ValueError(f"Empty audio file: {path}")
     if project.grid.offset_seconds >= info.duration:
         raise ValueError("Declared downbeat lies beyond this audio.")
-    reference = sf.info(project.mix_path) if project.mix_path else (
-        sf.info(project.tracks[0].audio_path) if project.tracks else None
-    )
+    reference_path = project.mix_path or (project.tracks[0].audio_path if project.tracks else None)
+    reference = sf.info(reference_path) if reference_path else None
     if reference and (
         reference.samplerate != info.samplerate
-        or abs(reference.duration - info.duration) > 1 / reference.samplerate
+        or abs(decoded_frames(reference_path) - decoded_frames(path)) > 1
     ):
         raise ValueError(
             "Stem sample rate/duration differs from the project reference. "
@@ -299,23 +301,166 @@ def mix_cqt(path: str, cancelled: Callable[[], bool] = lambda: False):
 
 
 def detect_key(cqt) -> str:
-    from core.analysis import detect_key_from_chroma
-    from audio_to_midi.chords import fold_chroma
+    from audio_to_midi.chords import fold_chroma, harmonic_power
     from audio_to_midi.spectrogram import LOW_PITCH
 
-    chroma = fold_chroma(cqt ** 4, LOW_PITCH)
+    chroma = fold_chroma(harmonic_power(cqt), LOW_PITCH)
     if not chroma.any():
         raise ValueError("No pitched harmony is audible in the mix.")
-    return normalize_key(detect_key_from_chroma(chroma.mean(axis=1)))
+    return key_from_chroma(chroma.mean(axis=1))
 
 
-def analyze_harmony(project: Project, cancelled: Callable[[], bool] = lambda: False):
-    """(key, chord segments) from the mix with the placeholder recognizer."""
+def key_from_chroma(vector) -> str:
+    """Best-matching key for a 12-bin pitch-class profile, spelled with the fewest accidentals."""
+    from core.analysis import detect_key_from_chroma
+
+    return preferred_key(normalize_key(detect_key_from_chroma(vector)))
+
+
+HARMONY_ROLES = ("piano", "guitar", "other")
+VOCAL_KEY_WEIGHT = 0.5
+
+
+@dataclass(frozen=True)
+class HarmonySources:
+    """Audio used for chords: summed chord stems, a bass stem for slash basses and vocals for the key.
+
+    Without current separated stems ``chords`` is just the full mix.
+    """
+
+    chords: tuple[str, ...]
+    bass: str | None = None
+    vocals: str | None = None
+    from_stems: bool = False
+
+    def identity(self) -> tuple:
+        paths = (*self.chords, self.bass, self.vocals)
+        return tuple(media_identity(p) if p and Path(p).exists() else p for p in paths)
+
+
+def harmony_sources(project: Project) -> HarmonySources:
+    """Chord, bass and vocal stems from the current separation; the mix when there are none.
+
+    Piano, guitar and other carry the chord shape, and the bass stem is added so
+    the root is heard. Drums never count. Vocals are left out of chord shapes
+    (scoops, vibrato and melody passing tones) and only help the key, unless the
+    other stems are silent.
+    """
+    usable = {
+        t.role: t.audio_path for t in project.tracks
+        if t.audio_path and Path(t.audio_path).exists() and not stale(project, t)
+    }
+    harmonic = tuple(usable[role] for role in HARMONY_ROLES if role in usable)
+    if not harmonic:
+        if not project.mix_path:
+            raise ValueError("Import a mix before detecting chords.")
+        return HarmonySources((project.mix_path,))
+    bass = usable.get("bass")
+    return HarmonySources(harmonic + ((bass,) if bass else ()), bass, usable.get("vocals"), True)
+
+
+def stems_for_chords(project: Project) -> bool:
+    """True when current piano/guitar/other stems exist, so chords need not come from the mix."""
+    return any(
+        t.role in HARMONY_ROLES and t.audio_path and Path(t.audio_path).exists() and not stale(project, t)
+        for t in project.tracks
+    )
+
+
+def _load_sum(paths, cancelled: Callable[[], bool]):
+    import librosa
+    import numpy as np
+    from audio_to_midi.adapters import Cancelled
+    from audio_to_midi.spectrogram import SAMPLE_RATE
+
+    total = np.zeros(0, dtype=np.float32)
+    for path in paths:
+        if cancelled():
+            raise Cancelled()
+        audio, _ = librosa.load(path, sr=SAMPLE_RATE, mono=True)
+        total = _add(total, audio)
+    return total
+
+
+def _add(a, b, weight: float = 1.0):
+    import numpy as np
+
+    out = np.zeros(max(len(a), len(b)), dtype=np.float32)
+    out[:len(a)] += a
+    out[:len(b)] += weight * b
+    return out
+
+
+def _rms(audio) -> float:
+    import numpy as np
+
+    return float(np.sqrt(np.mean(np.square(audio)))) if len(audio) else 0.0
+
+
+def harmony_audio(project: Project, cancelled: Callable[[], bool] = lambda: False):
+    """(chord audio, bass audio or None, key audio) as 22050 Hz mono, from the stems or the mix."""
+    from audio_to_midi.adapters import Cancelled
+
+    sources = harmony_sources(project)
+    if not sources.from_stems:
+        mix = _load_sum(sources.chords, cancelled)
+        return mix, None, mix
+    # The bass is left out of the key: a loud bass dwelling on IV pulls the key there.
+    harmonic = _load_sum([p for p in sources.chords if p != sources.bass], cancelled)
+    bass_audio = _load_sum([sources.bass], cancelled) if sources.bass else None
+    chord_audio = harmonic if bass_audio is None else _add(harmonic, bass_audio)
+    key_audio = harmonic
+    if sources.vocals:
+        vocals = _load_sum([sources.vocals], cancelled)
+        if _rms(chord_audio) < 0.05 * _rms(vocals):  # a cappella: the voice is the harmony
+            chord_audio = _add(chord_audio, vocals)
+            key_audio = _add(harmonic, vocals)
+        else:
+            key_audio = _add(harmonic, vocals, VOCAL_KEY_WEIGHT)
+    if cancelled():
+        raise Cancelled()
+    return chord_audio, bass_audio, key_audio
+
+
+def harmony_cqt(project: Project, cancelled: Callable[[], bool] = lambda: False, audio=None):
+    """(chord CQT, bass CQT or None, key CQT, frame seconds, duration) for chord detection and display."""
+    from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE, cqt_image
+
+    if audio is None and not harmony_sources(project).from_stems:
+        cqt, frame_seconds, duration = mix_cqt(harmony_sources(project).chords[0], cancelled)
+        return cqt, None, cqt, frame_seconds, duration
+    chord_audio, bass_audio, key_audio = audio or harmony_audio(project, cancelled)
+    chord_cqt = cqt_image(chord_audio, SAMPLE_RATE)
+    bass_cqt = cqt_image(bass_audio, SAMPLE_RATE) if bass_audio is not None else None
+    key_cqt = chord_cqt if key_audio is chord_audio else cqt_image(key_audio, SAMPLE_RATE)
+    return chord_cqt, bass_cqt, key_cqt, HOP_LENGTH / SAMPLE_RATE, len(chord_audio) / SAMPLE_RATE
+
+
+CHORD_MODELS = {"template": "Built-in templates", "btc": "BTC transformer (deep learning)"}
+
+
+def analyze_harmony(project: Project, cancelled: Callable[[], bool] = lambda: False, model: str = "template"):
+    """(key, chord segments) from the chord stems (or the mix).
+
+    ``template`` ranks chord templates with the project key as a soft prior;
+    ``btc`` runs the BTC transformer on the same audio (see audio_to_midi/btc.py).
+    """
     from audio_to_midi.chords import recognize
-    from audio_to_midi.spectrogram import LOW_PITCH
+    from audio_to_midi.spectrogram import LOW_PITCH, SAMPLE_RATE
 
-    if not project.mix_path:
-        raise ValueError("Import a mix before detecting chords.")
-    cqt, frame_seconds, duration = mix_cqt(project.mix_path, cancelled)
-    key = project.key or detect_key(cqt)
-    return key, recognize(cqt, LOW_PITCH, frame_seconds, project.grid, duration, cancel=cancelled)
+    if model not in CHORD_MODELS:
+        raise ValueError(f"Unknown chord model {model!r}")
+    audio = harmony_audio(project, cancelled) if model == "btc" else None
+    cqt, bass_cqt, key_cqt, frame_seconds, duration = harmony_cqt(project, cancelled, audio)
+    key = project.key or detect_key(key_cqt)
+    if model == "btc":
+        from audio_to_midi import btc
+
+        if SAMPLE_RATE != btc.SAMPLE_RATE:
+            raise RuntimeError("BTC expects 22050 Hz audio")
+        return key, btc.recognize(
+            audio[0], project.grid, duration, bass_cqt, LOW_PITCH, frame_seconds, cancelled,
+        )
+    return key, recognize(
+        cqt, LOW_PITCH, frame_seconds, project.grid, duration, cancel=cancelled, key=key, bass_cqt=bass_cqt,
+    )

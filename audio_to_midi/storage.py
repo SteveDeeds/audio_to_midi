@@ -11,6 +11,7 @@ from fractions import Fraction
 import json
 import os
 from pathlib import Path
+import shutil
 from uuid import uuid4
 
 from .domain import ChordSegment, Note, NoteStore, Project, Track
@@ -169,8 +170,63 @@ def _manifest(project: Project, folder: Path) -> dict:
         "schema_version": SCHEMA_VERSION, "id": project.id, "name": project.name,
         "grid": grid, "tracks": tracks, "mix_path": _saved_path(project.mix_path, folder),
         "key": project.key, "chords": [_chord(c) for c in project.chords],
-        "stages": project.stages, "revision": project.revision,
+        "stages": _stage_paths(project.stages, lambda value: _saved_path(value, folder)),
+        "revision": project.revision,
     }
+
+
+# Stage entries that hold file-system paths; saved relative so the project folder can move.
+STAGE_PATHS = (("timing", "source"), ("preparation", "directory"))
+
+
+def _stage_paths(stages: dict, convert) -> dict:
+    if not isinstance(stages, dict):
+        return stages
+    result = dict(stages)
+    for stage, key in STAGE_PATHS:
+        value = result.get(stage)
+        if isinstance(value, dict) and isinstance(value.get(key), str) and value[key]:
+            result[stage] = {**value, key: convert(value[key])}
+    return result
+
+
+def _resolved(value: str, folder: Path) -> str:
+    path = Path(value)
+    return str(path.resolve() if path.is_absolute() else (folder / path).resolve())
+
+
+def import_media(path: Path, folder: Path, subfolder: str = "audio") -> Path:
+    """Copy *path* into the project folder (once) so the project does not depend on the original."""
+    path, folder = Path(path).resolve(strict=True), Path(folder).resolve()
+    if path.is_relative_to(folder):
+        return path
+    target_dir = folder / subfolder
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / path.name
+    counter = 1
+    while target.exists():
+        if target.stat().st_size == path.stat().st_size and _same_bytes(target, path):
+            return target
+        target = target_dir / f"{path.stem} ({counter}){path.suffix}"
+        counter += 1
+    pending = target.with_name(f".{target.name}.{uuid4().hex}.pending")
+    try:
+        shutil.copyfile(path, pending)
+        os.replace(pending, target)
+    finally:
+        if pending.exists():
+            pending.unlink()
+    return target
+
+
+def _same_bytes(a: Path, b: Path) -> bool:
+    with a.open("rb") as first, b.open("rb") as second:
+        while True:
+            left, right = first.read(1 << 20), second.read(1 << 20)
+            if left != right:
+                return False
+            if not left:
+                return True
 
 
 def save_project(project: Project, folder: Path) -> None:
@@ -178,7 +234,8 @@ def save_project(project: Project, folder: Path) -> None:
 
     Serialization, validation, write and replacement failures never modify the
     previous manifest. Save errors propagate to the caller; partial files are
-    removed. Media is referenced, not copied, and is checked when reopening.
+    removed. Media is referenced, not copied (the editor copies imported mixes in
+    with ``import_media``), and is checked when reopening.
     """
     project.validate()
     folder = Path(folder).resolve()
@@ -246,7 +303,8 @@ def load_project(folder: Path) -> Project:
             id=data["id"], name=data["name"], grid=grid, tracks=tracks,
             mix_path=_loaded_path(data["mix_path"], folder), key=data["key"],
             chords=[_read_chord(c) for c in _list(data["chords"], "chords")],
-            stages=data["stages"], revision=data["revision"],
+            stages=_stage_paths(data["stages"], lambda value: _resolved(value, folder)),
+            revision=data["revision"],
         )
     except (TypeError, ValueError, KeyError, OverflowError) as exc:
         raise InvalidProjectError(f"Invalid project state: {exc}") from exc

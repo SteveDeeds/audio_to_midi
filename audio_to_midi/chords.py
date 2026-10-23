@@ -1,12 +1,11 @@
-"""Lead-sheet chord symbols, voicings and a placeholder chroma recognizer.
+"""Lead-sheet chord symbols, voicings and a baseline chroma recognizer.
 
 Vocabulary: triads (maj, m, dim, aug, sus2, sus4), sevenths (7, maj7, m7, m7b5,
 dim7, mMaj7) and slash chords (``C/E``); ``N.C.`` means no chord. The
 recognizer is a deliberately simple baseline until a published lead-sheet
-recognizer is evaluated (see docs/ui-redesign-plan.md): per beat it averages a
-12-semitone chroma, keeps pitch classes above a fraction of the strongest one,
-names the best-matching template and adds a slash bass from the lowest strong
-CQT bin.
+recognizer is evaluated (see docs/ui-redesign-plan.md). It recovers spectral
+contrast from the display CQT, ranks weighted chord templates per beat with a
+soft key prior, and adds a slash bass from the lowest strong CQT peak.
 """
 
 from __future__ import annotations
@@ -59,6 +58,18 @@ def symbol(root: int, quality: str, bass: int | None = None) -> str:
     return text + (f"/{NAMES[bass % 12]}" if bass is not None and bass % 12 != root % 12 else "")
 
 
+def spell(text: str, key: str = "") -> str:
+    """Display spelling of a stored symbol for the key (Abm -> G#m in B major)."""
+    from audio_to_midi.notation import spelling
+
+    parsed = parse(text)
+    if parsed is None:
+        return NO_CHORD
+    root, quality, bass = parsed
+    names = spelling(key)
+    return names[root] + quality + (f"/{names[bass]}" if bass is not None else "")
+
+
 def normalize(text: str) -> str:
     parsed = parse(text)
     return NO_CHORD if parsed is None else symbol(*parsed)
@@ -96,7 +107,9 @@ def name_notes(pitches) -> str:
     return _best(vector, pitches[0] % 12)[0][0]
 
 
-def _best(active: np.ndarray, bass: int | None) -> list[tuple[str, float]]:
+def _best(
+    active: np.ndarray, bass: int | None, scale: set[int] | None = None,
+) -> list[tuple[str, float]]:
     """Rank symbols for a 0..1 active-pitch-class vector; F-measure of template vs. active."""
     present = set(np.flatnonzero(active > 0).tolist())
     if not present:
@@ -112,6 +125,8 @@ def _best(active: np.ndarray, bass: int | None) -> list[tuple[str, float]]:
             # Prefer plain triads, then a bass that is the root, on ties.
             score -= 0.01 * (len(tones) - 3) + (0.02 if bass is not None and bass != root and bass not in tones else 0)
             score += 0.015 if bass == root else 0
+            if scale is not None:
+                score -= 0.08 * len(tones - scale) / len(tones)
             slash = bass if bass is not None and bass != root else None
             ranked.append((symbol(root, quality, slash), float(score)))
     ranked.sort(key=lambda item: -item[1])
@@ -130,16 +145,57 @@ def fold_chroma(cqt: np.ndarray, low_pitch: int, reduce: str = "sum") -> np.ndar
     return rows
 
 
+KEY_BANDS = (("Low", 21, 48), ("Mid", 48, 72), ("High", 72, 109))  # A0-B2, C3-B4, C5-C8
+
+
+def band_chroma(cqt: np.ndarray, low_pitch: int, bands=KEY_BANDS) -> dict[str, np.ndarray]:
+    """Time-averaged pitch-class energy per register plus ``All``, as shares of All's total.
+
+    ``All`` is exactly the profile key detection correlates; the bands add up to it.
+    """
+    power = harmonic_power(cqt)
+    rows = power.mean(axis=1) if power.shape[1] else np.zeros(power.shape[0], dtype=np.float32)
+    pitches = low_pitch + np.arange(len(rows))
+    profiles = {}
+    for name, lo, hi in bands:
+        vector = np.zeros(12)
+        inside = (pitches >= lo) & (pitches < hi)
+        np.add.at(vector, pitches[inside] % 12, rows[inside])
+        profiles[name] = vector
+    everything = np.zeros(12)
+    np.add.at(everything, pitches % 12, rows)
+    total = float(everything.sum())
+    profiles["All"] = everything
+    return {name: vector / total if total > 0 else vector for name, vector in profiles.items()}
+
+
+def harmonic_power(cqt: np.ndarray) -> np.ndarray:
+    """Recover linear power, suppressing adjacent-semitone CQT filter leakage."""
+    from audio_to_midi.spectrogram import FLOOR_DB
+
+    image = np.asarray(cqt, dtype=np.float32)
+    magnitude = np.where(image > 0, 10 ** ((image - 1) * FLOOR_DB / 20), 0)
+    neighbors = np.pad(magnitude, ((1, 1), (0, 0)))
+    contrast = np.maximum(magnitude - 0.5 * (neighbors[:-2] + neighbors[2:]), 0)
+    return contrast ** 2
+
+
 def recognize(
     cqt: np.ndarray, low_pitch: int, frame_seconds: float, grid, duration: float,
-    threshold: float = 0.7, cancel=lambda: False,
+    threshold: float = 0.1, cancel=lambda: False, key: str = "", bass_cqt: np.ndarray | None = None,
 ):
-    """Placeholder recognizer; returns a list of ``ChordSegment`` merged across equal beats."""
-    from audio_to_midi.adapters import Cancelled
-    from audio_to_midi.domain import ChordSegment
+    """Rank weighted templates with a soft key prior; merge equal adjacent beats.
 
-    # Sharpen: the display CQT is log-scaled 0..1; emphasize peaks before folding.
-    power = np.asarray(cqt, dtype=np.float32) ** 4
+    ``bass_cqt`` (a separated bass stem, same frames) supplies the slash bass
+    instead of the lowest strong note in ``cqt``.
+    """
+    from audio_to_midi.adapters import Cancelled, normalize_key
+    from audio_to_midi.domain import ChordSegment
+    from core.chord_analysis import key_to_scale_pcs
+
+    scale = key_to_scale_pcs(normalize_key(key)) if key else None
+    power = harmonic_power(cqt)
+    bass_power = power if bass_cqt is None else harmonic_power(bass_cqt)
     chroma = fold_chroma(power, low_pitch, "max")
     beat_q = Fraction(4, grid.denominator)
     end = grid.seconds_to_beat(duration)
@@ -156,10 +212,10 @@ def recognize(
         if hi > lo:
             vector = chroma[:, lo:hi].mean(axis=1)
             peak = float(vector.max())
-            if peak > 1e-6 and float(power[:, lo:hi].mean()) > 1e-3:
-                active = (vector >= threshold * peak).astype(float)
-                bass = _bass(power[:, lo:hi], low_pitch)
-                ranked = _best(active, bass)
+            if peak > 1e-6:
+                active = np.where(vector >= threshold * peak, np.sqrt(vector / peak), 0)
+                bass = _bass(bass_power[:, lo:hi], low_pitch)
+                ranked = _best(active, bass, scale)
                 name, confidence = ranked[0]
                 alternatives = tuple(n for n, _ in ranked[1:6])
         if segments and segments[-1].symbol == name and segments[-1].end == beat:
@@ -172,13 +228,21 @@ def recognize(
 
 
 def _bass(power: np.ndarray, low_pitch: int) -> int | None:
-    """Pitch class of the lowest strong bin between E1 and B3."""
+    """Lowest sustained bin at least half the peak amplitude between E1 and B3.
+
+    The per-frame median ignores short low thumps (kick drums near G1-A1) that
+    would otherwise outweigh the held bass note in a beat average.
+    """
     lo, hi = max(0, 28 - low_pitch), max(0, 59 - low_pitch)
-    band = power[lo:hi].mean(axis=1)
+    band = np.median(power[lo:hi], axis=1) if power.shape[1] else np.zeros(0)
     if not len(band) or float(band.max()) <= 1e-6:
         return None
-    strong = np.flatnonzero(band >= 0.5 * float(band.max()))
-    return int((low_pitch + lo + strong[0]) % 12)
+    strong = np.flatnonzero(band >= 0.25 * float(band.max()))
+    index = int(strong[0])
+    # Adjacent semitones are a slide or filter leakage, not two bass notes: keep the stronger.
+    while index + 1 < len(band) and band[index + 1] > band[index]:
+        index += 1
+    return int((low_pitch + lo + index) % 12)
 
 
 def segments_to_notes(segments, velocity: int = 80) -> list[tuple[Fraction, Fraction, int, int]]:
@@ -209,10 +273,12 @@ def notes_to_segments(notes, grid, source: str = "imported"):
     return segments
 
 
-def musicxml(segments, grid, title: str) -> str:
-    """Minimal lead sheet: one part of rests with <harmony> symbols at chord changes."""
+def musicxml(segments, grid, title: str, key: str = "") -> str:
+    """Minimal lead sheet: one part of rests with <harmony> symbols at chord changes, spelled for the key."""
     from xml.sax.saxutils import escape
+    from audio_to_midi.notation import key_fifths, spelling
 
+    names = spelling(key)
     bar_q = Fraction(4 * grid.numerator, grid.denominator)
     denominators = [Fraction(x).denominator for s in segments for x in (s.start, s.end)] + [bar_q.denominator, 1]
     divisions = int(np.lcm.reduce(np.array(denominators, dtype=np.int64)))
@@ -227,7 +293,7 @@ def musicxml(segments, grid, title: str) -> str:
     }
 
     def step_alter(pc: int) -> str:
-        name = NAMES[pc]
+        name = names[pc]
         alter = {"#": 1, "b": -1}.get(name[1:], 0)
         return f"<{{0}}-step>{name[0]}</{{0}}-step>" + (f"<{{0}}-alter>{alter}</{{0}}-alter>" if alter else "")
 
@@ -246,7 +312,7 @@ def musicxml(segments, grid, title: str) -> str:
         out.append(f'<measure number="{index + 1}">')
         if index == 0:
             out.append(
-                f"<attributes><divisions>{divisions}</divisions><key><fifths>0</fifths></key>"
+                f"<attributes><divisions>{divisions}</divisions><key><fifths>{key_fifths(key)}</fifths></key>"
                 f"<time><beats>{grid.numerator}</beats><beat-type>{grid.denominator}</beat-type></time>"
                 "<clef><sign>G</sign><line>2</line></clef></attributes>"
                 f'<direction placement="above"><direction-type><metronome><beat-unit>quarter</beat-unit>'
@@ -262,7 +328,7 @@ def musicxml(segments, grid, title: str) -> str:
                     out.append('<harmony><root><root-step>C</root-step></root><kind text="N.C.">none</kind></harmony>')
                 else:
                     root, quality, bass = parsed
-                    text = escape(chord.symbol.split("/")[0][len(NAMES[root]):])
+                    text = escape(quality)
                     harmony = f"<harmony><root>{step_alter(root).format('root')}</root><kind text=\"{text}\">{kinds[quality]}</kind>"
                     if bass is not None:
                         harmony += f"<bass>{step_alter(bass).format('bass')}</bass>"

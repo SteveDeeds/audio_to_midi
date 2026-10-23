@@ -3,11 +3,11 @@
 Audio to MIDI turns a song into editable MIDI. You work through stages, each
 shown in the strip at the top right of the window:
 
-**Mix → Count bars → Warp → Confirm → Stems → Notes → Chords → Export**
+**Mix → Count bars → Warp → Stems → Notes → Chords → Export**
 
 1. Import the full mix.
 2. Find its bars and beats (detect, then fix with pins or tapped downbeats).
-3. Warp the mix to one steady tempo and confirm the timing.
+3. Warp the mix to one steady tempo.
 4. Separate or import stems.
 5. Transcribe and correct notes per stem.
 6. Detect and correct a lead-sheet chord track.
@@ -60,9 +60,16 @@ Do not use `python app.py` for this guide: that opens the legacy application.
    Every project needs a mix; it is the timing reference for everything else.
 3. The app immediately runs **Edit > Detect tempo, meter, and key** on the mix.
 
-Projects reference audio files rather than copying the original mix, so keep
-it where it is. Save regularly with **File > Save** (Ctrl+S); closing the
-window asks before discarding unsaved changes.
+The imported mix is copied into the project's `audio` folder, so the project
+keeps working if you move or delete the original; the whole project folder can
+also be moved or renamed. Projects made by earlier versions that still point at
+an outside file get a copy the next time you open them (as long as the original
+is still there). Save regularly with **File > Save** (Ctrl+S). Save writes directly
+to the current project folder without a dialog; it asks for a folder only if
+one has not been chosen yet. Closing the window, opening another project, or
+creating a new one warns only when there are changes since the last successful
+save (including analysis results). A failed or canceled save leaves those
+changes unsaved.
 
 ## 3. Count the bars (Mix view)
 
@@ -106,7 +113,7 @@ adds clicks (high on downbeats) so you can hear whether the count lines up.
 
 The stage strip shows **Count bars ✓** once the bars are counted.
 
-## 4. Warp and confirm the timing
+## 4. Warp the mix
 
 **Edit > Warp mix to tempo...** writes a constant-tempo copy of the mix into
 the project folder, so the bar grid lines up with the music everywhere.
@@ -118,9 +125,9 @@ the project folder, so the bar grid lines up with the music everywhere.
 
 After warping, the app re-detects beats on the warped mix as a check. Green
 beat lines fall on the grid (within 30 ms); red ones do not. Click any beat
-line to see the summary. Listen with the metronome, then check
-**Edit > Timing confirmed**. Stems, chord detection and stem import stay
-grayed out until the timing is confirmed.
+line to see the summary. Listen with the metronome; if it drifts, return to
+the original mix and recount (below). Stems, chord detection and stem import
+unlock as soon as the mix is warped.
 
 To start over, **Edit > Return to original mix...** discards the warped copy.
 Bar and beat positions of existing notes are kept, but analysis of stems that
@@ -159,15 +166,30 @@ are analyzed automatically. **Model > Analyze visible bars** and
 button in the status bar) stops it.
 
 **Navigate** with **Previous** / **Next** (PgUp / PgDn). The label between them
-shows the visible bars. **Ctrl + mouse wheel** (or View > Zoom) shows more or
-fewer bars; the plain mouse wheel scrolls pitch; **Ctrl + Shift + wheel**
+shows the visible bars. **Zoom out (-)** / **Zoom in (+)** next to them (also
+Ctrl + mouse wheel, View > Zoom, Ctrl+- / Ctrl+=) show 1, 2, 4, 8 or 16 bars per
+screen; the readout beside the buttons shows the current setting. The plain mouse wheel scrolls pitch; **Ctrl + Shift + wheel**
 zooms pitch (not in the drums view). **Grid** sets the editing step (1/4 to 1/32, including
 triplets).
 
 The piano roll shows the stem's spectrogram behind the notes: a sustained
-pitch is a bright horizontal band. Blue notes are model proposals; green ones
+pitch is a bright horizontal band. Brightness is measured against the loudest
+moment of the whole stem, so bars where the instrument is silent stay dark
+(the spectrum appears a moment after a stem is first shown, once that level is
+measured). The chords view's pitch-class strip is scaled to the whole song the
+same way, on a 40 dB log scale so weaker chord tones still show. Blue notes are model proposals; green ones
 are yours. **Hover over a note** to see its name, the bar and beat it starts
 on, its length and velocity.
+
+Velocity comes from how loud the note is in its stem: the power at the note's
+pitch and its first harmonics over the note's first 200 ms, compared with the
+loudest notes of the whole stem (General MIDI curve, so 12 dB quieter is about
+half the velocity). This applies to bass, vocals and Basic Pitch; the piano_hr
+model predicts piano key velocities itself. Drum velocity is the RMS level at
+each hit in that kit piece's band (kick 30-150 Hz, snare 150 Hz-5 kHz, toms
+60-600 Hz, hi-hat 6-16 kHz, cymbals 4-16 kHz), so a kick and a hi-hat on the
+same beat are measured separately; each piece is scaled to its own loudest
+hits. Notes you draw start at 100.
 
 There are two tools, with buttons next to **Grid** (or **View** menu):
 
@@ -212,10 +234,49 @@ the mix amplitude, the chord lane, and a 12-row chroma (one row per pitch
 class, bright where that note sounds). The chord's tones are outlined in the
 chroma, and bar/beat lines run through every lane.
 
-- **Edit > Detect chords** proposes chords on the beat grid from the warped mix
-  (triads, sevenths, suspended and slash chords). It requires confirmed timing.
-  The current recognizer is a simple placeholder; a better lead-sheet
-  recognizer is being evaluated.
+- **Edit > Detect chords** proposes chords on the beat grid
+  (triads, sevenths, suspended and slash chords). It requires a warped mix.
+  Separate stems first for the best results: with current stems, chords come
+  from piano + guitar + other + bass, the slash bass comes from the bass stem
+  alone, drums are ignored, and vocals (slides, vibrato, melody passing tones)
+  only help detect the key unless the instruments are silent. Without current
+  stems the app offers to separate them first (then detects chords
+  automatically) or to use the full mix, where kick drums and vocals can add
+  wrong notes. The chroma lane shows the same audio the detector reads.
+  The key is judged from piano + guitar + other plus half-level vocals, without
+  bass or drums: a loud bass sitting on the IV chord otherwise pulls the key
+  there. When stems exist and you have not set the key yourself, **Detect
+  chords** re-detects the key from the stems (the first detection used the
+  mix) and the status line reports any change.
+  Key and chord detection use the same spectral preprocessing. The project key
+  gently favors chords in that scale when the audio is ambiguous; clear borrowed
+  chords can still win. Set or correct the key with **Edit...**, then rerun
+  **Detect chords** to apply it to the chord proposals. The built-in detector
+  is a baseline, not a definitive transcription.
+- **Model > Chord recognizer** (or the **Model** box when the Chords track is
+  selected) chooses the detector used by **Detect chords**:
+  **Built-in templates** (default) or **BTC transformer (deep learning)**, the
+  MIT-licensed Bi-directional Transformer for Chord recognition (Park et al.,
+  ISMIR 2019) trained on lead sheets with a 170-chord vocabulary. BTC is much
+  steadier from beat to beat and works well on the full mix, so it does not
+  ask to separate stems (it still uses current stems when present). The first
+  use installs PyTorch if needed and downloads the ~12 MB model once. Sixth
+  chords are shown as their triads, and an inversion slash is added only when
+  the bass stem plays a chord tone other than the root. The key still comes
+  from the key detector. From the command line: `chords --model btc`.
+- Chord, chroma-row and note names are spelled for the project key: `G#m`,
+  not `Abm`, in B major; `Bb`, not `A#`, in F major. Common chromatic notes use
+  the usual altered degree (`Eb` as the flat 3rd in C, `G#` as the leading tone
+  in A minor). Changing the key respells existing chords without redetecting,
+  and MusicXML export writes the matching key signature. Detected keys use the
+  simpler enharmonic (`Db`, not `C#`).
+- **Model > Advanced > Show key CQT...** plots the 12 pitch classes the key
+  detector reads, folded over octaves, as overlaid traces: Low (A0-B2), Mid
+  (C3-B4), High (C5-C8) and All. All is exactly the key-detection profile and
+  the bands add up to it; the legend shows each band's share of the energy and
+  the key it alone would give. **Compare shapes** scales each trace to 100% so
+  quiet registers can be compared. Choose the audio: the key detection input,
+  the full mix, or any stem.
 - **Double-click** a chord to type a symbol (`Am7`, `C/E`, `F#m7b5`, `N.C.`).
 - **Right-click** for *Alternatives*, *Split at this beat*, *Merge with next
   chord* and *No chord*.
@@ -252,7 +313,7 @@ mix with the chords.
 
 | Symptom | What to check |
 |---|---|
-| A menu item is grayed out | Hover over it: the tooltip says which stage is missing (mix, counted bars, warp, or confirmed timing). |
+| A menu item is grayed out | Hover over it: the tooltip says which stage is missing (mix, counted bars, or warp). |
 | The count is at double or half speed | Pin two downbeats several bars apart; the count follows your pins. |
 | Tapping did not count bars | Tap the first beat of each bar (not every beat), for at least four bars, in a section with clear drums or bass. Or pin downbeats by hand. |
 | Clicks drift late in the song | Pin another downbeat near the drift, then warp with stretching instead of as-is. |

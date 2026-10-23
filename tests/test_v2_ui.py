@@ -43,6 +43,12 @@ class EditorTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.wav = self.root / "bass.wav"
         sf.write(self.wav, np.zeros(16000), 8000)
+        from PySide6.QtCore import QSettings
+
+        settings = patch("audio_to_midi.ui.QSettings", lambda *_: QSettings(
+            str(self.root / "settings.ini"), QSettings.Format.IniFormat))
+        settings.start()
+        self.addCleanup(settings.stop)
         self.window = ProjectWindow()
         self.window.auto.setChecked(False)
         self.track = add_stem(self.window.project, self.wav, "bass")
@@ -66,6 +72,14 @@ class EditorTests(unittest.TestCase):
             self.app.processEvents()
             time.sleep(.005)
         self.assertIsNone(self.window.job)
+
+    def wait_cqt(self):
+        """The piano-roll spectrum appears once the whole-song level is measured in the background."""
+        timeout = time.monotonic() + 10
+        while self.window.timeline.cqt is None and time.monotonic() < timeout:
+            self.app.processEvents()
+            time.sleep(.01)
+        self.assertIsNotNone(self.window.timeline.cqt)
 
     def test_edit_undo_redo_rejections_and_training(self):
         self.window._add_note(F(0), 60)
@@ -130,6 +144,111 @@ class EditorTests(unittest.TestCase):
         loaded = load_project(self.window.folder)
         self.assertEqual(loaded.tracks[0].notes.resolved(), self.track.notes.resolved())
 
+    def test_save_existing_project_has_no_dialog_and_exit_has_no_warning(self):
+        from PySide6.QtGui import QCloseEvent
+        from audio_to_midi.ui import QFileDialog
+
+        self.wait_idle()
+        self.window.folder = self.root / "project"
+        self.window._add_note(F(0), 60)
+        with patch.object(QFileDialog, "getExistingDirectory") as folder_dialog:
+            self.window.actions["save"].trigger()
+        folder_dialog.assert_not_called()
+        event = QCloseEvent()
+        with patch.object(QMessageBox, "question") as question:
+            self.window.closeEvent(event)
+        question.assert_not_called()
+        self.assertTrue(event.isAccepted())
+
+    def test_saved_project_warns_only_after_new_changes_and_failed_save_stays_dirty(self):
+        self.window.folder = self.root / "project"
+        self.window._save()
+        self.track.settings["test_setting"] = True
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as question:
+            self.assertFalse(self.window._confirm_replace())
+        question.assert_called_once()
+        with patch("audio_to_midi.ui.save_project", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                self.window._save()
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
+            self.assertFalse(self.window._confirm_replace())
+        self.window._save()
+        with patch.object(QMessageBox, "question") as question:
+            self.assertTrue(self.window._confirm_replace())
+        question.assert_not_called()
+
+    def test_opened_project_is_clean_and_nested_training_changes_are_unsaved(self):
+        from audio_to_midi.ui import QFileDialog
+
+        self.window.folder = self.root / "project"
+        self.window._save()
+        with patch.object(QFileDialog, "getExistingDirectory", return_value=str(self.window.folder)), patch.object(
+            QMessageBox, "question",
+        ) as question:
+            self.window._open()
+            self.assertTrue(self.window._confirm_replace())
+        question.assert_not_called()
+        self.window.project.tracks[0].training.append({"label": 1})
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
+            self.assertFalse(self.window._confirm_replace())
+
+    def test_new_project_and_pristine_window_are_clean(self):
+        from audio_to_midi.ui import QFileDialog, QInputDialog
+
+        window = ProjectWindow()
+        try:
+            with patch.object(QMessageBox, "question") as question:
+                self.assertTrue(window._confirm_replace())
+            question.assert_not_called()
+            with patch.object(QInputDialog, "getText", return_value=("New song", True)), patch.object(
+                QFileDialog, "getExistingDirectory", return_value=str(self.root),
+            ):
+                window._new()
+            with patch.object(QMessageBox, "question") as question:
+                self.assertTrue(window._confirm_replace())
+            question.assert_not_called()
+            window.project.key = "B"
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
+                self.assertFalse(window._confirm_replace())
+        finally:
+            with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+                window.close()
+            window.deleteLater()
+
+    def test_cancelled_first_save_leaves_unsaved_changes(self):
+        from audio_to_midi.ui import QFileDialog
+
+        with patch.object(QFileDialog, "getExistingDirectory", return_value=""):
+            self.window._save()
+        self.assertIsNone(self.window.folder)
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
+            self.assertFalse(self.window._confirm_replace())
+
+    def test_unsaved_timing_session_changes_are_detected(self):
+        from audio_to_midi.beats import Beat
+        from audio_to_midi.timing import BeatSession
+
+        self.window.folder = self.root / "project"
+        self.window.session = BeatSession([Beat(i * 0.5, 0.9) for i in range(16)], 120, 8)
+        self.window._save()
+        self.window.session.pin(0, 1)
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
+            self.assertFalse(self.window._confirm_replace())
+
+    def test_analysis_after_save_is_unsaved_and_declining_exit_keeps_window_open(self):
+        from PySide6.QtGui import QCloseEvent
+
+        self.wait_idle()
+        self.window.folder = self.root / "project"
+        self.window._save()
+        result = Prediction(F(0), F(4), (Note("generated", F(0), F(1), 60),), ())
+        self.window._publish((token(self.window.project, self.track), result))
+        event = QCloseEvent()
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as question:
+            self.window.closeEvent(event)
+        question.assert_called_once()
+        self.assertFalse(event.isAccepted())
+
     def test_whole_track_publishes_multiple_batches_and_marks_complete(self):
         from audio_to_midi.application import complete
 
@@ -160,14 +279,42 @@ class EditorTests(unittest.TestCase):
         self.window.folder.mkdir()
         with patch.object(self.window, "_detect"):
             self.window._set_mix(mix_path)
-        return mix_path
+        copy = Path(self.window.project.mix_path)
+        self.assertEqual(copy, (self.window.folder / "audio" / "mix.wav").resolve())
+        return copy
+
+    def test_external_mix_is_copied_into_the_project(self):
+        from audio_to_midi.storage import load_project, save_project
+        from audio_to_midi.ui import QFileDialog
+
+        window = self.window
+        copy = self._mix_only(seconds=1.0)
+        self.assertEqual(window.timing["source"], str(copy))
+        window._save()
+        # A project saved by an older version still points at the original in Downloads.
+        outside = self.root / "Downloads" / "song.wav"
+        outside.parent.mkdir()
+        sf.write(outside, np.zeros(800), 8000)
+        old = load_project(window.folder)
+        old.mix_path = str(outside)
+        old.stages["timing"]["source"] = str(outside)
+        save_project(old, window.folder)
+        with patch.object(QFileDialog, "getExistingDirectory", return_value=str(window.folder)), \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+            window._open()
+        inside = str((window.folder / "audio" / "song.wav").resolve())
+        self.assertEqual((window.project.mix_path, window.timing["source"]), (inside, inside))
+        self.assertIn("Copied the original mix", window.status.text())
+        self.assertEqual(load_project(window.folder).mix_path, inside)
+        outside.unlink()
+        self.assertEqual(load_project(window.folder).stages["timing"]["source"], inside)
 
     def test_menu_bar_and_gating(self):
         window = self.window
         self.assertEqual([a.text().replace("&", "") for a in window.menuBar().actions()],
                          ["File", "Edit", "View", "Model", "Help"])
         self.assertEqual([window.tracks.itemText(i) for i in range(window.tracks.count())], ["bass"])
-        for name in ("detect", "warp", "separate", "import_stems", "chords", "confirm", "unwarp"):
+        for name in ("detect", "warp", "separate", "import_stems", "chords", "unwarp"):
             self.assertFalse(window.actions[name].isEnabled(), name)
         self.assertTrue(window.actions["analyze"].isEnabled())
         self.assertIn("mix", window.actions["detect"].toolTip())
@@ -261,17 +408,15 @@ class EditorTests(unittest.TestCase):
         detect.assert_called_once()
         self.assertTrue(Path(window.project.mix_path).is_file())
         self.assertNotEqual(Path(window.project.mix_path), mix_path.resolve())
-        self.assertFalse(window.confirmed)
-        self.assertFalse(window.actions["separate"].isEnabled())
-        self.assertTrue(window.actions["confirm"].isEnabled())
+        self.assertNotIn("confirm", window.actions)
+        self.assertNotIn("Confirm", window.stages.text())
+        self.assertTrue(window.actions["separate"].isEnabled())  # warping alone unlocks stems
+        self.assertTrue(window.actions["import_stems"].isEnabled())
+        self.assertTrue(window.actions["chords"].isEnabled())
         window.check = [0.5, 1.0, 1.52, 1.6]
         window._refresh()
         self.assertEqual([kind for _, kind, _ in window.timeline.beats], ["check_ok", "check_ok", "check_ok", "check_bad"])
         self.assertIn("max 100 ms", window._check_text())
-        window._set_confirmed(True)
-        self.assertTrue(window.confirmed)
-        self.assertTrue(window.actions["separate"].isEnabled())
-        self.assertTrue(window.actions["import_stems"].isEnabled())
         track = add_stem(window.project, mix_path, "bass")
         window._sync_tracks()
         self.assertFalse(stale(window.project, track))
@@ -286,7 +431,7 @@ class EditorTests(unittest.TestCase):
         window = self.window
         runs = []
         window._run = lambda *args, **kwargs: runs.append((args, kwargs))
-        self.enterContext(patch.object(ProjectWindow, "confirmed", property(lambda _: True)))
+        self.enterContext(patch.object(ProjectWindow, "warped", property(lambda _: True)))
         window.project.stages["preparation"] = {"directory": str(self.root / "prep"), "warp_revision": "w1"}
         with patch("audio_to_midi.provision.missing", return_value=["demucs>=4.0.1"]), \
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as ask:
@@ -300,6 +445,86 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertTrue(runs[0][1]["reports"])
         self.assertEqual(runs[0][1]["kind"], "separate")
+
+    def test_chord_detection_offers_separation_without_current_stems(self):
+        window = self.window
+        mix_path = self._mix_only(seconds=4.0)
+        self.enterContext(patch.object(ProjectWindow, "warped", property(lambda _: True)))
+        runs = []
+        window._run = lambda *args, **kwargs: runs.append((args, kwargs))
+        buttons = QMessageBox.StandardButton
+        for answer, separates, detects in ((buttons.Cancel, 0, 0), (buttons.No, 0, 1), (buttons.Yes, 1, 0)):
+            with self.subTest(answer=answer), patch.object(window, "_separate") as separate, \
+                    patch.object(QMessageBox, "question", return_value=answer) as ask:
+                runs.clear()
+                window._detect_chords()
+                self.assertIn("Separate stems", ask.call_args.args[1])
+                self.assertEqual(separate.call_count, separates)
+                if separates:
+                    separate.assert_called_with(then_detect_chords=True)
+                self.assertEqual(len(runs), detects)
+        add_stem(window.project, mix_path, "piano")
+        with patch.object(QMessageBox, "question") as ask:
+            runs.clear()
+            window._detect_chords()
+        ask.assert_not_called()
+        self.assertEqual(len(runs), 1)
+        # A key detected from the mix is re-judged from the stems; a key the user typed is kept.
+        for source, expected in (("detected", "B"), ("user", "E")):
+            with self.subTest(key_source=source):
+                window.project.key, window.timing["key_source"] = "E", source
+                runs.clear()
+                window._detect_chords()
+                runs[0][0][1](("B", []))
+                self.assertEqual(window.project.key, expected)
+                self.assertEqual("from E to B" in window.status.text(), expected == "B")
+
+    def test_key_cqt_window_shows_band_traces_per_source(self):
+        from audio_to_midi.key_view import KeyChromaDialog
+
+        window = self.window
+        mix_path = self._mix_only(seconds=4.0)
+        add_stem(window.project, mix_path, "bass")
+        window._update_actions()
+        action = window.actions["key_chroma"]
+        self.assertTrue(action.isEnabled())
+        from PySide6.QtWidgets import QMenu
+
+        menus = [m for m in action.associatedObjects() if isinstance(m, QMenu)]
+        self.assertEqual([m.title() for m in menus], ["&Advanced"])
+        self.assertEqual(menus[0].menuAction().associatedObjects()[0].title(), "&Model")
+        runs = []
+        window._run = lambda *args, **kwargs: runs.append(args)
+        cqt = np.zeros((88, 20), dtype=np.float32)
+        for pitch in (40, 59, 64, 68, 83):
+            cqt[pitch - 21] = 1.0
+        action.trigger()
+        dialog = window._key_dialog
+        self.assertIsInstance(dialog, KeyChromaDialog)
+        self.assertEqual([dialog.source.itemText(i) for i in range(dialog.source.count())],
+                         ["Key detection input", "Full mix", "Bass stem"])
+        with patch("audio_to_midi.ui.harmony_cqt", return_value=(cqt, None, cqt, 0.01, 1.0)):
+            work, accept = runs[-1][:2]
+            accept(work(lambda: False))
+        self.assertEqual(set(dialog.chart.profiles), {"Low", "Mid", "High", "All"})
+        self.assertEqual(dialog.chart.keys["All"], "E")
+        self.assertIn("E", dialog.message.text())
+        self.assertFalse(dialog.chart.grab().isNull())
+        dialog.shapes.setChecked(True)
+        for name, vector in dialog.chart._shown().items():
+            self.assertAlmostEqual(float(vector.sum()), 1.0, msg=name)
+        self.assertFalse(dialog.chart.grab().isNull())
+        dialog.source.setCurrentIndex(2)
+        self.assertEqual(dialog.chart.profiles, {})
+        with patch("audio_to_midi.ui.mix_cqt", return_value=(cqt, 0.01, 1.0)) as load:
+            work, accept = runs[-1][:2]
+            accept(work(lambda: False))
+        self.assertEqual(load.call_args.args[0], window.project.tracks[0].audio_path)
+        runs.clear()
+        dialog.source.setCurrentIndex(0)
+        self.assertEqual(runs, [], "results are cached per source")
+        self.assertEqual(dialog.chart.keys["All"], "E")
+        dialog.close()
 
     def test_missing_model_installs_before_analysis(self):
         window = self.window
@@ -399,6 +624,38 @@ class EditorTests(unittest.TestCase):
         self.assertIn("8 bars counted", window.status.text())
         self.assertRegex(window.status.text(), r"\b(7[5-9]|8[0-5]) ms late")
 
+    def test_chords_model_box_lists_chord_recognizers_in_sync_with_menu(self):
+        from PySide6.QtCore import QSettings
+
+        window = self.window
+        window.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
+        self._mix_only(seconds=2.0)
+        window.tracks.setCurrentIndex(window.tracks.findData("__chords__"))
+        self.assertTrue(window.models.isEnabled())
+        self.assertEqual([window.models.itemText(i) for i in range(window.models.count())],
+                         ["Built-in templates", "BTC transformer (deep learning)"])
+        self.assertEqual(window.models.currentData(), "template")
+        window.project.stages["preparation"] = {"warp_revision": "warp"}
+        with patch.object(window, "_detect_chords") as detect:
+            window.models.setCurrentIndex(window.models.findData("btc"))
+            self.app.processEvents()
+            self.assertEqual(detect.call_count, 1)
+            self.assertIn("BTC", window.status.text())
+            self.assertTrue(window.actions["chord_btc"].isChecked())
+            self.assertEqual(window.chord_model, "btc")
+            self.assertEqual(window.settings.value("chords/model"), "btc")
+            window.actions["chord_template"].trigger()
+            self.app.processEvents()
+            self.assertEqual(detect.call_count, 2)
+        self.assertEqual(window.models.currentData(), "template")
+        self.assertEqual(window.settings.value("chords/model"), "template")
+        window.project.stages.pop("preparation")
+        with patch.object(window, "_detect_chords") as detect:
+            window.actions["chord_btc"].trigger()
+            self.app.processEvents()
+        detect.assert_not_called()  # unwarped: nothing to detect yet
+        self.wait_idle()
+
     def test_chords_view_edits_with_undo(self):
         from audio_to_midi.domain import ChordSegment
 
@@ -421,12 +678,108 @@ class EditorTests(unittest.TestCase):
         self.app.processEvents()
         self.assertFalse(window.grab().toImage().isNull())
 
+    def test_chroma_display_suppresses_adjacent_bin_leakage(self):
+        view = self.window.chord_view
+        view.project = self.window.project
+        view.cqt = np.zeros((88, 100), dtype=np.float32)
+        view.cqt[66 - 21] = 1.0
+        view.cqt[65 - 21] = 0.9
+        view.cqt[67 - 21] = 0.9
+        view.frame_seconds = 0.01
+        self.assertIsNotNone(view._chroma_image())
+        self.assertEqual(int(view._image_buffer[11 - 6, 0, 0]), 250)
+        self.assertEqual(int(view._image_buffer[11 - 5, 0, 0]), 20)
+        self.assertEqual(int(view._image_buffer[11 - 7, 0, 0]), 20)
+
+    def test_chroma_display_is_scaled_to_the_whole_song(self):
+        view = self.window.chord_view
+        view.project = self.window.project
+        view.cqt = np.zeros((88, 200), dtype=np.float32)
+        view.cqt[60 - 21, :100] = 1.0  # loud C for the first half
+        view.cqt[60 - 21, 100:] = 1 - 40 / 60  # same C, 40 dB quieter
+        view.frame_seconds = 0.01
+        view.start, view.end = F(0), F(4)  # 0-2 s at 120 BPM
+        view._chroma_image()
+        loud = int(view._image_buffer[11, :, 0].max())
+        quiet = int(view._image_buffer[11, 110:, 0].max())
+        self.assertEqual(loud, 250)
+        self.assertLess(quiet, 30)
+
+    def test_zoom_buttons_and_song_scaled_piano_roll_spectrum(self):
+        window = self.window
+        rate = 8000
+        seconds = np.arange(rate * 4) / rate
+        loud = np.sin(2 * np.pi * 220 * seconds) * .5
+        mix_path = self.root / "mix.wav"
+        sf.write(mix_path, np.concatenate([loud, loud * 10 ** (-40 / 20)]), rate)
+        window.project.tracks.clear()
+        window.folder = self.root / "project"
+        window.folder.mkdir()
+        with patch.object(window, "_detect"):
+            window._set_mix(mix_path)
+        self.wait_cqt()
+        loud_red = int(window.timeline._cqt_buffer[..., 0].max())
+        window._navigate(1)  # bars 3-4: the quiet half
+        quiet_red = int(window.timeline._cqt_buffer[..., 0].max())
+        self.assertGreater(loud_red, 200)
+        self.assertLess(quiet_red, 60)
+
+        self.assertEqual(window.zoom_label.text(), "2 bars/screen")
+        window.actions["zoom_out"].trigger()
+        self.assertEqual(window.bars, 4)
+        self.assertEqual(window.timeline.end - window.timeline.start, 4 * window.project.grid.bar_beats)
+        self.assertEqual(window.zoom_label.text(), "4 bars/screen")
+        for _ in range(5):
+            window.actions["zoom_in"].trigger()
+        self.assertEqual(window.bars, 1)
+        self.assertFalse(window.actions["zoom_in"].isEnabled())
+        self.assertTrue(window.actions["zoom_out"].isEnabled())
+
+    def test_chord_recognizer_option_downloads_btc_and_routes_detection(self):
+        from PySide6.QtCore import QSettings
+        from audio_to_midi import provision
+
+        window = self.window
+        window.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
+        window.project.stages["preparation"] = {"warp_revision": "warp"}
+        self.assertEqual(window.chord_model, "template")
+        with patch.object(window, "_detect_chords") as detect:
+            window.actions["chord_btc"].trigger()
+            self.app.processEvents()
+        detect.assert_called_once()
+        self.assertEqual(window.chord_model, "btc")
+        self.assertEqual(window.settings.value("chords/model"), "btc")
+        self.assertFalse(window.actions["chord_template"].isChecked())
+
+        with patch.object(provision, "missing", return_value=["BTC chord weights (~12 MB)"]), \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as asked, \
+                patch.object(window, "_run") as run:
+            window._detect_chords()
+        self.assertIn("12 MB", asked.call_args.args[2])
+        run.assert_not_called()
+
+        with patch.object(provision, "missing", return_value=["BTC chord weights (~12 MB)"]), \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
+                patch.object(window, "_run") as run:
+            window._detect_chords()
+        self.assertEqual(run.call_args.kwargs["kind"], "install")
+        with patch.object(provision, "ensure") as ensure:
+            run.call_args.args[0](lambda: False, lambda text: None)
+        self.assertEqual(ensure.call_args.args[0], "btc")
+        self.assertNotIn("btc", window._installing)
+
+        with patch.object(provision, "missing", return_value=[]), patch.object(window, "_run") as run, \
+                patch("audio_to_midi.ui.analyze_harmony", return_value=("C", [])) as analyze:
+            window._detect_chords()
+            run.call_args.args[0](lambda: False)
+        self.assertEqual(analyze.call_args.args[2], "btc")
+        self.assertIn("BTC", run.call_args.kwargs["message"])
+
     def test_chord_detection_rejects_results_after_newer_edits(self):
         from audio_to_midi.domain import ChordSegment
 
         window = self.window
         window.project.stages["preparation"] = {"warp_revision": "warp"}
-        window.timing["confirmed"] = True
         window.project.chords = [ChordSegment(F(0), F(4), "C")]
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
             with patch.object(window, "_run") as run:
@@ -483,7 +836,7 @@ class EditorTests(unittest.TestCase):
         window.show()
         self.app.processEvents()
         self.assertEqual((timeline.low, timeline.high), (28, 67))
-        self.assertIsNotNone(timeline.cqt)
+        self.wait_cqt()
         self.assertEqual(timeline.cqt.height(), 88)
 
         def point(beat, pitch):
@@ -522,7 +875,7 @@ class EditorTests(unittest.TestCase):
         self.window._add_note(F(5, 2), 63)
         note = self.window._rows[0]
         self.assertEqual(note_summary(self.window.project, note),
-                         f"D#4 (63) \u00b7 bar 1, beat 3 1/2 \u00b7 1 beat (quarter) \u00b7 velocity {note.velocity}")
+                         f"Eb4 (63) \u00b7 bar 1, beat 3 1/2 \u00b7 1 beat (quarter) \u00b7 velocity {note.velocity}")
 
     def test_info_tool_edits_and_deletes_a_clicked_note(self):
         from PySide6.QtCore import QPoint, Qt

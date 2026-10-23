@@ -11,9 +11,9 @@ from PySide6.QtWidgets import QInputDialog, QMenu, QWidget
 
 from audio_to_midi import chords as chord_logic
 from audio_to_midi.domain import ChordSegment
+from audio_to_midi.notation import spelling
 from audio_to_midi.spectrogram import LOW_PITCH
 
-PITCH_ROWS = ("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
 
 
 class ChordView(QWidget):
@@ -27,6 +27,7 @@ class ChordView(QWidget):
     AMPLITUDE = 56
     LANE = 34
     FOOTER = 4
+    CHROMA_RANGE_DB = 40.0  # power below the song reference that maps to black
     EDGE = 5
 
     def __init__(self, parent=None):
@@ -46,6 +47,8 @@ class ChordView(QWidget):
         self._image: QImage | None = None
         self._image_buffer = None
         self._image_key = None
+        self._reference_source = None
+        self._reference = 0.0
         self._drag = None
 
     # Geometry -------------------------------------------------------------
@@ -84,6 +87,15 @@ class ChordView(QWidget):
         return None
 
     # Painting -------------------------------------------------------------
+    def _song_reference(self) -> float:
+        """99th percentile of each frame's strongest pitch-class power over the whole song."""
+        if self._reference_source is not self.cqt:
+            peaks = chord_logic.fold_chroma(chord_logic.harmonic_power(self.cqt), LOW_PITCH, "max").max(axis=0)
+            sounding = peaks[peaks > 0]
+            self._reference = float(np.percentile(sounding, 99)) if len(sounding) else 0.0
+            self._reference_source = self.cqt
+        return self._reference
+
     def _chroma_image(self) -> QImage | None:
         if self.cqt is None or not self.cqt.size or not self.frame_seconds:
             return None
@@ -97,8 +109,13 @@ class ChordView(QWidget):
         if hi <= lo:
             self._image = None
             return None
-        chroma = chord_logic.fold_chroma(self.cqt[:, lo:hi] ** 4, LOW_PITCH, "max")
-        chroma = chroma / np.maximum(chroma.max(axis=0, keepdims=True), 1e-6)
+        power = chord_logic.harmonic_power(self.cqt[:, lo:hi])
+        chroma = chord_logic.fold_chroma(power, LOW_PITCH, "max")
+        # dB relative to the whole song's loud frames, so quiet or empty bars stay dark
+        # while weaker chord tones (typically 10-25 dB down) remain visible.
+        reference = max(self._song_reference(), 1e-12)
+        decibels = 10 * np.log10(np.maximum(chroma / reference, 1e-12))
+        chroma = 1 + decibels / self.CHROMA_RANGE_DB
         rows = np.clip(chroma[::-1], 0, 1)  # B on top
         rgb = np.stack([
             (20 + 230 * rows ** 1.5), (24 + 170 * rows ** 2), (36 + 60 * rows),
@@ -141,10 +158,11 @@ class ChordView(QWidget):
         if image is not None:
             left, right = (self._seconds_x(s) for s in self._image_span)
             painter.drawImage(QRectF(left, chroma_top, right - left, 12 * row), image)
+        rows = spelling(self._key())
         for pc in range(12):
             top = chroma_top + (11 - pc) * row
             painter.setPen(QColor("#d9dde4"))
-            painter.drawText(QRectF(2, top, self.LABELS - 6, row), Qt.AlignmentFlag.AlignVCenter, PITCH_ROWS[pc])
+            painter.drawText(QRectF(2, top, self.LABELS - 6, row), Qt.AlignmentFlag.AlignVCenter, rows[pc])
         # Bar and beat lines.
         unit = Fraction(4, grid.denominator)
         beat = (self.start // unit) * unit
@@ -175,7 +193,7 @@ class ChordView(QWidget):
             painter.setPen(QPen(QColor("#ffffff" if index == self.selected else "#0d1118"), 2 if index == self.selected else 1))
             painter.drawRect(rect)
             painter.setPen(QColor("#0d1118" if not none else "#c3cad6"))
-            painter.drawText(rect.adjusted(4, 0, -2, 0), Qt.AlignmentFlag.AlignVCenter, segment.symbol)
+            painter.drawText(rect.adjusted(4, 0, -2, 0), Qt.AlignmentFlag.AlignVCenter, self._spell(segment.symbol))
             tones = chord_logic.pitch_classes(segment.symbol)
             parsed = chord_logic.parse(segment.symbol)
             for pc in tones:
@@ -254,7 +272,7 @@ class ChordView(QWidget):
         if segment.alternatives:
             alternatives = menu.addMenu("Alternatives")
             for name in segment.alternatives:
-                alternatives.addAction(name, lambda n=name: self.set_symbol(index, n))
+                alternatives.addAction(self._spell(name), lambda n=name: self.set_symbol(index, n))
         menu.addSeparator()
         split = menu.addAction("Split at this beat", lambda: self.split(index, beat))
         split.setEnabled(segment.start < beat < segment.end)
@@ -263,13 +281,19 @@ class ChordView(QWidget):
         menu.addAction("No chord (N.C.)", lambda: self.set_symbol(index, chord_logic.NO_CHORD))
         menu.exec(where)
 
+    def _key(self) -> str:
+        return self.project.key if self.project else ""
+
+    def _spell(self, symbol: str) -> str:
+        return chord_logic.spell(symbol, self._key())
+
     # Edits ----------------------------------------------------------------
     def _emit(self, segments) -> None:
         self.changed.emit(sorted(segments, key=lambda c: c.start))
 
     def type_symbol(self, index: int) -> None:
         segment = self.segments[index]
-        text, ok = QInputDialog.getText(self, "Chord", "Chord symbol (e.g. Am7, C/E, F#m7b5, N.C.)", text=segment.symbol)
+        text, ok = QInputDialog.getText(self, "Chord", "Chord symbol (e.g. Am7, C/E, F#m7b5, N.C.)", text=self._spell(segment.symbol))
         if ok and text.strip():
             self.set_symbol(index, text)
 

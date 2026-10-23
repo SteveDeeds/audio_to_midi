@@ -20,6 +20,26 @@ class SpectrogramTests(unittest.TestCase):
         self.assertEqual(float(cqt_image(np.zeros(16000), 8000).max()), 0)
         self.assertEqual(cqt_image(np.zeros(0), 8000).shape[1], 0)
 
+    def test_song_reference_keeps_quiet_windows_dark(self):
+        import tempfile, os
+        import soundfile as sf
+        from audio_to_midi.spectrogram import FLOOR_DB, song_reference
+
+        rate = 22050
+        time = np.arange(rate * 2) / rate
+        loud = np.sin(2 * np.pi * 110 * time) * .5
+        quiet = loud * 10 ** (-30 / 20)
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, "song.wav")
+            sf.write(path, np.concatenate([loud, quiet]), rate)
+            reference = song_reference(path)
+        self_scaled = cqt_image(quiet, rate)
+        song_scaled = cqt_image(quiet, rate, reference)
+        self.assertAlmostEqual(float(self_scaled.max()), 1.0, places=3)
+        # 30 dB below the song's loud part: about half way down a 60 dB scale.
+        self.assertAlmostEqual(float(song_scaled.max()), 1 - 30 / FLOOR_DB, delta=.05)
+        self.assertEqual(float(cqt_image(loud * 4, rate, reference).max()), 1.0)
+
     def test_colorize_puts_high_pitches_on_top(self):
         image = np.zeros((88, 4), dtype=np.float32)
         image[-1] = 1

@@ -1,6 +1,6 @@
 """Main window of the v2 application: menu bar, Mix / track / Chords views and background jobs.
 
-Stages: import mix -> detect beats -> count bars (tap or pin) -> warp -> confirm timing
+Stages: import mix -> detect beats -> count bars (tap or pin) -> warp
 -> separate or import stems -> transcribe notes -> chords -> export.
 """
 
@@ -25,9 +25,9 @@ from audio_to_midi import beats as beat_logic
 from audio_to_midi.adapters import Cancelled, MODELS
 from audio_to_midi.pipeline import Cancelled as PreparationCancelled
 from audio_to_midi.application import (
-    TranscriptionService, add_stem, adopt_warp, analyze_harmony, complete, covered, current_warp,
-    detect_key, import_profile, mark_project_edited, mix_cqt, publish, record_drum, record_onset,
-    replace_stem, stale, token, track_end,
+    CHORD_MODELS, HARMONY_ROLES, TranscriptionService, add_stem, adopt_warp, analyze_harmony, complete, covered, current_warp,
+    detect_key, harmony_cqt, harmony_sources, import_profile, key_from_chroma, mark_project_edited, media_identity,
+    mix_cqt, publish, record_drum, record_onset, replace_stem, stale, stems_for_chords, token, track_end,
 )
 from audio_to_midi.chord_view import ChordView
 from audio_to_midi.dialogs import NoteInfoDialog, PlaybackSettingsDialog, TimingDialog, WarpDialog
@@ -37,8 +37,8 @@ from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, parse_number, position,
 )
 from audio_to_midi.preview import SYNC_TEST_PITCH, click_track, midi_outputs, mix, render_notes
-from audio_to_midi.spectrogram import colorize, cqt_image
-from audio_to_midi.storage import load_project, save_project
+from audio_to_midi.spectrogram import colorize, cqt_image, song_reference
+from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline  # noqa: F401  (re-exported)
 from audio_to_midi.timing import BeatSession
@@ -54,6 +54,14 @@ ROLE_WORDS = {
     "piano": ("piano", "keys", "key"), "guitar": ("guitar", "gtr"), "other": ("other", "rest", "inst"),
 }
 BEAT_TOLERANCE = 0.15
+
+
+def _harmony_identity(project: Project):
+    """Which audio files (and versions) chord detection would read; None without any."""
+    try:
+        return harmony_sources(project).identity()
+    except ValueError:
+        return None
 
 
 def guess_role(path: Path) -> str | None:
@@ -91,6 +99,8 @@ class Job(QThread):
 
 
 class ProjectWindow(QMainWindow):
+    reference_ready = Signal(object, float)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Audio to MIDI v2")
@@ -112,7 +122,12 @@ class ProjectWindow(QMainWindow):
         self._rows = []
         self._building = False
         self._cqt_cache: dict[tuple, tuple] = {}
+        self._references: dict[tuple, float] = {}  # (path, mtime) -> whole-song CQT peak
+        self._reference_jobs: set[tuple] = set()
+        self.reference_ready.connect(self._reference_ready)
         self._mix_data: dict[tuple, tuple] = {}
+        self._key_dialog = None
+        self._key_chroma: dict[tuple, dict] = {}
         self.session: BeatSession | None = None
         self.check: list[float] | None = None
         self.taps: list[float] = []
@@ -122,6 +137,7 @@ class ProjectWindow(QMainWindow):
         self.tool_buttons: dict[str, QToolButton] = {}
         self._build()
         self._sync_tracks()
+        self._saved_project = deepcopy(self.project)
 
     # -- state ------------------------------------------------------------
     @property
@@ -137,16 +153,12 @@ class ProjectWindow(QMainWindow):
     @property
     def timing(self) -> dict:
         return self.project.stages.setdefault("timing", {
-            "source": self.project.mix_path, "beats": None, "check": None, "confirmed": False,
+            "source": self.project.mix_path, "beats": None, "check": None,
         })
 
     @property
     def warped(self) -> bool:
         return "preparation" in self.project.stages
-
-    @property
-    def confirmed(self) -> bool:
-        return self.warped and bool(self.project.stages.get("timing", {}).get("confirmed"))
 
     @property
     def tapping(self) -> bool:
@@ -195,7 +207,6 @@ class ProjectWindow(QMainWindow):
         self._act(edit, "set_timing", "Set tempo, meter, and &key...", self._edit_timing)
         edit.addSeparator()
         self._act(edit, "warp", "&Warp mix to tempo...", self._warp)
-        self._act(edit, "confirm", "Timing &confirmed", self._set_confirmed, checkable=True)
         self._act(edit, "unwarp", "Return to original mix...", self._unwarp)
         edit.addSeparator()
         self._act(edit, "separate", "&Separate stems...", self._separate)
@@ -230,6 +241,20 @@ class ProjectWindow(QMainWindow):
         model.addSeparator()
         self._act(model, "profile", "Import onset profile...", self._profile)
         self._act(model, "cancel", "&Cancel analysis", self._cancel, "Esc")
+        model.addSeparator()
+        recognizers = model.addMenu("C&hord recognizer")
+        group = QActionGroup(self)
+        saved = self.settings.value("chords/model", "template")
+        for name, text in CHORD_MODELS.items():
+            action = self._act(recognizers, f"chord_{name}", text,
+                               lambda checked, n=name: self._chord_model_chosen(n) if checked else None,
+                               checkable=True)
+            group.addAction(action)
+            action.setChecked(name == saved)
+        if group.checkedAction() is None:
+            self.actions["chord_template"].setChecked(True)
+        advanced = model.addMenu("&Advanced")
+        self._act(advanced, "key_chroma", "Show &key CQT...", self._show_key_chroma)
 
         helper = bar.addMenu("&Help")
         self._act(helper, "help", "&Getting started", self._help, "F1")
@@ -251,7 +276,7 @@ class ProjectWindow(QMainWindow):
         row.addWidget(self.models)
         row.addStretch(1)
         self.stages = QLabel()
-        self.stages.setToolTip("Workflow: import the mix, count bars, warp, confirm the timing, then stems.")
+        self.stages.setToolTip("Workflow: import the mix, count bars, warp, then stems.")
         row.addWidget(self.stages)
         root.addLayout(row)
 
@@ -275,6 +300,15 @@ class ProjectWindow(QMainWindow):
                 self.window_label.setMinimumWidth(90)
                 self.window_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
                 row.addWidget(self.window_label)
+        for name, text in (("zoom_out", "Zoom out (-)"), ("zoom_in", "Zoom in (+)")):
+            button = QToolButton()
+            button.setDefaultAction(self.actions[name])
+            button.setText(text)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            row.addWidget(button)
+        self.zoom_label = QLabel()
+        self.zoom_label.setToolTip("Bars shown per screen (Ctrl+wheel also zooms)")
+        row.addWidget(self.zoom_label)
         row.addSpacing(16)
         row.addWidget(QLabel("Grid:"))
         self.grid_choice = QComboBox()
@@ -371,6 +405,9 @@ class ProjectWindow(QMainWindow):
         first = bar_and_beat(grid, self.timeline.start)[0]
         last = bar_and_beat(grid, max(self.timeline.start, self.timeline.end - grid.subdivision))[0]
         self.window_label.setText(f"Bar {first}" if first == last else f"Bars {first}\u2013{last}")
+        self.zoom_label.setText(f"{self.bars} bar{'s' if self.bars != 1 else ''}/screen")
+        self.actions["zoom_in"].setEnabled(self.bars > ZOOMS[0])
+        self.actions["zoom_out"].setEnabled(self.bars < ZOOMS[-1])
         index = self.grid_choice.findData(grid.subdivision)
         self._building, building = True, self._building
         if index < 0:
@@ -396,7 +433,7 @@ class ProjectWindow(QMainWindow):
             f"Key: {self.project.key or '-'}",
         ]
         if self.warped:
-            parts.append("warped" + (", timing confirmed" if self.confirmed else ""))
+            parts.append("warped")
         track = self.active
         if track:
             parts.append("stale stem - re-separate or re-import" if stale(self.project, track) else (
@@ -412,15 +449,15 @@ class ProjectWindow(QMainWindow):
         stems = len(self.project.tracks)
         return (
             f"Mix {mark(bool(self.project.mix_path))} \u203a Count bars {mark(counted)} \u203a "
-            f"Warp {mark(self.warped)} \u203a Confirm {mark(self.confirmed)} \u203a Stems ({stems})"
+            f"Warp {mark(self.warped)} \u203a Stems ({stems})"
         )
 
     def _update_actions(self) -> None:
         has_mix, track, busy = bool(self.project.mix_path), self.active, self.job is not None
-        warped, confirmed, tapping = self.warped, self.confirmed, self.tapping
+        warped, tapping = self.warped, self.tapping
         transcribable = track is not None and track.role != "other"
         rules = {
-            "import_stems": (confirmed, "Warp the mix and tick Edit > Timing confirmed first."),
+            "import_stems": (warped, "Warp the mix first (Edit > Warp mix to tempo)."),
             "import_midi": (track is not None, "Choose a track first."),
             "import_chords": (has_mix, "Import a mix first."),
             "export": (bool(self.project.tracks or self.project.chords), "Nothing to export yet."),
@@ -430,10 +467,9 @@ class ProjectWindow(QMainWindow):
                     "Detect tempo first; tapping counts bars before the mix is warped."),
             "warp": (has_mix and not warped,
                      "Import a mix first." if not has_mix else "Already warped - use Return to original mix to redo."),
-            "confirm": (warped, "Warp the mix first."),
             "unwarp": (warped, "The mix is not warped."),
-            "separate": (confirmed, "Warp the mix and tick Edit > Timing confirmed first."),
-            "chords": (has_mix and confirmed, "Warp the mix and tick Edit > Timing confirmed first."),
+            "separate": (warped, "Warp the mix first (Edit > Warp mix to tempo)."),
+            "chords": (has_mix and warped, "Warp the mix first (Edit > Warp mix to tempo)."),
             "clear_track": (track is not None, "Choose a track first."),
             "clear_all": (bool(self.project.tracks or self.project.chords), "Nothing to clear."),
             "analyze": (transcribable and not stale(self.project, track),
@@ -442,15 +478,12 @@ class ProjectWindow(QMainWindow):
                             "Choose a transcribable, up-to-date stem."),
             "profile": (track is not None, "Choose a track first."),
             "cancel": (busy, "Nothing is running."),
+            "key_chroma": (has_mix, "Import a mix first."),
         }
         for name, (ok, why) in rules.items():
             action = self.actions[name]
             action.setEnabled(bool(ok))
             action.setToolTip("" if ok else why)
-        confirm = self.actions["confirm"]
-        confirm.blockSignals(True)
-        confirm.setChecked(confirmed)
-        confirm.blockSignals(False)
         for key in ("D", "U"):
             self.shortcuts[key].setEnabled(self.view == MIX)
         self.cancel_button.setVisible(busy)
@@ -494,8 +527,8 @@ class ProjectWindow(QMainWindow):
         bad = sum(v > 30 for v in values)
         return (
             f"Warped mix check: {len(values)} beats, median {np.median(values):.0f} ms and max {max(values):.0f} ms "
-            f"from the grid; {bad} off by more than 30 ms (red). Listen with View > Metronome click, then tick "
-            "Edit > Timing confirmed."
+            f"from the grid; {bad}             off by more than 30 ms (red). Listen with View > Metronome click, then Edit > Separate stems; "
+            "if it drifts, use Edit > Return to original mix and recount."
         )
 
     # -- tracks and views ---------------------------------------------------
@@ -523,12 +556,17 @@ class ProjectWindow(QMainWindow):
         self._building = True
         self.models.clear()
         track = self.active
+        view = self.view
         if track and MODELS[track.role]:
             self.models.addItems(MODELS[track.role])
             self.models.setCurrentText(track.model)
-        self.models.setEnabled(bool(track and MODELS[track.role]))
+        elif view == CHORDS:
+            for name, text in CHORD_MODELS.items():
+                self.models.addItem(text, name)
+            self.models.setCurrentIndex(self.models.findData(self.chord_model))
+        self.models.setEnabled(bool(track and MODELS[track.role]) or view == CHORDS)
+        self.models.setToolTip("Chord recognizer used by Edit > Detect chords" if view == CHORDS else "")
         self._building = False
-        view = self.view
         self.timeline.set_role(track.role if track else (MIX if view == MIX else None))
         self.timeline.selected = None
         self.timeline.selected_beat = None
@@ -562,10 +600,11 @@ class ProjectWindow(QMainWindow):
         if not path or not Path(path).exists():
             return
         grid = self.project.grid
-        key = (
-            path, Path(path).stat().st_mtime_ns, grid.bpm, grid.offset_seconds,
-            self.timeline.start, self.timeline.end,
-        )
+        ident = (path, Path(path).stat().st_mtime_ns)
+        reference = self._references.get(ident)
+        if reference is None:
+            self._request_reference(ident)
+        key = (*ident, grid.bpm, grid.offset_seconds, self.timeline.start, self.timeline.end, reference)
         if key not in self._cqt_cache:
             # Read only the visible window; never load a whole file on the UI thread.
             with sf.SoundFile(path) as audio:
@@ -581,7 +620,9 @@ class ProjectWindow(QMainWindow):
                 envelope = np.array([
                     np.max(np.abs(segment[i:i + stride])) for i in range(0, len(segment), stride)
                 ])
-                rgb = colorize(cqt_image(segment, rate))
+                # Until the whole-song level is known, show no spectrum rather than a self-normalized one.
+                if reference is not None:
+                    rgb = colorize(cqt_image(segment, rate, reference))
             if len(self._cqt_cache) >= 24:
                 self._cqt_cache.pop(next(iter(self._cqt_cache)))
             self._cqt_cache[key] = envelope, (start / rate, (start + len(segment)) / rate), rgb
@@ -589,18 +630,45 @@ class ProjectWindow(QMainWindow):
         self.timeline.envelope, self.timeline.audio_span = envelope, span
         self.timeline.set_cqt(rgb)
 
+    def _request_reference(self, ident: tuple) -> None:
+        """Measure a file's whole-song CQT peak once, off the UI thread."""
+        if ident in self._reference_jobs:
+            return
+        self._reference_jobs.add(ident)
+
+        def work():
+            try:
+                value = song_reference(ident[0])
+            except Exception:
+                value = 0.0
+            try:
+                self.reference_ready.emit(ident, value)
+            except RuntimeError:  # window already closed
+                pass
+
+        threading.Thread(target=work, daemon=True, name="cqt-reference").start()
+
+    def _reference_ready(self, ident: tuple, value: float) -> None:
+        self._reference_jobs.discard(ident)
+        self._references[ident] = value
+        path = self._audio_path()
+        if path and Path(path).exists() and (path, Path(path).stat().st_mtime_ns) == ident:
+            self._load_envelope()
+            self.timeline.update()
+
     def _load_mix_data(self) -> None:
-        """Whole-mix CQT and amplitude for the Chords view, computed once per mix file."""
+        """Chord-view spectrum (the audio chord detection uses) and mix amplitude, cached per source."""
         path = self.project.mix_path
         if not path or not Path(path).exists():
             return
-        key = (path, Path(path).stat().st_mtime_ns)
+        key = (path, Path(path).stat().st_mtime_ns, _harmony_identity(self.project))
         if key in self._mix_data:
             self._show_mix_data(self._mix_data[key])
             return
+        project = deepcopy(self.project)
 
         def work(cancelled):
-            cqt, frame_seconds, _ = mix_cqt(path, cancelled)
+            cqt, _, _, frame_seconds, _ = harmony_cqt(project, cancelled)
             with sf.SoundFile(path) as audio:
                 rate = audio.samplerate
                 data = audio.read(dtype="float32", always_2d=True).mean(axis=1)
@@ -616,7 +684,7 @@ class ProjectWindow(QMainWindow):
             if self.view == CHORDS:
                 self._show_mix_data(value)
 
-        self._run(work, accept, kind="mix", message="Computing the chord view spectrum of the mix...")
+        self._run(work, accept, kind="mix", message="Computing the chord view spectrum...")
 
     def _show_mix_data(self, value) -> None:
         cqt, frame_seconds, envelope, step = value
@@ -624,7 +692,82 @@ class ProjectWindow(QMainWindow):
         view.cqt, view.frame_seconds, view.envelope, view.envelope_step = cqt, frame_seconds, envelope, step
         view.update()
 
+    def _show_key_chroma(self) -> None:
+        """Model > Advanced > Show key CQT: folded pitch-class energy per register for a chosen audio."""
+        from audio_to_midi.key_view import KeyChromaDialog
+
+        if not self.project.mix_path:
+            raise ValueError("Import a mix first.")
+        sources = [("key", "Key detection input"), ("mix", "Full mix")] + [
+            (track.id, f"{track.role.title()} stem" + (" (stale)" if stale(self.project, track) else ""))
+            for track in self.project.tracks if track.audio_path and Path(track.audio_path).exists()
+        ]
+        if self._key_dialog is not None:
+            self._key_dialog.close()
+        dialog = self._key_dialog = KeyChromaDialog(self, sources)
+        dialog.source_changed.connect(lambda source: self._guard(lambda: self._load_key_chroma(source)))
+        dialog.show()
+        self._load_key_chroma(dialog.current())
+
+    def _load_key_chroma(self, source: str) -> None:
+        from audio_to_midi.chords import band_chroma
+        from audio_to_midi.notation import spelling
+        from audio_to_midi.spectrogram import LOW_PITCH
+
+        dialog, project = self._key_dialog, deepcopy(self.project)
+        track = next((t for t in project.tracks if t.id == source), None)
+        path = track.audio_path if track else project.mix_path
+        identity = (source, _harmony_identity(project) if source == "key" else media_identity(path))
+
+        def show(profiles):
+            if dialog is not self._key_dialog or dialog.current() != source:
+                return
+            keys = {name: key_from_chroma(vector) if vector.any() else "" for name, vector in profiles.items()}
+            dialog.show_result(profiles, spelling(self.project.key), keys)
+
+        if identity in self._key_chroma:
+            show(self._key_chroma[identity])
+            return
+
+        def work(cancelled):
+            cqt = harmony_cqt(project, cancelled)[2] if source == "key" else mix_cqt(path, cancelled)[0]
+            return band_chroma(cqt, LOW_PITCH)
+
+        def accept(profiles):
+            self._key_chroma[identity] = profiles
+            show(profiles)
+
+        dialog.set_message("Computing the CQT of the whole song...")
+        self._run(work, accept, kind="mix", message="Computing the key CQT...")
+
+    def _chord_model_chosen(self, name: str) -> None:
+        self.settings.setValue("chords/model", name)
+        if self.view == CHORDS and self.models.currentData() != name:
+            self._building = True
+            self.models.setCurrentIndex(self.models.findData(name))
+            self._building = False
+        self._redetect_with(name)
+
+    def _redetect_with(self, name: str) -> None:
+        """Switching recognizer re-runs detection so the change is visible right away."""
+        if self.warped:
+            self.status.setText(f"Chord recognizer: {CHORD_MODELS[name]}. Detecting chords...")
+            QTimer.singleShot(0, self._detect_chords_safely)
+
+    def _detect_chords_safely(self) -> None:
+        try:
+            self._detect_chords()
+        except Exception as error:
+            QMessageBox.warning(self, "Detect chords", str(error))
+
     def _model_changed(self, model: str) -> None:
+        if not self._building and self.view == CHORDS and not self.active:
+            name = self.models.currentData()
+            if name in CHORD_MODELS and not self.actions[f"chord_{name}"].isChecked():
+                self.actions[f"chord_{name}"].setChecked(True)
+                self.settings.setValue("chords/model", name)
+                self._redetect_with(name)
+            return
         if not self._building and self.active and model:
             self._cancel(analysis_only=True)
             self.active.model = model
@@ -1063,8 +1206,11 @@ class ProjectWindow(QMainWindow):
 
     # -- project files ----------------------------------------------------
     def _confirm_replace(self) -> bool:
-        return not (self.project.tracks or self.project.mix_path or self.project.chords) or QMessageBox.question(
-            self, "Replace open project", "Unsaved changes will be lost. Continue?",
+        if self.session is not None or self.check is not None or "timing" in self.project.stages:
+            self._store_timing()
+        return self.project == self._saved_project or QMessageBox.question(
+            self, "Unsaved changes", "Unsaved changes will be lost. Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No,
         ) == QMessageBox.StandardButton.Yes
 
     def _reset_state(self) -> None:
@@ -1077,8 +1223,13 @@ class ProjectWindow(QMainWindow):
             grid = self.project.grid
             self.session = BeatSession.from_json(timing["beats"], grid.numerator, grid.denominator)
         self.check = timing.get("check")
+        if self._key_dialog is not None:
+            self._key_dialog.close()
+            self._key_dialog = None
+        self._key_chroma.clear()
         self._set_window(Fraction(0))
         self._sync_tracks()
+        self._saved_project = deepcopy(self.project)
 
     def _new(self) -> None:
         if not self._confirm_replace():
@@ -1112,9 +1263,31 @@ class ProjectWindow(QMainWindow):
             return
         self._cancel()
         self._stop()
+        copied = self._bring_media_in(loaded, Path(folder))
+        if copied:
+            save_project(loaded, Path(folder))
         self.project, self.folder = loaded, Path(folder)
         self._reset_state()
-        self.status.setText(f"Opened {folder}.")
+        self.status.setText(f"Opened {folder}." + (f" Copied the original mix into the project ({copied})." if copied else ""))
+
+    @staticmethod
+    def _bring_media_in(project: Project, folder: Path) -> str:
+        """Copy an original mix that lives outside the project folder into its audio/ subfolder."""
+        timing = project.stages.get("timing")
+        sources = {p for p in (project.mix_path, timing.get("source") if timing else None) if p}
+        moved = {}
+        for source in sources:
+            path = Path(source)
+            if path.is_file() and not path.resolve().is_relative_to(folder.resolve()):
+                try:
+                    moved[source] = str(import_media(path, folder))
+                except OSError:
+                    continue
+        if project.mix_path in moved:
+            project.mix_path = moved[project.mix_path]
+        if timing and timing.get("source") in moved:
+            timing["source"] = moved[timing["source"]]
+        return ", ".join(sorted(Path(p).name for p in moved.values()))
 
     def _store_timing(self) -> None:
         timing = self.timing
@@ -1132,9 +1305,11 @@ class ProjectWindow(QMainWindow):
                 ) != QMessageBox.StandardButton.Yes:
                     return
             self.folder = Path(folder)
+        self._bring_media_in(self.project, self.folder)
         if self.session is not None or self.check is not None or "timing" in self.project.stages:
             self._store_timing()
         save_project(self.project, self.folder)
+        self._saved_project = deepcopy(self.project)
         self.status.setText(f"Saved {self.folder}")
 
     def _import_mix(self) -> None:
@@ -1154,8 +1329,10 @@ class ProjectWindow(QMainWindow):
             return
         self._cancel()
         self._stop()
+        if self.folder is not None:
+            path = import_media(path, self.folder)
         self.project.stages.pop("preparation", None)
-        self.project.stages["timing"] = {"source": str(path), "beats": None, "check": None, "confirmed": False}
+        self.project.stages["timing"] = {"source": str(path), "beats": None, "check": None}
         self.project.mix_path = str(path)
         self.project.revision += 1
         for track in self.project.tracks:
@@ -1167,8 +1344,8 @@ class ProjectWindow(QMainWindow):
         self._detect()
 
     def _import_stems(self) -> None:
-        if not self.confirmed:
-            raise ValueError("Warp the mix and tick Edit > Timing confirmed before importing stems.")
+        if not self.warped:
+            raise ValueError("Warp the mix before importing stems.")
         paths, _ = QFileDialog.getOpenFileNames(self, "Import stems aligned to the warped mix", filter="Audio (*.wav *.flac)")
         last = None
         for name in paths:
@@ -1570,7 +1747,6 @@ class ProjectWindow(QMainWindow):
 
     def _adopt(self, store, warp_id: str) -> None:
         adopt_warp(self.project, store, warp_id)
-        self.timing["confirmed"] = False
         self.check = None
         self._store_timing()
         for track in self.project.tracks:
@@ -1599,7 +1775,6 @@ class ProjectWindow(QMainWindow):
         self._stop()
         self.project.stages.pop("preparation", None)
         self.project.mix_path = source
-        self.timing["confirmed"] = False
         self.check = None
         for track in self.project.tracks:
             track.notes.generated = []
@@ -1610,20 +1785,10 @@ class ProjectWindow(QMainWindow):
         self._sync_tracks()
         self.status.setText("Back on the original mix. Recount bars, then Edit > Warp mix to tempo.")
 
-    def _set_confirmed(self, checked: bool) -> None:
-        if not self.warped:
-            self._update_actions()
-            raise ValueError("Warp the mix first.")
-        self.timing["confirmed"] = bool(checked)
-        self.project.revision += 1
-        self._refresh()
-        if checked:
-            self.status.setText("Timing confirmed. Next: Edit > Separate stems, or File > Import stems.")
-
     # -- stems and chords ---------------------------------------------------
-    def _separate(self) -> None:
-        if not self.confirmed:
-            raise ValueError("Warp the mix and tick Edit > Timing confirmed first.")
+    def _separate(self, then_detect_chords: bool = False) -> None:
+        if not self.warped:
+            raise ValueError("Warp the mix first (Edit > Warp mix to tempo).")
         from audio_to_midi import provision
 
         needs = provision.missing("demucs")
@@ -1660,6 +1825,10 @@ class ProjectWindow(QMainWindow):
             if self.folder is not None:
                 save_project(self.project, self.folder)
             self.status.setText("Six aligned stems imported. Choose a track to see its notes.")
+            if self.view == CHORDS:
+                self._load_mix_data()
+            if then_detect_chords:
+                self._detect_chords()
 
         self._run(
             lambda cancel, report: separate_mix(
@@ -1667,37 +1836,96 @@ class ProjectWindow(QMainWindow):
             ), accept, kind="separate", message="Separating stems with Demucs:", reports=True,
         )
 
+    @property
+    def chord_model(self) -> str:
+        return "btc" if self.actions["chord_btc"].isChecked() else "template"
+
     def _detect_chords(self) -> None:
-        if not self.confirmed:
-            raise ValueError("Warp the mix and tick Edit > Timing confirmed first.")
+        if not self.warped:
+            raise ValueError("Warp the mix first (Edit > Warp mix to tempo).")
+        model = self.chord_model
+        if model == "btc":
+            from audio_to_midi import provision
+
+            needs = provision.missing("btc")
+            if needs:
+                if "btc" in self._installing:
+                    return
+                if QMessageBox.question(
+                    self, "Install chord model",
+                    f"The BTC chord recognizer is not installed yet. Download it now ({', '.join(needs)})? "
+                    "This happens once and needs an internet connection. BTC is MIT-licensed "
+                    "(github.com/jayg996/BTC-ISMIR19).",
+                ) != QMessageBox.StandardButton.Yes:
+                    return
+                self._installing.add("btc")
+
+                def install(cancel, report):
+                    try:
+                        provision.ensure("btc", report, cancel)
+                    finally:
+                        self._installing.discard("btc")
+
+                self._run(install, lambda _value: self._detect_chords(), kind="install",
+                          message="Installing the BTC chord model:", reports=True)
+                return
+        # BTC was trained on full mixes, so only the template recognizer needs stems to be reliable.
+        if model == "template" and self.project.mix_path and not stems_for_chords(self.project):
+            outdated = any(t.role in HARMONY_ROLES for t in self.project.tracks)
+            answer = QMessageBox.question(
+                self, "Separate stems first?",
+                ("The separated stems no longer match the current timing. " if outdated else "")
+                + "Chords are more reliable from separated stems: drums are ignored, the bass note comes "
+                "from the bass stem, and vocal slides and melody notes do not count.\n\n"
+                "Yes: separate stems now (a few minutes), then detect chords.\n"
+                "No: detect chords from the full mix.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No | QMessageBox.StandardButton.Cancel,
+                QMessageBox.StandardButton.Yes,
+            )
+            if answer == QMessageBox.StandardButton.Yes:
+                self._separate(then_detect_chords=True)
+                return
+            if answer != QMessageBox.StandardButton.No:
+                return
         if any(c.source != "detected" for c in self.project.chords) and QMessageBox.question(
             self, "Replace chords", "Replace the chords, including your edits? (Undo in the Chords view restores them.)",
         ) != QMessageBox.StandardButton.Yes:
             return
         project = deepcopy(self.project)
+        sources = _harmony_identity(project)
+        work = project
+        # A detected key came from the full mix; the stems (without bass and drums) judge it better.
+        if project.key and self.timing.get("key_source") != "user" and stems_for_chords(project):
+            work = deepcopy(project)
+            work.key = ""
 
         def accept(value):
             if (
                 self.project.id != project.id or self.project.chords != project.chords
                 or self.project.grid != project.grid or self.project.mix_path != project.mix_path
-                or self.project.key != project.key or not self.confirmed
+                or self.project.key != project.key or not self.warped
                 or current_warp(self.project) != current_warp(project)
+                or _harmony_identity(self.project) != sources
             ):
                 self.status.setText("Chords or timing changed during detection; discarded stale results.")
                 return
             key, segments = value
-            if not self.project.key:
+            changed = ""
+            if not self.project.key or work is not project:
+                if self.project.key and key != self.project.key:
+                    changed = f" Key changed from {self.project.key} to {key} (judged from the stems)."
                 self.project.key = key
+                self.timing["key_source"] = "detected"
             self._set_chords(segments)
             if self.view != CHORDS:
                 self.tracks.setCurrentIndex(self.tracks.findData(CHORDS))
             self.status.setText(
-                f"Detected {len(segments)} chords. Click a chord to select it, type to rename, "
-                "right-click for alternatives, drag a boundary to move it."
+                f"Detected {len(segments)} chords with {CHORD_MODELS[model]}.{changed} Click a chord to select "
+                "it, type to rename, right-click for alternatives, drag a boundary to move it."
             )
 
-        self._run(lambda cancel: analyze_harmony(project, cancel), accept, kind="chords",
-                  message="Detecting chords...")
+        self._run(lambda cancel: analyze_harmony(work, cancel, model), accept, kind="chords",
+                  message=f"Detecting chords ({CHORD_MODELS[model]})...")
 
     # -- playback -----------------------------------------------------------
     def _player(self):
@@ -1847,7 +2075,7 @@ class ProjectWindow(QMainWindow):
         QMessageBox.information(self, "Getting started", (
             "1. File > New project, then File > Import mix.\n"
             "2. Count bars: Edit > Tap downbeats (Space on each bar's one) or right-click beats to pin downbeats.\n"
-            "3. Edit > Warp mix to tempo, listen with View > Metronome click, tick Edit > Timing confirmed.\n"
+            "3. Edit > Warp mix to tempo and listen with View > Metronome click.\n"
             "4. Edit > Separate stems (or File > Import stems), pick a track and analyze notes.\n"
             "5. Edit > Detect chords, then File > Export MIDI or lead sheet."
         ))

@@ -23,6 +23,7 @@ Separation runs Demucs htdemucs_6s in a subprocess of the running interpreter
 from __future__ import annotations
 
 from dataclasses import dataclass
+import functools
 import hashlib
 import json
 import math
@@ -61,6 +62,27 @@ class RevisionConflict(PreparationError):
 def _check_cancel(cancel):
     if cancel is not None and cancel():
         raise Cancelled("Preparation cancelled")
+
+
+def decoded_frames(path) -> int:
+    """Frames a decoder actually returns. MP3 headers only estimate the length
+    (encoder delay/padding), so those are counted by decoding."""
+    path = Path(path)
+    stat = path.stat()
+    return _decoded_frames(str(path.resolve()), stat.st_size, stat.st_mtime_ns)
+
+
+@functools.lru_cache(maxsize=16)
+def _decoded_frames(path: str, _size: int, _mtime: int) -> int:
+    with sf.SoundFile(path) as audio:
+        if audio.format not in ("MP3", "MPEG"):
+            return audio.frames
+        total = 0
+        while True:  # blocks() trusts the header length, so read until the decoder runs dry
+            read = len(audio.read(1 << 16, dtype="float32"))
+            if not read:
+                return total
+            total += read
 
 
 def _hash(path):
@@ -693,6 +715,7 @@ def separate_mix(
             cancel=cancel, progress=progress, timeout_seconds=timeout_seconds, env=env,
         )
         expected = sf.info(full_mix)
+        expected_frames = decoded_frames(full_mix)
         result = {}
         for role in roles:
             _check_cancel(cancel)
@@ -700,7 +723,7 @@ def separate_mix(
             if len(matches) != 1:
                 raise PreparationError(f"Demucs missing/ambiguous {role} stem")
             info = sf.info(matches[0])
-            if info.samplerate != expected.samplerate or info.frames != expected.frames or info.channels != expected.channels:
+            if info.samplerate != expected.samplerate or info.frames != expected_frames or info.channels != expected.channels:
                 raise PreparationError(f"Demucs {role} rate/duration/channel mismatch; no silent resampling")
             result[role] = str(matches[0].relative_to(staging))
         return result, {"model": "htdemucs_6s", "roles": roles, "alignment": "shared-warp",

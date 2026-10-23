@@ -12,7 +12,7 @@ from uuid import uuid4
 from audio_to_midi import Grid, Note, NoteStore, Project, Track
 from audio_to_midi.storage import (
     InvalidProjectError, MissingMediaError, MissingProjectError,
-    SCHEMA_VERSION, SchemaVersionError, load_project, save_project,
+    SCHEMA_VERSION, SchemaVersionError, import_media, load_project, save_project,
 )
 
 
@@ -359,6 +359,36 @@ class StorageTests(unittest.TestCase):
         self.project.tracks[0].audio_path = "stem.wav"
         save_project(self.project, self.folder)
         self.assertEqual(load_project(self.folder).tracks[0].audio_path, str(self.media))
+
+    def test_moved_project_folder_keeps_stage_paths(self):
+        original = import_media(self.external, self.folder)
+        self.assertEqual(original, (self.folder / "audio" / "outside.wav").resolve())
+        self.assertEqual(original.read_bytes(), self.external.read_bytes())
+        self.assertEqual(import_media(self.external, self.folder), original)  # same bytes: reused
+        self.assertEqual(import_media(original, self.folder), original)  # already inside
+        self.project.mix_path = str(original)
+        self.project.stages = {
+            "timing": {"source": str(original), "beats": None},
+            "preparation": {"directory": str(self.folder / "preparation"), "warp_revision": "w"},
+        }
+        save_project(self.project, self.folder)
+        data = self.manifest()
+        self.assertEqual(data["stages"]["timing"]["source"], str(Path("audio") / "outside.wav"))
+        self.assertEqual(data["stages"]["preparation"]["directory"], "preparation")
+        self.assertEqual(self.project.stages["timing"]["source"], str(original))  # in memory untouched
+        moved = self.fixture / "moved"
+        shutil.move(str(self.folder), str(moved))
+        loaded = load_project(moved)
+        self.assertEqual(loaded.mix_path, str((moved / "audio" / "outside.wav").resolve()))
+        self.assertEqual(loaded.stages["timing"]["source"], loaded.mix_path)
+        self.assertEqual(loaded.stages["preparation"]["directory"], str((moved / "preparation").resolve()))
+
+    def test_import_media_does_not_overwrite_a_different_file_with_the_same_name(self):
+        (self.folder / "audio").mkdir()
+        (self.folder / "audio" / "outside.wav").write_bytes(b"something else")
+        copied = import_media(self.external, self.folder)
+        self.assertEqual(copied.name, "outside (1).wav")
+        self.assertEqual(copied.read_bytes(), self.external.read_bytes())
 
     def test_empty_audio_and_missing_mix_are_allowed(self):
         self.project.tracks[0].audio_path = ""

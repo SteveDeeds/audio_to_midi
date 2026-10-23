@@ -199,6 +199,79 @@ class WorkflowTests(unittest.TestCase):
             result = backend.predict(self.track, F(0), F(4), lambda: False)
         self.assertNotIn(F(1), result.onsets)
 
+    def test_mono_velocity_follows_cqt_harmonic_energy(self):
+        from audio_to_midi import velocity
+
+        self.assertEqual(velocity.velocity(1.0, 1.0), 127)
+        self.assertEqual(velocity.velocity(10 ** -1.2, 1.0), 64)  # -12 dB on the GM curve
+        self.assertEqual(velocity.velocity(1e-9, 1.0), velocity.MIN_VELOCITY)
+        time = np.arange(16000) / 8000
+        tone = sum(np.sin(2 * np.pi * 110 * h * time) / h for h in (1, 2, 3))
+        level = np.where(time < 1, 1.0, 10 ** (-12 / 20))  # second note 12 dB quieter
+        path = self.root / "vocals.wav"
+        sf.write(path, (0.4 * level * tone).astype(np.float32), 8000)
+        track = app.add_stem(self.project, path, "vocals")
+
+        class Mono:
+            def prepare(self, *args, **kwargs):
+                return True
+            def onset_times(self, *args):
+                return np.array([0, 1])
+            def pitch_changes(self, *args):
+                return []
+            def block_pitch(self, a, b, *args):
+                return [45], b
+        backend = TrackBackend.create(track, self.project)
+        backend.provider = Mono()
+        loud, quiet = backend.predict(track, F(0), F(4), lambda: False).notes
+        self.assertGreaterEqual(loud.velocity, 120)
+        self.assertAlmostEqual(quiet.velocity, loud.velocity * 10 ** (-12 / 40), delta=6)
+
+    def test_drum_velocity_is_band_rms_per_kit_piece(self):
+        from core import adtof_drums
+        from core.adtof_drums import DrumHit
+
+        sr = 44100
+        time = np.arange(sr * 2) / sr
+        audio = np.zeros_like(time)
+        rng = np.random.default_rng(0)
+        hits = []
+        for i, gain_db in enumerate((0, -12, -24, -6)):
+            t = 0.5 * i
+            seg = (time >= t) & (time < t + 0.15)
+            decay = np.exp(-(time[seg] - t) * 30)
+            audio[seg] += 10 ** (gain_db / 20) * np.sin(2 * np.pi * 60 * (time[seg] - t)) * decay  # kick
+            audio[seg] += 0.2 * np.diff(rng.standard_normal(seg.sum() + 1)) * decay  # same hi-hat on every kick
+            hits += [DrumHit(t, 36, 0.9), DrumHit(t, 42, 0.9)]
+        path = self.root / "drums.wav"
+        sf.write(path, (0.5 * audio).astype(np.float32), sr)
+        project = Project.create("Drums", Grid(120, 4, 4))
+        track = app.add_stem(project, path, "drums")
+        track.settings["license_acknowledged"] = True
+
+        class Fake:
+            _act = None
+            def __init__(self, *args):
+                pass
+            def prepare(self):
+                pass
+            def set_activations(self, activations):
+                pass
+            def hits(self):
+                return tuple(hits)
+        backend = TrackBackend.create(track, project)
+        backend.provider = Fake()
+        with patch.object(adtof_drums, "AdtofDrumTranscriber", Fake):
+            notes = backend.predict(track, F(0), F(4), lambda: False).notes
+        kicks = [n.velocity for n in sorted(notes, key=lambda n: n.start) if n.pitch == 36]
+        hats = [n.velocity for n in notes if n.pitch == 42]
+        self.assertGreater(kicks[0], kicks[3])
+        self.assertGreater(kicks[3], kicks[1])
+        self.assertGreater(kicks[1], kicks[2])
+        self.assertAlmostEqual(kicks[1] / kicks[0], 10 ** (-12 / 40), delta=0.1)
+        self.assertLessEqual(max(hats) - min(hats), 6)  # kick level does not leak into the hi-hat
+        self.assertGreaterEqual(min(hats), 110)
+
     def test_visible_batches_merge_continuation_without_false_restrike(self):
         class Mono:
             def prepare(self, *args, **kwargs):
