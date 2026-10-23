@@ -363,6 +363,36 @@ class BtcTests(unittest.TestCase):
         with patch.object(btc_paths, "CHECKPOINT", Path("does-not-exist.pt")):
             self.assertIn("BTC chord weights (~12 MB)", provision.missing("btc"))
 
+    def test_package_install_retries_once_on_the_configured_feed(self):
+        from audio_to_midi import provision
+        from audio_to_midi.pipeline import PreparationError
+
+        calls = []
+
+        def flaky(argv, **kwargs):
+            calls.append(argv)
+            if len(calls) == 1:
+                raise PreparationError("Installing x failed (exit 1):\nERROR: HTTP error 404")
+
+        installed = iter([False, True])
+        with patch.dict(provision.FEATURES, {"x": [("x_mod", ["x>=1"])]}), \
+                patch.object(provision, "_run_process", side_effect=flaky), \
+                patch.object(provision, "_installed", side_effect=lambda module: next(installed)):
+            provision.ensure("x")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0], calls[1])
+        self.assertFalse(any("--index-url" in arg or "--extra-index-url" in arg for arg in calls[0]))
+
+        def broken(argv, **kwargs):
+            raise PreparationError("Installing x failed (exit 1)")
+
+        with patch.dict(provision.FEATURES, {"x": [("x_mod", ["x>=1"])]}), \
+                patch.object(provision, "_run_process", side_effect=broken) as process, \
+                patch.object(provision, "_installed", return_value=False):
+            with self.assertRaises(PreparationError):
+                provision.ensure("x")
+        self.assertEqual(process.call_count, 2)
+
     def test_analyze_harmony_routes_to_btc_with_stem_audio(self):
         from audio_to_midi import btc
 

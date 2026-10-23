@@ -77,10 +77,15 @@ def ensure(feature: str, progress=None, cancel=None) -> None:
         if _installed(module):
             continue
         report(f"Installing {args[-1]} for {label} (first use)...")
-        _run_process(
-            [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--progress-bar", "off", *args],
-            cancel=cancel, progress=report, name=f"Installing {args[-1]}",
-        )
+        command = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", "--progress-bar", "off", *args]
+        try:
+            _run_process(command, cancel=cancel, progress=report, name=f"Installing {args[-1]}")
+        except Cancelled:
+            raise
+        except Exception as error:
+            # Mirrored feeds (Azure Artifacts upstreams) can 404 a file until they have cached it.
+            report(f"Retrying {args[-1]} after: {str(error).splitlines()[0]}")
+            _run_process(command, cancel=cancel, progress=report, name=f"Installing {args[-1]}")
         invalidate_caches()
         if not _installed(module):
             raise RuntimeError(f"Installed {args[-1]}, but '{module}' still cannot be imported; restart the app.")
