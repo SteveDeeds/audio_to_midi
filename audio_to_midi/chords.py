@@ -27,6 +27,11 @@ QUALITIES = {
     "7": (0, 4, 7, 10), "maj7": (0, 4, 7, 11), "m7": (0, 3, 7, 10),
     "m7b5": (0, 3, 6, 10), "dim7": (0, 3, 6, 9), "mMaj7": (0, 3, 7, 11),
 }
+MUSICXML_KINDS = {
+    "": "major", "m": "minor", "dim": "diminished", "aug": "augmented", "sus2": "suspended-second",
+    "sus4": "suspended-fourth", "7": "dominant", "maj7": "major-seventh", "m7": "minor-seventh",
+    "m7b5": "half-diminished", "dim7": "diminished-seventh", "mMaj7": "major-minor",
+}
 _ALIASES = {
     "maj": "", "M": "", "min": "m", "-": "m", "+": "aug", "o": "dim", "°": "dim", "sus": "sus4",
     "M7": "maj7", "Δ": "maj7", "Δ7": "maj7", "min7": "m7", "-7": "m7", "ø": "m7b5", "ø7": "m7b5",
@@ -325,11 +330,7 @@ def musicxml(segments, grid, title: str, key: str = "") -> str:
     start = min((s.start for s in segments), default=Fraction(0))
     first_bar = int(start // bar_q)
     bars = max(1, math.ceil((end - first_bar * bar_q) / bar_q))
-    kinds = {
-        "": "major", "m": "minor", "dim": "diminished", "aug": "augmented", "sus2": "suspended-second",
-        "sus4": "suspended-fourth", "7": "dominant", "maj7": "major-seventh", "m7": "minor-seventh",
-        "m7b5": "half-diminished", "dim7": "diminished-seventh", "mMaj7": "major-minor",
-    }
+    kinds = MUSICXML_KINDS
 
     def step_alter(pc: int) -> str:
         name = names[pc]

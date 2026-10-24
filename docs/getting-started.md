@@ -380,8 +380,8 @@ The setting is remembered.
 - **File > Export MIDI...** (Ctrl+E): choose all tracks plus chords, a single
   role, or chords only. If tracks are not fully analyzed, the app asks before
   writing a partial file.
-- **File > Export lead sheet (MusicXML)...** writes the chord symbols on bars,
-  ready for MuseScore.
+- **File > Export score (MusicXML)...** writes a MuseScore-ready score with
+  the transcribed tracks and the chord symbols on the top staff.
 
 ## Troubleshooting
 

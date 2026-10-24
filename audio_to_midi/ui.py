@@ -202,7 +202,7 @@ class ProjectWindow(QMainWindow):
         self._act(file, "import_chords", "Import chord MIDI...", self._import_chords)
         file.addSeparator()
         self._act(file, "export", "&Export MIDI...", self._export, "Ctrl+E")
-        self._act(file, "export_xml", "Export lead sheet (MusicXML)...", self._export_lead_sheet)
+        self._act(file, "export_xml", "Export score (MusicXML)...", self._export_score)
         file.addSeparator()
         self._act(file, "playback", "Playback settings...", self._playback_settings)
         file.addSeparator()
@@ -504,7 +504,12 @@ class ProjectWindow(QMainWindow):
             "import_midi": (track is not None, "Choose a track first."),
             "import_chords": (has_mix, "Import a mix first."),
             "export": (bool(self.project.tracks or self.project.chords), "Nothing to export yet."),
-            "export_xml": (bool(self.project.chords), "Detect or import chords first."),
+            "export_xml": (
+                bool(self.project.chords) or any(
+                    t.role != "other" and (t.notes.generated or t.notes.authored) for t in self.project.tracks
+                ),
+                "Transcribe a track or detect chords first.",
+            ),
             "detect": (has_mix and not tapping, "Import a mix first (File > Import mix)."),
             "tap": (tapping or self.session is not None, "Detect tempo first."),
             "clear_pins": (bool(self.session and self.session.pins), "No downbeat pins to clear."),
@@ -1428,13 +1433,14 @@ class ProjectWindow(QMainWindow):
         self._set_chords(notes_to_segments(notes, self.project.grid))
         self.status.setText(f"Imported {len(self.project.chords)} chords from {Path(path).name}.")
 
-    def _export(self) -> None:
+    def _export_scope(self, title: str, kind: str) -> tuple[list[Track], bool, bool] | None:
+        """Ask which tracks to export: (tracks, include chords, partial), or None if cancelled."""
         choices = ["All tracks + chords"] + [t.role for t in self.project.tracks if t.role != "other"]
         if self.project.chords:
             choices.append("chords")
-        scope, accepted = QInputDialog.getItem(self, "Export MIDI", "Track(s)", choices, editable=False)
+        scope, accepted = QInputDialog.getItem(self, title, "Track(s)", choices, editable=False)
         if not accepted:
-            return
+            return None
         selected = self.project.tracks if scope == choices[0] else [
             t for t in self.project.tracks if t.role == scope
         ]
@@ -1442,25 +1448,35 @@ class ProjectWindow(QMainWindow):
         if partial and QMessageBox.question(
             self, "Partial export",
             "Some tracks are unprocessed or stale. Export only currently resolved notes "
-            "as an explicitly partial MIDI? Choose No to analyze whole tracks first.",
+            f"as an explicitly partial {kind}? Choose No to analyze whole tracks first.",
         ) != QMessageBox.StandardButton.Yes:
+            return None
+        return selected, scope in (choices[0], "chords"), partial
+
+    def _export(self) -> None:
+        chosen = self._export_scope("Export MIDI", "MIDI")
+        if chosen is None:
             return
+        selected, include_chords, partial = chosen
         path, _ = QFileDialog.getSaveFileName(
             self, "Export MIDI", "partial.mid" if partial else "song.mid", "MIDI (*.mid)",
         )
         if path:
-            export_midi(self.project, Path(path), selected, include_chords=scope in (choices[0], "chords"))
+            export_midi(self.project, Path(path), selected, include_chords=include_chords)
             self.status.setText(f"{'PARTIAL' if partial else 'Complete'} MIDI exported: {path}")
 
-    def _export_lead_sheet(self) -> None:
-        if not self.project.chords:
-            raise ValueError("Detect or import chords first.")
+    def _export_score(self) -> None:
+        chosen = self._export_scope("Export score", "score")
+        if chosen is None:
+            return
+        selected, include_chords, partial = chosen
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export lead sheet", f"{self.project.name}.musicxml", "MusicXML (*.musicxml *.xml)",
+            self, "Export score", f"{self.project.name}.musicxml",
+            "MusicXML (*.musicxml *.xml);;Compressed MusicXML (*.mxl)",
         )
         if path:
-            export_musicxml(self.project, Path(path))
-            self.status.setText(f"Lead sheet exported: {path}")
+            export_musicxml(self.project, Path(path), selected, include_chords=include_chords)
+            self.status.setText(f"{'PARTIAL' if partial else 'Complete'} score exported: {path}")
 
     def _profile(self) -> None:
         if not self.active:

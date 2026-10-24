@@ -46,7 +46,8 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("folder", type=Path)
     export.add_argument("output", type=Path)
     export.add_argument("--allow-partial", action="store_true")
-    export.add_argument("--role", choices=["bass", "vocals", "piano", "guitar", "drums", "chords"], help="Export one stem or just the chord track; default is combined MIDI")
+    export.add_argument("--role", choices=["bass", "vocals", "piano", "guitar", "drums", "chords"], help="Export one stem or just the chord track; default is every track plus chords. "
+                        "Output .mid is MIDI; .musicxml/.xml/.mxl is a MuseScore-ready score")
     separate = commands.add_parser(
         "separate", help="Demucs htdemucs_6s separation of the full mix (installs/downloads on first use)",
     )
@@ -193,16 +194,14 @@ def main(argv: list[str] | None = None) -> int:
             )
             if args.role == "chords" and not project.chords:
                 raise ValueError("Project has no chords.")
-            if args.output.suffix.lower() in (".musicxml", ".xml"):
-                if args.role not in (None, "chords"):
-                    raise ValueError("MusicXML export is a chord lead sheet; use --role chords or omit --role.")
-                from audio_to_midi.midi import export_musicxml
-                export_musicxml(project, args.output)
-                print(f"Lead sheet: {args.output}")
-                return 0
             incomplete = [t.role for t in selected if not complete(project, t)]
             if incomplete and not args.allow_partial:
                 raise ValueError(f"Unprocessed or stale tracks: {', '.join(incomplete)}. Transcribe or use --allow-partial.")
+            if args.output.suffix.lower() in (".musicxml", ".xml", ".mxl"):
+                from audio_to_midi.midi import export_musicxml
+                export_musicxml(project, args.output, selected, include_chords=args.role in (None, "chords"))
+                print(f"{'PARTIAL' if incomplete else 'Complete'} MusicXML: {args.output}")
+                return 0
             export_midi(project, args.output, selected, include_chords=args.role in (None, "chords"))
             print(f"{'PARTIAL' if incomplete else 'Complete'} MIDI: {args.output}")
         elif args.command == "info":

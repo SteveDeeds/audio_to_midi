@@ -110,15 +110,28 @@ def export_midi(
         Path(temporary).unlink(missing_ok=True)
 
 
-def export_musicxml(project: Project, path: Path) -> None:
-    """Lead sheet with chord symbols over rests, for notation programs."""
-    from audio_to_midi.chords import musicxml
+def export_musicxml(
+    project: Project, path: Path, tracks: list[Track] | None = None,
+    include_chords: bool = True,
+) -> None:
+    """Score for notation programs: one staff per track with chord symbols.
 
-    if not project.chords:
-        raise ValueError("There are no chords to export.")
+    With no transcribed notes among the chosen tracks, writes the chord lead
+    sheet instead. A .mxl path is written compressed.
+    """
+    from audio_to_midi import musicxml
+
     _validate_export_path(project, path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(musicxml(project.chords, project.grid, project.name, project.key), encoding="utf-8")
+    chosen = project.tracks if tracks is None else tracks
+    if any(t.role != "other" and t.notes.resolved() for t in chosen):
+        text = musicxml.score_xml(project, chosen, include_chords)
+    elif include_chords and project.chords:
+        from audio_to_midi.chords import musicxml as lead_sheet
+
+        text = lead_sheet(project.chords, project.grid, project.name, project.key)
+    else:
+        raise ValueError("There are no notes or chords to export.")
+    musicxml.write(path, text)
 
 
 def _append_track(mid: mido.MidiFile, name: str, notes: list[Note], channel: int) -> None:
