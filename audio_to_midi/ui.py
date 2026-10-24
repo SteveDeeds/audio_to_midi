@@ -105,6 +105,7 @@ class Job(QThread):
 
 class ProjectWindow(QMainWindow):
     reference_ready = Signal(object, float)
+    reference_failed = Signal(object, str)
 
     def __init__(self):
         super().__init__()
@@ -140,6 +141,7 @@ class ProjectWindow(QMainWindow):
         self._references: dict[tuple, float] = {}  # (path, mtime) -> whole-song CQT peak
         self._reference_jobs: set[tuple] = set()
         self.reference_ready.connect(self._reference_ready)
+        self.reference_failed.connect(self._reference_failed)
         self._mix_data: dict[tuple, tuple] = {}
         self._key_dialog = None
         self._key_chroma: dict[tuple, dict] = {}
@@ -651,14 +653,22 @@ class ProjectWindow(QMainWindow):
         def work():
             try:
                 value = song_reference(ident[0])
-            except Exception:
-                value = 0.0
+            except Exception as error:
+                try:
+                    self.reference_failed.emit(ident, f"{type(error).__name__}: {error}")
+                except RuntimeError:  # window already closed
+                    pass
+                return
             try:
                 self.reference_ready.emit(ident, value)
             except RuntimeError:  # window already closed
                 pass
 
         threading.Thread(target=work, daemon=True, name="cqt-reference").start()
+
+    def _reference_failed(self, ident: tuple, message: str) -> None:
+        self._reference_jobs.discard(ident)
+        self.status.setText(f"Spectrogram reference failed for {ident[0]}: {message}")
 
     def _reference_ready(self, ident: tuple, value: float) -> None:
         self._reference_jobs.discard(ident)

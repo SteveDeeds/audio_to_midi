@@ -1,4 +1,4 @@
-"""Chord symbols, placeholder recognizer, timing session and lead-sheet export."""
+"""Chord symbols, template recognizer, timing session and lead-sheet export."""
 
 from fractions import Fraction as F
 import unittest
@@ -16,6 +16,14 @@ from audio_to_midi.spectrogram import cqt_image, HOP_LENGTH, SAMPLE_RATE
 
 
 class SymbolTests(unittest.TestCase):
+    def test_enharmonic_roots_and_basses_share_pitch_classes(self):
+        from audio_to_midi.notation import PITCH_CLASSES
+
+        for name, pc in PITCH_CLASSES.items():
+            with self.subTest(name=name):
+                self.assertEqual(chords.parse(name), (pc, "", None))
+                self.assertEqual(chords.parse(f"C/{name}"), (0, "", pc or None))
+
     def test_parse_aliases_and_slash(self):
         self.assertEqual(chords.parse("Cmaj7"), (0, "maj7", None))
         self.assertEqual(chords.parse("Bbm7b5"), (10, "m7b5", None))
@@ -80,6 +88,22 @@ class SymbolTests(unittest.TestCase):
 
 
 class RecognizerTests(unittest.TestCase):
+    def test_key_scale_rejects_missing_or_invalid_keys(self):
+        from core.chord_analysis import key_to_scale_pcs
+
+        for key in ("", "   ", "unknown", "? (?)"):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "key"):
+                key_to_scale_pcs(key)
+        self.assertEqual(key_to_scale_pcs("G (Em)"), {7, 9, 11, 0, 2, 4, 6})
+        self.assertEqual(key_to_scale_pcs("Am (C)"), {9, 11, 0, 2, 4, 5, 7})
+
+    def test_key_detection_rejects_unusable_chroma(self):
+        from core.analysis import detect_key_from_chroma
+
+        for chroma in (np.zeros(12), np.ones(11), np.full(12, np.nan), -np.ones(12)):
+            with self.subTest(chroma=chroma), self.assertRaisesRegex(ValueError, "chroma"):
+                detect_key_from_chroma(chroma)
+
     def image(self, frames, low=21):
         return np.zeros((88, frames), dtype=np.float32), low
 
@@ -413,6 +437,35 @@ class BtcTests(unittest.TestCase):
                 provision.ensure("x")
         self.assertEqual(process.call_count, 2)
 
+    def test_provision_rejects_unknown_features_before_doing_work(self):
+        from audio_to_midi import provision
+
+        with patch.object(provision, "_run_process") as process:
+            for operation in (provision.missing, provision.ensure):
+                with self.subTest(operation=operation.__name__):
+                    with self.assertRaisesRegex(ValueError, "Unknown.*feature"):
+                        operation("crepe_typo")
+            provision.ensure("pyin")
+            self.assertEqual(provision.missing("pyin"), [])
+        process.assert_not_called()
+
+    def test_module_inspection_does_not_hide_broken_import_specs(self):
+        from audio_to_midi import provision
+
+        with patch.object(provision.util, "find_spec", side_effect=ValueError("broken spec")):
+            with self.assertRaisesRegex(ValueError, "broken spec"):
+                provision.missing("crepe_tiny")
+
+    def test_install_does_not_retry_programming_errors(self):
+        from audio_to_midi import provision
+
+        with patch.dict(provision.FEATURES, {"x": [("x_mod", ["x>=1"])]}), \
+                patch.object(provision, "_installed", return_value=False), \
+                patch.object(provision, "_run_process", side_effect=TypeError("bad command")) as process:
+            with self.assertRaisesRegex(TypeError, "bad command"):
+                provision.ensure("x")
+        process.assert_called_once()
+
     def test_analyze_harmony_routes_to_btc_with_stem_audio(self):
         from audio_to_midi import btc
 
@@ -471,6 +524,14 @@ class BeatSessionTests(unittest.TestCase):
         self.assertEqual((session.numerator, session.denominator), (4, 4))
         restored = BeatSession.from_json(session.to_json(), 4, 4)
         self.assertEqual([b.mark for b in restored.pins], [(1, 1), (1, 4)])
+
+    def test_invalid_tempo_curve_is_not_replaced_by_constant_tempo(self):
+        session = BeatSession([Beat(0.5 * i + 0.002 * i * i, 0.9) for i in range(48)], 120.0, 30.0)
+        session.pin(2, 1)
+        session.pin(34, 9)
+        with patch("audio_to_midi.timing.beat_logic.anchors", side_effect=ValueError("invalid anchors")):
+            with self.assertRaisesRegex(ValueError, "invalid anchors"):
+                session.grid(F(1, 4))
 
     def test_taps_on_downbeats_pin_bars(self):
         session = self.session()

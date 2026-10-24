@@ -12,7 +12,8 @@ from pathlib import Path
 import sys
 import urllib.request
 
-from audio_to_midi.pipeline import Cancelled, _run_process
+from audio_to_midi.pipeline import Cancelled, PreparationError, _run_process
+from audio_to_midi.environment import PIANO_HR_CHECKPOINT
 
 # (import name, pip arguments) per feature; installed in order, skipped when importable.
 _CREPE = [("torch", ["torch"]), ("torchcrepe", ["torchcrepe>=0.0.23"])]
@@ -37,21 +38,23 @@ LABELS = {
     "crepe_tiny": "CREPE", "crepe_full": "CREPE", "basic_pitch": "Basic Pitch", "piano_hr": "Piano-HR",
     "adtof": "ADTOF", "demucs": "Demucs", "btc": "BTC chord model",
 }
-PIANO_HR_CHECKPOINT = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
 PIANO_HR_URL = "https://zenodo.org/record/4034264/files/CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1"
 PIANO_HR_MIN_BYTES = 1.6e8  # the library re-downloads anything smaller
 
 
 def _installed(module: str) -> bool:
-    try:
-        return util.find_spec(module) is not None
-    except (ImportError, ValueError):
-        return False
+    return util.find_spec(module) is not None
+
+
+def _requirements(feature: str) -> list[tuple[str, list[str]]]:
+    if feature not in FEATURES:
+        raise ValueError(f"Unknown model feature: {feature!r}")
+    return FEATURES[feature]
 
 
 def missing(feature: str) -> list[str]:
     """What first use of ``feature`` would install or download (empty when ready)."""
-    needs = [args[-1] for module, args in FEATURES.get(feature, []) if not _installed(module)]
+    needs = [args[-1] for module, args in _requirements(feature) if not _installed(module)]
     if feature == "piano_hr" and not _checkpoint_ready():
         needs.append("Piano-HR checkpoint (~165 MB)")
     if feature == "btc" and not _btc_ready():
@@ -73,7 +76,7 @@ def ensure(feature: str, progress=None, cancel=None) -> None:
     """Install whatever ``feature`` lacks; no-op when everything is present."""
     report = progress or (lambda text: None)
     label = LABELS.get(feature, feature)
-    for module, args in FEATURES.get(feature, []):
+    for module, args in _requirements(feature):
         if _installed(module):
             continue
         report(f"Installing {args[-1]} for {label} (first use)...")
@@ -82,7 +85,7 @@ def ensure(feature: str, progress=None, cancel=None) -> None:
             _run_process(command, cancel=cancel, progress=report, name=f"Installing {args[-1]}")
         except Cancelled:
             raise
-        except Exception as error:
+        except PreparationError as error:
             # Mirrored feeds (Azure Artifacts upstreams) can 404 a file until they have cached it.
             report(f"Retrying {args[-1]} after: {str(error).splitlines()[0]}")
             _run_process(command, cancel=cancel, progress=report, name=f"Installing {args[-1]}")

@@ -65,6 +65,20 @@ class GridTests(unittest.TestCase):
             with self.subTest(anchors=anchors), self.assertRaises(ValueError):
                 Grid(anchors=anchors)
 
+    def test_note_ends_snap_to_half_grid_with_positive_ties(self):
+        for step in (F(1), F(1, 4), F(1, 3), F(1, 6)):
+            grid = Grid(subdivision=step)
+            for value, expected in (
+                (F(0), F(0)), (F(1, 5), F(0)),
+                (F(1, 4), F(1, 2)), (F(1, 2), F(1, 2)),
+                (F(7, 10), F(1, 2)), (F(3, 4), F(1)),
+                (F(1), F(1)), (F(-1, 4), F(0)),
+            ):
+                with self.subTest(step=step, value=value):
+                    self.assertEqual(grid.snap_end(value * step), expected * step)
+            self.assertEqual(grid.snap(step / 2), step)
+            self.assertEqual(grid.subdivision, step)
+
     def test_invalid_grid(self):
         cases = [
             {"bpm": 0}, {"bpm": -1}, {"bpm": float("nan")},

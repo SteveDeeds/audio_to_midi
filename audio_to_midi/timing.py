@@ -195,16 +195,13 @@ class BeatSession:
         """The grid through the counted beats and pins, or None before anything is counted.
 
         Bars follow the smoothed tempo curve (one anchor per bar) and land exactly on pins;
-        a steady fit, or one whose curve cannot be built, gives a constant-tempo grid.
+        A steady fit gives a constant-tempo grid; an invalid curve raises ValueError.
         """
         if not self.fit:
             return None
         if self.fit.steady:
             return Grid(round(self.fit.bpm, 4), self.numerator, self.denominator, subdivision, self.fit.downbeat)
-        try:
-            points = beat_logic.anchors(self.beats, self.labels, "smooth", self.units()[0], self.fit.downbeat)
-        except ValueError:
-            points = ()
+        points = beat_logic.anchors(self.beats, self.labels, "smooth", self.units()[0], self.fit.downbeat)
         anchors = [(t, Fraction(q).limit_denominator(1_000_000)) for t, q in points]
         return Grid(self.fit.bpm, self.numerator, self.denominator, subdivision, self.fit.downbeat, anchors)
 

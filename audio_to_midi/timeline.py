@@ -418,11 +418,12 @@ class Timeline(QWidget):
         x, y = event.position().x(), event.position().y()
         drag = self._drag
         if drag:
-            minimum = (drag["note"].start if drag["kind"] == "resize" else drag["start"]) + self.project.grid.subdivision
+            grid = self.project.grid
+            minimum = (drag["note"].start if drag["kind"] == "resize" else drag["start"]) + grid.subdivision / 2
             if drag["kind"] == "create" and not drag["moved"] and abs(x - drag["x"]) < 4:
                 return
             drag["moved"] = True
-            drag["end"] = max(minimum, self._beat(x))
+            drag["end"] = max(minimum, grid.snap_end(self._raw_beat(x)))
             self.update()
             return
         if self._editable() and self._in_roll(x, y):

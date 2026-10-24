@@ -303,6 +303,13 @@ def _correlate_profile(chroma_vector: np.ndarray, profile: np.ndarray, tonic: in
 def detect_key_from_chroma(chroma_vector: np.ndarray) -> str:
     """Detect key from a 12-bin chroma vector.  Returns 'G (Em)' format."""
     chroma_vector = np.asarray(chroma_vector, dtype=np.float32).reshape(-1)
+    if (
+        chroma_vector.size != 12
+        or not np.all(np.isfinite(chroma_vector))
+        or np.any(chroma_vector < 0)
+        or not np.any(chroma_vector > 0)
+    ):
+        raise ValueError("Key detection requires 12 finite, nonnegative chroma values with audible energy.")
     chroma_vector = chroma_vector / (np.sum(chroma_vector) + 1e-9)
 
     best_score, best_tonic, best_mode = -np.inf, 0, "major"
@@ -318,13 +325,3 @@ def detect_key_from_chroma(chroma_vector: np.ndarray) -> str:
         return f"{tonic_name} ({rel}m)"
     rel = _PITCH_NAMES[(best_tonic + 3) % 12]
     return f"{tonic_name}m ({rel})"
-
-
-def detect_key_from_file(wav_path: str, sr: int = 44100) -> str:
-    """Detect key from a WAV file (typically the Piano stem)."""
-    try:
-        audio, _ = librosa.load(wav_path, sr=sr, mono=True)
-        chroma = librosa.feature.chroma_cqt(y=audio, sr=sr, hop_length=512, bins_per_octave=36)
-        return detect_key_from_chroma(np.mean(chroma, axis=1))
-    except Exception:
-        return "? (?)"

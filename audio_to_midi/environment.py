@@ -18,6 +18,7 @@ OPTIONAL_PACKAGES = {
     "scikit-learn": "sklearn", "piano-transcription-inference": "piano_transcription_inference",
     "adtof-pytorch": "adtof_pytorch", "demucs": "demucs",
 }
+PIANO_HR_CHECKPOINT = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
 
 
 def inspect_environment() -> dict:
@@ -43,11 +44,10 @@ def inspect_environment() -> dict:
                 except ImportError as exc:
                     packages[distribution]["import_error"] = str(exc)
                     missing.append(distribution)
-    checkpoint = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
     return {
         "python": sys.version.split()[0], "executable": sys.executable,
         "base_ready": not missing, "missing_base": missing, "packages": packages,
-        "piano_hr_checkpoint_local": checkpoint.is_file(),
+        "piano_hr_checkpoint_local": PIANO_HR_CHECKPOINT.is_file(),
         "notes": [
             "Optional neural models are not required to edit projects, import/export MIDI, or use pYIN.",
             "Basic Pitch 0.4.0 uses ONNX here; its mandatory TensorFlow package metadata can make pip check report TensorFlow missing.",

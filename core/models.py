@@ -136,11 +136,13 @@ class CorrectionModel:
             self._cand_src.append(source)
 
     @staticmethod
-    def _map_candidate_row(row: list[float] | tuple[float, ...]) -> list[float] | None:
+    def _map_candidate_row(row: list[float] | tuple[float, ...]) -> list[float]:
         """Map legacy candidate row shapes to the active 4-feature format."""
         if not isinstance(row, (list, tuple)) or len(row) < 3:
-            return None
+            raise ValueError("Candidate rows require at least three numeric features.")
         vals = [float(v) for v in row]
+        if not all(np.isfinite(v) for v in vals):
+            raise ValueError("Candidate features must be finite.")
         if len(vals) >= 5:
             return [vals[0], vals[1], vals[2], vals[4]]
         if len(vals) == 4:
@@ -154,31 +156,25 @@ class CorrectionModel:
         """Return normalized candidate rows from new or legacy profile payloads."""
         out: list[dict] = []
         if "cand" in data:
-            for item in data.get("cand", []):
-                source = str(item.get("source", "user"))
-                if user_only and source != "user":
-                    continue
-                mapped = cls._map_candidate_row(item.get("row", []))
-                if mapped is None:
-                    continue
-                out.append({
-                    "row": mapped,
-                    "label": int(item.get("label", 0)),
-                    "key": item.get("key"),
-                    "source": source,
-                })
-            return out
-
-        # Backward compatibility with older saved profiles.
-        for row, label in zip(data.get("cand_X", []), data.get("cand_y", [])):
-            mapped = cls._map_candidate_row(row)
-            if mapped is None:
+            candidates = data["cand"]
+        else:
+            # Backward compatibility with older saved profiles.
+            rows, labels = data.get("cand_X", []), data.get("cand_y", [])
+            if len(rows) != len(labels):
+                raise ValueError("Legacy candidate rows and labels must have matching lengths.")
+            candidates = [{"row": row, "label": label} for row, label in zip(rows, labels)]
+        for item in candidates:
+            source = str(item.get("source", "user"))
+            if user_only and source != "user":
                 continue
+            label = item.get("label")
+            if label not in (0, 1):
+                raise ValueError("Candidate labels must be binary (0 or 1).")
             out.append({
-                "row": mapped,
+                "row": cls._map_candidate_row(item.get("row", [])),
                 "label": int(label),
-                "key": None,
-                "source": "user",
+                "key": item.get("key"),
+                "source": source,
             })
         return out
 
@@ -660,10 +656,11 @@ class CorrectionModel:
         }
 
     def load_dict(self, data: dict, merge: bool = False):
+        candidate_rows = self.candidate_rows_from_payload(data, user_only=False)
         if not merge:
             self.__init__()
 
-        for item in self.candidate_rows_from_payload(data, user_only=False):
+        for item in candidate_rows:
             self._append_candidate_sample(
                 item["row"],
                 bool(int(item["label"])),

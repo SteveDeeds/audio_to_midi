@@ -104,3 +104,7 @@ class Grid:
         beat_value(beat, "beat", nonnegative=False)
         steps = beat / self.subdivision + Fraction(1, 2)
         return (steps.numerator // steps.denominator) * self.subdivision
+
+    def snap_end(self, beat: Fraction) -> Fraction:
+        """Snap a note release to half-grid intervals, using the same tie rule."""
+        return self.snap(beat * 2) / 2

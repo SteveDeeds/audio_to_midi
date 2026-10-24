@@ -73,6 +73,35 @@ class TestCorrectionModelProfiles(unittest.TestCase):
         self.assertEqual(rows[0]["label"], 1)
         self.assertEqual(rows[0]["row"], [0.1, 0.2, -20.0, 0.3])
 
+    def test_malformed_candidate_profiles_raise_instead_of_dropping_rows(self) -> None:
+        for payload in (
+            {"cand": [{"row": [0.1, 0.2], "label": 1}]},
+            {"cand": [{"row": [0.1, 0.2, float("nan")], "label": 1}]},
+            {"cand": [{"row": [0.1, 0.2, -20.0], "label": 2}]},
+            {"cand": [{"row": [0.1, 0.2, -20.0]}]},
+            {"cand_X": [[0.1, 0.2, -20.0]], "cand_y": []},
+        ):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                CorrectionModel.candidate_rows_from_payload(payload)
+
+    def test_supported_legacy_feature_shapes_still_map(self) -> None:
+        payload = {"cand": [
+            {"row": [0.1, 0.2, -20.0], "label": 0},
+            {"row": [0.1, 0.2, -20.0, 99.0, 0.3], "label": 1},
+        ]}
+        rows = CorrectionModel.candidate_rows_from_payload(payload)
+        self.assertEqual([row["row"] for row in rows], [
+            [0.1, 0.2, -20.0, 0.0], [0.1, 0.2, -20.0, 0.3],
+        ])
+
+    def test_invalid_candidate_profile_does_not_reset_existing_model(self) -> None:
+        model = CorrectionModel()
+        model.instrument_dictionary.add_atom(60, np.ones(4, dtype=np.float32))
+        before = model.to_dict(user_only=False)
+        with self.assertRaises(ValueError):
+            model.load_dict({"cand": [{"row": [1.0], "label": 1}]})
+        self.assertEqual(model.to_dict(user_only=False), before)
+
 
 if __name__ == "__main__":
     unittest.main()

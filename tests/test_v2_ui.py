@@ -84,6 +84,18 @@ class EditorTests(unittest.TestCase):
         self.window._undo()
         self.assertEqual(len(self.window._rows), 1)
 
+    def test_reference_failure_is_visible_and_does_not_cache_a_success(self):
+        ident = (str(self.wav), self.wav.stat().st_mtime_ns)
+        self.window._references.clear()
+        self.window._reference_jobs.clear()
+        with patch("audio_to_midi.ui.song_reference", side_effect=ValueError("invalid audio")), \
+                patch("audio_to_midi.ui.threading.Thread") as thread:
+            thread.side_effect = lambda **kwargs: SimpleNamespace(start=kwargs["target"])
+            self.window._request_reference(ident)
+        self.assertNotIn(ident, self.window._reference_jobs)
+        self.assertNotIn(ident, self.window._references)
+        self.assertIn("ValueError: invalid audio", self.window.status.text())
+
     def test_undo_does_not_restore_obsolete_generated_publication(self):
         self.window._add_note(F(0), 60)
         result = Prediction(F(0), F(4), (Note("new", F(1), F(2), 67),), ())
@@ -1124,6 +1136,60 @@ class EditorTests(unittest.TestCase):
 
         QTest.mouseClick(timeline, left, none, QPoint(round(timeline._x(F(2))), 50))
         self.assertIn(F(2), self.track.notes.onsets)
+
+    def test_dragged_note_ends_use_half_grid_and_preserve_adjacent_notes(self):
+        from dataclasses import replace
+        from PySide6.QtCore import QPointF, Qt
+
+        window, timeline = self.window, self.window.timeline
+        timeline.resize(1400, 400)
+
+        def event(beat, pitch=48):
+            return SimpleNamespace(
+                position=lambda: QPointF(timeline._x(beat), timeline._y(pitch) + timeline._row_height() / 2),
+                button=lambda: Qt.MouseButton.LeftButton,
+            )
+
+        for step in (F(1, 4), F(1, 3)):
+            with self.subTest(step=step):
+                window.project.grid = replace(window.project.grid, subdivision=step)
+                self.track.notes = type(self.track.notes)()
+                window._add_note(F(0), 48, step * 4)
+                window._add_note(step * 4, 48, step * 6)
+                for end in (step * F(7, 2), step * 4, step / 2):
+                    first = window._rows[0]
+                    press = event(first.end)
+                    edge = press.position() - QPointF(2, 0)
+                    press.position = lambda: edge
+                    timeline.mousePressEvent(press)
+                    self.assertEqual(timeline._drag["kind"], "resize")
+                    timeline.mouseMoveEvent(event(end if end > step / 2 else F(0)))
+                    self.assertEqual(timeline._drag["end"], end)
+                    timeline.mouseReleaseEvent(event(end))
+                    self.assertEqual([(n.start, n.end) for n in self.track.notes.resolved()],
+                                     [(F(0), end), (step * 4, step * 6)])
+                    window._undo()
+                    self.assertEqual(window._rows[0].end, first.end)
+                    window._redo()
+                    self.assertEqual(window._rows[0].end, end)
+
+                timeline.mousePressEvent(event(step / 3, 50))
+                timeline.mouseMoveEvent(event(step * F(5, 2), 50))
+                timeline.mouseReleaseEvent(event(step * F(5, 2), 50))
+                drawn = next(n for n in self.track.notes.resolved() if n.pitch == 50)
+                self.assertEqual((drawn.start, drawn.end), (F(0), step * F(5, 2)))
+
+    def test_info_editor_accepts_half_grid_ends_but_not_half_grid_starts(self):
+        step = self.window.project.grid.subdivision
+        self.window._add_note(F(0), 60)
+        note = self.window._rows[0]
+        self.window._edit_note(note, 1, "1", str(step * F(7, 2)), 60, note.velocity)
+        edited = self.window._rows[0]
+        self.assertEqual((edited.start, edited.end), (F(0), step * F(7, 2)))
+        with self.assertRaisesRegex(ValueError, "Start must fit"):
+            self.window._edit_note(edited, 1, str(1 + step / 2), "1", 60, edited.velocity)
+        with self.assertRaisesRegex(ValueError, "note end must fit"):
+            self.window._edit_note(edited, 1, "1", str(step / 3), 60, edited.velocity)
 
     def test_no_note_table_hover_shows_note_stats(self):
         from audio_to_midi.timeline import note_summary

@@ -17,12 +17,10 @@ from fractions import Fraction
 
 import numpy as np
 
+from audio_to_midi.notation import PITCH_CLASSES
+
 NO_CHORD = "N.C."
 NAMES = ("C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B")
-_PC = {
-    "C": 0, "B#": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3, "E": 4, "Fb": 4, "E#": 5,
-    "F": 5, "F#": 6, "Gb": 6, "G": 7, "G#": 8, "Ab": 8, "A": 9, "A#": 10, "Bb": 10, "B": 11, "Cb": 11,
-}
 QUALITIES = {
     "": (0, 4, 7), "m": (0, 3, 7), "dim": (0, 3, 6), "aug": (0, 4, 8),
     "sus2": (0, 2, 7), "sus4": (0, 5, 7),
@@ -49,8 +47,8 @@ def parse(symbol: str) -> tuple[int, str, int | None] | None:
     quality = _ALIASES.get(quality, quality)
     if quality not in QUALITIES:
         raise ValueError(f"Unsupported chord quality {quality!r} in {symbol!r}")
-    bass_pc = _PC[bass] if bass else None
-    root_pc = _PC[root]
+    bass_pc = PITCH_CLASSES[bass] if bass else None
+    root_pc = PITCH_CLASSES[root]
     return root_pc, quality, None if bass_pc == root_pc else bass_pc
 
 

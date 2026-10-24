@@ -56,11 +56,20 @@ project editor:
 ```
 
 The former single-stem application is retired and its unused engine, window,
-and workers have been removed. This does not delete or migrate any projects,
+workers, and chord-analysis pipeline have been removed. Chord symbols, voicings,
+and template recognition now live in `audio_to_midi.chords`; the shared
+key-to-scale helper remains in `core.chord_analysis`.
+This does not delete or migrate any projects,
 audio, MIDI, profiles, logs, or model caches. Existing project-editor projects
 and preferences keep their current formats and settings location. Compatible
 onset examples can still be imported from older profiles; legacy session state
 is not converted automatically.
+
+Malformed candidate-profile rows, unknown model features, invalid key-analysis
+inputs, and invalid tempo curves now raise errors instead of being skipped or
+replaced by defaults. Spectrogram-reference failures appear in the status bar
+and are not cached as successful measurements. Valid legacy onset-feature
+formats remain supported.
 
 The unversioned installer uses `.env` by default (matching `activate.ps1`).
 Use `.\install.ps1 -Environment .venv-v2` to update an existing preview
@@ -233,19 +242,26 @@ There are two tools, with buttons next to **Grid** (or **View** menu):
 | Action | Result |
 |---|---|
 | Click an empty cell | Add a note one beat long |
-| Drag from an empty cell | Add a note and set its length |
+| Drag from an empty cell | Add a note and set its length, with the end snapping to half-grid intervals |
 | Click a note | Select it |
-| Drag a note's right edge | Change its length |
+| Drag a note's right edge | Change its length, snapping the end to half-grid intervals |
 | Right-click a note, or **Delete** | Reject it (that pitch stays silent there) |
 | Right-click empty space | *Rest for this beat* / *Rest for this bar* (silence all pitches) |
 | Click the onset lane | Add an onset (note-attack boundary) |
 | Right-click the onset lane | Remove the nearest onset |
 
+Note starts stay on the selected grid; dragged note ends can land halfway
+between grid lines, with a minimum length of half a grid cell. Extend a note
+to the next note's start for connected (legato) playback, or leave a half-grid
+gap for a separate articulation. Clicking an empty cell still adds a
+one-beat note.
+
 - **Info (I)**: click a note to open a small editor with its bar, beat, length
   in beats, pitch and velocity, plus **Delete note**. Beats accept `2 1/2`,
   `5/2` or `2.5`; pitches accept `Eb4` or `63`. Clicking empty space does
   nothing, so you can inspect notes without adding any. Right-click still
-  deletes.
+  deletes. Starts must fit the selected grid; note ends can use half-grid
+  intervals, just like dragging.
 
 **Drums** have their own view: the spectrogram fills the top half, and below it
 are ADTOF's five lanes - Cymbal, Hi-hat, Tom, Snare and Kick - instead of piano
