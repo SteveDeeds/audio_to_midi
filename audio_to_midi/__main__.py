@@ -11,7 +11,7 @@ def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="Audio to MIDI project editor")
     commands = root.add_subparsers(dest="command")
     commands.add_parser("doctor", help="Inspect environment without installing or downloading models")
-    create = commands.add_parser("create", help="Create an externally warped project")
+    create = commands.add_parser("create", help="Create a project with a constant tempo")
     create.add_argument("folder", type=Path)
     create.add_argument("--name", default="Untitled")
     create.add_argument("--bpm", type=float, required=True, help="Quarter notes per minute")
@@ -20,7 +20,7 @@ def parser() -> argparse.ArgumentParser:
     create.add_argument("--offset", type=float, default=0, help="Shared downbeat in audio seconds")
     create.add_argument("--key", default="")
     create.add_argument("--mix", type=Path)
-    stem = commands.add_parser("add-stem", help="Import a role-assigned, already-warped stem")
+    stem = commands.add_parser("add-stem", help="Import a role-assigned stem aligned to the mix")
     stem.add_argument("folder", type=Path)
     stem.add_argument("role", choices=["bass", "vocals", "piano", "guitar", "drums", "other"])
     stem.add_argument("audio", type=Path)
@@ -47,28 +47,10 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("output", type=Path)
     export.add_argument("--allow-partial", action="store_true")
     export.add_argument("--role", choices=["bass", "vocals", "piano", "guitar", "drums", "chords"], help="Export one stem or just the chord track; default is combined MIDI")
-    prepare = commands.add_parser("prepare", help="Inspect/experimentally warp an ORIGINAL full mix")
-    prepare.add_argument("mix", type=Path)
-    prepare.add_argument("artifacts", type=Path)
-    prepare.add_argument("--bpm", type=float)
-    prepare.add_argument("--meter")
-    prepare.add_argument("--downbeat", type=float)
-    prepare.add_argument("--anchors", type=Path, help="JSON pairs [source_seconds, quarter_position]")
-    prepare.add_argument("--lead-in", choices=["trim", "pad"], help="Required to render; otherwise inspect only")
-    prepare.add_argument("--new-revision", action="store_true", help="Preserve old outputs and explicitly invalidate descendants")
-    register = commands.add_parser("register-warped", help="Register an EXTERNAL warped mix verbatim, without re-warping")
-    register.add_argument("mix", type=Path)
-    register.add_argument("artifacts", type=Path)
-    register.add_argument("--bpm", type=float, required=True)
-    register.add_argument("--meter", default="4/4")
-    register.add_argument("--offset", type=float, default=0)
-    register.add_argument("--new-revision", action="store_true")
-    attach = commands.add_parser("attach-prepared", help="Attach a prepared mix to an EMPTY project")
-    attach.add_argument("folder", type=Path)
-    attach.add_argument("artifacts", type=Path)
     separate = commands.add_parser(
-        "separate", help="Demucs htdemucs_6s separation of a prepared full mix (installs/downloads on first use)",
+        "separate", help="Demucs htdemucs_6s separation of the full mix (installs/downloads on first use)",
     )
+    separate.add_argument("mix", type=Path)
     separate.add_argument("artifacts", type=Path)
     separate.add_argument("--new-revision", action="store_true")
     separate.add_argument("--project", type=Path, help="Import all six outputs into an empty project")
@@ -114,54 +96,28 @@ def main(argv: list[str] | None = None) -> int:
         from audio_to_midi.timebase import Grid
         from audio_to_midi.storage import load_project, save_project
         from audio_to_midi.application import (
-            add_stem, analyze_harmony, attach_prepared, complete, publish, token, track_end,
+            add_stem, analyze_harmony, complete, publish, token, track_end,
             TranscriptionService,
         )
         from audio_to_midi.adapters import MODELS, normalize_key
         from audio_to_midi.midi import export_midi, import_notes
 
-        if args.command in ("prepare", "register-warped", "separate"):
-            import json
-            import sys
-            from audio_to_midi.pipeline import ArtifactStore, prepare_mix, register_warped_mix, separate_mix
+        if args.command == "separate":
+            from audio_to_midi.pipeline import ArtifactStore, separate_mix
 
-            if args.command == "register-warped":
-                registered = register_warped_mix(
-                    args.mix, args.artifacts, bpm=args.bpm,
-                    meter=tuple(int(x) for x in args.meter.split("/")),
-                    offset_seconds=args.offset, force_new_revision=args.new_revision,
-                )
-                print(f"External mix registered verbatim: {registered['warp_revision']['id']}")
-            elif args.command == "prepare":
-                anchors = json.loads(args.anchors.read_text(encoding="utf-8")) if args.anchors else []
-                meter = tuple(int(x) for x in args.meter.split("/")) if args.meter else None
-                prepared = prepare_mix(
-                    args.mix, args.artifacts, bpm=args.bpm, meter=meter,
-                    downbeat_seconds=args.downbeat, beat_anchors=anchors, lead_in=args.lead_in,
-                    force_new_revision=args.new_revision,
-                )
-                print(f"Analysis revision: {prepared['analysis_revision']['id']}")
-                if prepared["warp_revision"]:
-                    print(f"EXPERIMENTAL warp revision: {prepared['warp_revision']['id']}; audition before use")
-            else:
-                if args.project:
-                    project = load_project(args.project)
-                    if project.tracks or project.chords:
-                        raise ValueError("Import separation into an empty project to preserve existing edits.")
-                store = ArtifactStore(args.artifacts)
-                warp = store.manifest["active"].get("warp")
-                if not warp:
-                    raise ValueError("No prepared warp revision. Run prepare first.")
-                revision = separate_mix(
-                    store, warp, force_new_revision=args.new_revision, progress=print,
-                )
-                if args.project:
-                    attach_prepared(project, args.artifacts)
-                    for role in MODELS:
-                        add_stem(project, store.output(revision, role), role)
-                    project.stages["preparation"]["separation_revision"] = revision["id"]
-                    save_project(project, args.project)
-                print(f"Separation revision: {revision['id']}")
+            if args.project:
+                project = load_project(args.project)
+                if project.tracks or project.chords:
+                    raise ValueError("Import separation into an empty project to preserve existing edits.")
+            store = ArtifactStore(args.artifacts)
+            revision = separate_mix(store, args.mix, force_new_revision=args.new_revision, progress=print)
+            if args.project:
+                project.mix_path = project.mix_path or str(args.mix.resolve(strict=True))
+                for role in MODELS:
+                    add_stem(project, store.output(revision, role), role)
+                project.stages["preparation"] = {"directory": str(store.root), "separation_revision": revision["id"]}
+                save_project(project, args.project)
+            print(f"Separation revision: {revision['id']}")
             return 0
         if args.command == "create":
             if (args.folder / "project.json").exists():
@@ -179,10 +135,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Created {project.name}")
             return 0
         project = load_project(args.folder)
-        if args.command == "attach-prepared":
-            attach_prepared(project, args.artifacts)
-            save_project(project, args.folder)
-        elif args.command == "add-stem":
+        if args.command == "add-stem":
             track = add_stem(project, args.audio, args.role)
             if args.model:
                 if args.model not in MODELS[args.role]:

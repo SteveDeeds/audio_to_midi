@@ -50,6 +50,21 @@ class GridTests(unittest.TestCase):
         self.assertEqual(grid.snap(F(-1, 6)), F(0))
         self.assertEqual(Grid().snap(F(3, 8)), F(1, 2))
 
+    def test_anchors_pin_exactly_interpolate_and_extrapolate(self):
+        grid = Grid(anchors=((1.0, F(0)), (3.0, F(4)), (4.0, F(8))))
+        self.assertEqual(grid.seconds_to_beat(3.0), F(4))
+        self.assertEqual(grid.beat_to_seconds(F(8)), 4.0)
+        self.assertAlmostEqual(float(grid.seconds_to_beat(2.0)), 2)
+        self.assertAlmostEqual(float(grid.seconds_to_beat(4.5)), 10)  # last segment's tempo continues
+        self.assertAlmostEqual(grid.beat_to_seconds(F(-2)), 0.0)  # first segment's tempo before bar 1
+        for seconds in (0.3, 2.2, 3.7, 9.0):
+            self.assertAlmostEqual(grid.beat_to_seconds(grid.seconds_to_beat(seconds)), seconds)
+        self.assertEqual([(q, round(b, 6)) for q, b in grid.tempos()], [(F(0), 120), (F(4), 240)])
+        self.assertEqual(Grid(90).tempos(), [(F(0), 90)])
+        for anchors in (((1.0, F(0)), (1.0, F(1))), ((1.0, F(1)), (2.0, F(0)))):
+            with self.subTest(anchors=anchors), self.assertRaises(ValueError):
+                Grid(anchors=anchors)
+
     def test_invalid_grid(self):
         cases = [
             {"bpm": 0}, {"bpm": -1}, {"bpm": float("nan")},
@@ -306,7 +321,8 @@ class StorageTests(unittest.TestCase):
         self.media.write_bytes(b"synthetic fixture")
         self.external = self.fixture / "outside.wav"
         self.external.write_bytes(b"synthetic external fixture")
-        self.project = Project.create("Música", Grid(123.5, 12, 8, F(1, 3), -0.125))
+        self.project = Project.create("Música", Grid(
+            123.5, 12, 8, F(1, 3), -0.125, ((0.25, F(0)), (2.0, F(7, 2)), (3.0, F(6)))))
         store = NoteStore(generated=[note("generated", 0, 8), note("voice", 0, 8, 64)])
         store.author(F(1, 3), F(4, 3), 60, 73)
         store.reject(F(2), F(3), None)
@@ -369,7 +385,7 @@ class StorageTests(unittest.TestCase):
         self.project.mix_path = str(original)
         self.project.stages = {
             "timing": {"source": str(original), "beats": None},
-            "preparation": {"directory": str(self.folder / "preparation"), "warp_revision": "w"},
+            "preparation": {"directory": str(self.folder / "preparation"), "separation_revision": "s"},
         }
         save_project(self.project, self.folder)
         data = self.manifest()

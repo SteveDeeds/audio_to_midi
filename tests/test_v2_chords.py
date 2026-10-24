@@ -305,13 +305,13 @@ class StemHarmonyTests(unittest.TestCase):
         self.assertNotEqual(detect_key(harmony_cqt(project)[0]), "B")  # chord audio, bass included
         self.assertEqual(analyze_harmony(project)[0], "B")
 
-    def test_stale_or_missing_stems_fall_back_to_the_mix(self):
+    def test_missing_stems_fall_back_to_the_mix(self):
         from audio_to_midi.application import harmony_sources, stems_for_chords
 
         project = self.project({"piano": self.tone(64, 68, 71), "bass": self.tone(40, level=0.3)})
         self.assertTrue(stems_for_chords(project))
         self.assertTrue(harmony_sources(project).from_stems)
-        project.stages["preparation"] = {"warp_revision": "newer"}
+        project.tracks = [t for t in project.tracks if t.role == "bass"]
         self.assertFalse(stems_for_chords(project))
         self.assertEqual(harmony_sources(project).chords, (project.mix_path,))
 
@@ -447,10 +447,20 @@ class BeatSessionTests(unittest.TestCase):
         self.assertEqual(session.mark_of(6), (2, 1))
         grid = session.grid(F(1, 4))
         self.assertAlmostEqual(grid.offset_seconds, 1.0)
-        self.assertEqual(session.target_bpm(), 120)
-        self.assertGreater(len(session.warp_anchors("smooth")), 2)
+        self.assertEqual((grid.bpm, grid.anchors), (120, ()))  # steady: a constant tempo
         with self.assertRaises(ValueError):
             session.pin(4, 1)  # bar 1 is already pinned elsewhere
+
+    def test_drifting_tempo_maps_pins_exactly_without_stretching_audio(self):
+        session = BeatSession([Beat(0.5 * i + 0.002 * i * i, 0.9) for i in range(48)], 120.0, 30.0)
+        session.pin(2, 1)
+        session.pin(34, 9)
+        grid = session.grid(F(1, 4))
+        self.assertFalse(session.fit.steady)
+        self.assertGreater(len(grid.anchors), 2)
+        for index, quarter in ((2, F(0)), (34, F(32))):
+            self.assertEqual(grid.seconds_to_beat(session.beats[index].time), quarter)
+            self.assertAlmostEqual(grid.beat_to_seconds(quarter), session.beats[index].time)
 
     def test_meter_change_keeps_marks_and_rejects_impossible_beats(self):
         session = self.session()

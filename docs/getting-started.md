@@ -3,15 +3,18 @@
 Audio to MIDI turns a song into editable MIDI. You work through stages, each
 shown in the strip at the top right of the window:
 
-**Mix → Count bars → Warp → Stems → Notes → Chords → Export**
+**Mix → Count bars → Stems → Notes → Chords → Export**
 
 1. Import the full mix.
 2. Find its bars and beats (detect, then fix with pins or tapped downbeats).
-3. Warp the mix to one steady tempo.
-4. Separate or import stems.
-5. Transcribe and correct notes per stem.
-6. Detect and correct a lead-sheet chord track.
-7. Export MIDI and/or a MusicXML lead sheet.
+3. Separate or import stems.
+4. Transcribe and correct notes per stem.
+5. Detect and correct a lead-sheet chord track.
+6. Export MIDI and/or a MusicXML lead sheet.
+
+The audio is never time-stretched. Your pinned downbeats define a tempo map
+that places every moment of the original recording at an exact bar, beat and
+sub-beat, even when the band speeds up or slows down.
 
 Menu items that are not available yet are grayed out; hover over them to see
 what is missing.
@@ -73,7 +76,7 @@ Open it in a separate checkout and use that revision's own dependencies and
 ## 2. Create a project and import the mix
 
 1. **File > New project...** asks for a name, then a parent folder. The project
-   is saved in a new folder named after the project; the warped mix and
+   is saved in a new folder named after the project; the copied mix and
    separated stems are stored there as well.
 2. **File > Import mix...** and choose the full song (WAV or FLAC works best).
    Every project needs a mix; it is the timing reference for everything else.
@@ -117,15 +120,19 @@ app which beats are downbeats, and it counts every other beat from them.
   the number), *Unpin* and *Remove this beat*. Right-click between beats to
   *Add a beat here*, or to *Clear all pins*.
 - **Edit > Clear all pins** also resets downbeat pins without removing beat
-  candidates. It is available when pins exist and the mix has not been warped.
+  candidates. It is available when pins exist.
 - Pin two downbeats several bars apart; the tempo comes from your pins, not
   from the detector's guess. Add more pins where the count drifts.
-- Until the mix is warped, the bar lines and the "Bar N" labels follow your
-  counted beats, so a downbeat pinned to bar N sits exactly on the Bar N line.
-  If the music speeds up or slows down, the bars get narrower or wider instead
-  of drifting away from the pins. A bar that looks squeezed or stretched
-  usually means an extra or missed tap, or a pin set to the wrong bar. The
-  audio itself is not stretched until you warp.
+- The pins and counted beats form the song's tempo map. Bar lines and the
+  "Bar N" labels follow it, so a downbeat pinned to bar N sits exactly on the
+  Bar N line. If the music speeds up or slows down, the bars get narrower or
+  wider instead of drifting away from the pins. A bar that looks squeezed or
+  stretched usually means an extra or missed tap, or a pin set to the wrong
+  bar. A steady song gets one constant tempo; a drifting one shows "avg" in
+  the timing summary. Typing a tempo or bar 1 in **Edit...** replaces the tempo
+  map with one constant tempo.
+- Exported MIDI carries the tempo map as tempo changes, so it lines up with
+  the original recording in a DAW.
 
 **Tap downbeats instead.** Check **Edit > Tap downbeats**. The mix plays from
 the current window, and you press **Space** on the "one" of every bar. Your
@@ -159,43 +166,22 @@ adds clicks (high on downbeats) so you can hear whether the count lines up.
 
 The stage strip shows **Count bars ✓** once the bars are counted.
 
-## 4. Warp the mix
-
-**Edit > Warp mix to tempo...** writes a constant-tempo copy of the mix into
-the project folder, so the bar grid lines up with the music everywhere.
-
-- **Use as-is** skips stretching. It is preselected when the mix already has a
-  steady tempo (for example, it was produced to a click or warped in a DAW).
-- Otherwise choose the **Target tempo**, how the **Anchors** follow your beats,
-  and whether to keep or trim the audio before bar 1.
-
-After warping, the app re-detects beats on the warped mix as a check. Green
-beat lines fall on the grid (within 30 ms); red ones do not. Click any beat
-line to see the summary. Listen with the metronome; if it drifts, return to
-the original mix and recount (below). Stems, chord detection and stem import
-unlock as soon as the mix is warped.
-
-To start over, **Edit > Return to original mix...** discards the warped copy.
-Bar and beat positions of existing notes are kept, but analysis of stems that
-came from the old warp becomes stale (marked **(stale)** in the track list), so
-re-separate or re-import them.
-
-## 5. Get stems
+## 4. Get stems
 
 Either:
 
-- **Edit > Separate stems...** runs Demucs `htdemucs_6s` on the warped mix in
+- **Edit > Separate stems...** runs Demucs `htdemucs_6s` on the original mix in
   the background (a few minutes for a full song on a CPU). The first time, the
   app installs Demucs and downloads its model (about 80 MB) automatically.
   Existing tracks of the same role keep their edits and get the new audio. Or:
 - **File > Import stems...** and choose stems that were separated from the
-  **warped** mix (same length and sample rate). The role is guessed from the
+  imported mix (same length and sample rate). The role is guessed from the
   file name, and you can change it.
 
 The roles are `bass`, `vocals`, `piano`, `guitar`, `drums`, and `other`; one
 track per role. `other` is harmony context only and produces no notes.
 
-## 6. Transcribe and correct notes
+## 5. Transcribe and correct notes
 
 Choose a stem in **Track** and its **Model** next to it:
 
@@ -210,6 +196,8 @@ With **Model > Reanalyze after edits** checked (the default), the visible bars
 are analyzed automatically. **Model > Analyze visible bars** and
 **Analyze whole track** run it on demand; **Cancel analysis** (Esc, or the
 button in the status bar) stops it.
+Background activity messages clear when the task finishes or stops after cancellation.
+Errors and result summaries remain visible.
 
 **Navigate** with **Previous** / **Next** (Left / Right arrow, or PgUp / PgDn);
 each step scrolls half a screen. The label between them
@@ -274,7 +262,7 @@ track.
 Your corrections teach lightweight onset logic for the project; they do not
 retrain the large pitch models.
 
-## 7. Chords
+## 6. Chords
 
 Choose **Chords** in the **Track** selector. From the top down, the view shows
 the mix amplitude, the chord lane, and a 12-row chroma (one row per pitch
@@ -282,7 +270,7 @@ class, bright where that note sounds). The chord's tones are outlined in the
 chroma, and bar/beat lines run through every lane.
 
 - **Edit > Detect chords** proposes chords on the beat grid
-  (triads, sevenths, suspended and slash chords). It requires a warped mix.
+  (triads, sevenths, suspended and slash chords). It requires a mix.
   Suspended chords are named as sus4: the notes of Csus2 show as `Gsus4/C`,
   and a typed `Csus2` becomes `Gsus4/C`.
   Separate stems first for the best results: with current stems, chords come
@@ -340,7 +328,7 @@ chroma, and bar/beat lines run through every lane.
 
 Undo and redo work in the Chords view too. Playback adds voiced chords.
 
-## 8. Listen
+## 7. Listen
 
 **Play** (or Space) plays from the start of the visible window; **Stop** ends
 it, and the view follows the playhead. In a stem view you hear the stem mostly
@@ -363,7 +351,7 @@ The setting is remembered.
   from audio; use **MIDI sync test** and adjust **MIDI latency** until the click
   and the wood block sound together. The setting is stored on this computer.
 
-## 9. Export
+## 8. Export
 
 - **File > Export MIDI...** (Ctrl+E): choose all tracks plus chords, a single
   role, or chords only. If tracks are not fully analyzed, the app asks before
@@ -375,12 +363,10 @@ The setting is remembered.
 
 | Symptom | What to check |
 |---|---|
-| A menu item is grayed out | Hover over it: the tooltip says which stage is missing (mix, counted bars, or warp). |
+| A menu item is grayed out | Hover over it: the tooltip says which stage is missing (mix or counted bars). |
 | The count is at double or half speed | Pin two downbeats several bars apart; the count follows your pins. |
 | Tapping did not count bars | Tap the first beat of each bar (not every beat), for at least four bars, in a section with clear drums or bass. Or pin downbeats by hand. |
-| Clicks drift late in the song | Pin another downbeat near the drift, then warp with stretching instead of as-is. |
-| Many red beats after warping | Return to the original mix, add pins where it drifts, and warp again. |
-| A track is marked (stale) | Its audio came from a different warp of the mix. Re-separate or re-import it. |
+| Clicks drift late in the song | Pin another downbeat near the drift; the tempo map follows it. |
 | No notes appear | Check the model selector and the status bar for errors. `other` never produces notes. |
 | Model install fails | First-use installs need an internet connection and write access to the app's Python environment (use a virtual environment rather than a system-wide Python). ADTOF also needs `git`. Or pre-install with `.\install.ps1 -Models`. For a base-only trial, use vocals with `pyin`. |
 | Notes sound late with a MIDI device | Run **MIDI sync test** in **File > Playback settings** and raise the latency. |

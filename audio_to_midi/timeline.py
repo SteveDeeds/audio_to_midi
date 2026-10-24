@@ -6,7 +6,6 @@ Drum tracks swap the piano keys for ADTOF's five lanes under a half-height spect
 from __future__ import annotations
 
 from fractions import Fraction
-import math
 
 import numpy as np
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
@@ -53,18 +52,8 @@ def note_summary(project: Project, note, drums: bool = False) -> str:
     return f"{name} \u00b7 bar {bar}, beat {format_number(beat)} \u00b7 {duration} \u00b7 velocity {note.velocity}"
 
 BEAT_COLORS = {
-    "uncounted": "#7d8796", "counted": "#4fc3d9", "downbeat": "#f5a142",
-    "pin": "#ffe04a", "check_ok": "#5fd38a", "check_bad": "#ff5c5c",
+    "uncounted": "#7d8796", "counted": "#4fc3d9", "downbeat": "#f5a142", "pin": "#ffe04a",
 }
-
-
-def follow_curve(value: float, xs: np.ndarray, ys: np.ndarray) -> float:
-    """Piecewise-linear map through (xs, ys); continues at the end segments' slope outside them."""
-    if value <= xs[0]:
-        return float(ys[0] + (value - xs[0]) * (ys[1] - ys[0]) / (xs[1] - xs[0]))
-    if value >= xs[-1]:
-        return float(ys[-1] + (value - xs[-1]) * (ys[-1] - ys[-2]) / (xs[-1] - xs[-2]))
-    return float(np.interp(value, xs, ys))
 
 
 class Timeline(QWidget):
@@ -105,8 +94,6 @@ class Timeline(QWidget):
         self.beats: list[tuple[float, str, str]] = []
         self.selected_beat: float | None = None
         self.taps: list[float] = []
-        # Mix view before warping: (seconds, quarter) points so bar lines follow the counted beats.
-        self.tempo_map: list[tuple[float, float]] | None = None
         self.playhead: float | None = None
         self.tool = "brush"
         self._drag = None
@@ -138,16 +125,25 @@ class Timeline(QWidget):
         rows = len(DRUM_LANES) if self.drums else self.high - self.low + 1
         return (self._roll_bottom() - self._rows_top()) / rows
 
-    def _x(self, beat: Fraction) -> float:
-        width = max(1, self.width() - self.KEYS)
-        return self.KEYS + float(beat - self.start) / float(self.end - self.start) * width
+    def _span(self) -> tuple[float, float]:
+        grid = self.project.grid
+        return grid.beat_to_seconds(self.start), grid.beat_to_seconds(self.end)
 
     def _x_seconds(self, seconds: float) -> float:
-        return self._x(self.project.grid.seconds_to_beat(seconds))
+        """The x axis is linear in the original audio's time; bar lines follow the tempo map."""
+        width = max(1, self.width() - self.KEYS)
+        s0, s1 = self._span()
+        return self.KEYS + (seconds - s0) / max(1e-9, s1 - s0) * width
+
+    def _x(self, beat: Fraction) -> float:
+        return self._x_seconds(self.project.grid.beat_to_seconds(Fraction(beat)))
+
+    def _seconds(self, x: float) -> float:
+        s0, s1 = self._span()
+        return s0 + (x - self.KEYS) / max(1, self.width() - self.KEYS) * (s1 - s0)
 
     def _raw_beat(self, x: float) -> Fraction:
-        fraction = Fraction(str(round((x - self.KEYS) / max(1, self.width() - self.KEYS), 6)))
-        return self.start + fraction * (self.end - self.start)
+        return self.project.grid.seconds_to_beat(self._seconds(x)).limit_denominator(1_000_000)
 
     def _beat(self, x: float) -> Fraction:
         return self.project.grid.snap(self._raw_beat(x))
@@ -290,43 +286,13 @@ class Timeline(QWidget):
                 painter.setPen(QPen(QColor("#ffffff"), 1))
                 painter.drawLine(x, self.LANE_TOP, x, bottom)
 
-    def counted_times(self) -> tuple[np.ndarray, np.ndarray] | None:
-        """(seconds, quarters) of the Mix view's counted tempo map, or None when the grid is constant."""
-        if self.mode != "mix" or not self.tempo_map or len(self.tempo_map) < 2:
-            return None
-        return (np.array([t for t, _ in self.tempo_map], dtype=float),
-                np.array([q for _, q in self.tempo_map], dtype=float))
-
-    def counted(self, beat: Fraction) -> Fraction:
-        """The counted (tempo-map) beat at a grid position; the beat itself when no map applies."""
-        curve = self.counted_times()
-        if curve is None or self.project is None:
-            return beat
-        value = follow_curve(self.project.grid.beat_to_seconds(beat), *curve)
-        return Fraction(value).limit_denominator(1000)
-
     def _grid_lines(self):
-        """(beat, x) of each visible grid line; in the Mix view they follow the counted tempo map."""
-        grid = self.project.grid
-        step = grid.subdivision
-        if self.mode != "mix" or not self.tempo_map or len(self.tempo_map) < 2:
-            beat = self.start
-            while beat < self.end:
-                yield beat, round(self._x(beat))
-                beat += step
-            return
-        seconds = np.array([t for t, _ in self.tempo_map], dtype=float)
-        quarters = np.array([q for _, q in self.tempo_map], dtype=float)
-        first = follow_curve(grid.beat_to_seconds(self.start), seconds, quarters)
-        last = follow_curve(grid.beat_to_seconds(self.end), seconds, quarters)
-        beat = math.floor(first / float(step)) * step
-        limit = 4 * int((self.end - self.start) / step) + 256
-        while float(beat) < last and limit > 0:
-            x = round(self._x_seconds(follow_curve(float(beat), quarters, seconds)))
-            if x >= self.KEYS:
-                yield beat, x
+        """(beat, x) of each visible grid line."""
+        step = self.project.grid.subdivision
+        beat = self.start
+        while beat < self.end:
+            yield beat, round(self._x(beat))
             beat += step
-            limit -= 1
 
     def _paint_lanes(self, painter: QPainter) -> None:
         top, height, width = self._rows_top(), self._row_height(), self.width()
@@ -406,7 +372,7 @@ class Timeline(QWidget):
         right = event.button() == Qt.MouseButton.RightButton
         if self.mode == "mix":
             if x >= self.KEYS and y < self.ROLL_TOP and (left or right):
-                seconds = self.project.grid.beat_to_seconds(self._raw_beat(x))
+                seconds = self._seconds(x)
                 self.beat_clicked.emit(float(seconds), right, self._global(event))
             elif right and self._in_roll(x, y):
                 self.context_requested.emit(self._raw_beat(x), self._pitch(y), self._global(event))

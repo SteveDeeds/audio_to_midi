@@ -1,8 +1,8 @@
-"""Beat candidates, user-pinned labeling, and tempo fitting for full-mix preparation.
+"""Beat candidates, user-pinned labeling, and tempo fitting for the mix.
 
-Times are source seconds in the ORIGINAL mix; positions are quarter notes
-relative to bar 1's downbeat (quarter 0), matching ``pipeline.analyze_mix``
-anchors. The tracker proposes pulses only; bar positions come from user pins.
+Times are source seconds in the original mix; positions are quarter notes
+relative to bar 1's downbeat (quarter 0), matching ``Grid.anchors``.
+The tracker proposes pulses only; bar positions come from user pins.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ MAX_DRIFT = 0.1  # local tempo may deviate this much from the pinned tempo while
 SMOOTH_QUARTERS = 8.0  # half-width of the local tempo fit used for the smoothed curve
 OUTLIER_SECONDS = 0.06
 OUTLIER_FRACTION = 0.15  # of one pulse
-STEADY_DRIFT_MS = 30.0  # below this, a constant tempo fits and warping is unnecessary
+STEADY_DRIFT_MS = 30.0  # below this, a constant tempo fits and no tempo map is needed
 
 
 @dataclass
@@ -140,7 +140,7 @@ def label(beats: list[Beat], unit: Fraction) -> list[Fraction | None]:
     ``unit`` is the pulse length in quarters (normally one meter beat). Beats
     between two pins are spaced by interpolation and rounded to the unit; beats
     beyond the outermost pins are counted outward, following the local period.
-    Unlabeled (None) beats are off-grid or duplicates and are not warp anchors.
+    Unlabeled (None) beats are off-grid or duplicates and are not tempo-map anchors.
     """
     unit = Fraction(unit)
     if unit <= 0:
@@ -289,7 +289,7 @@ def _drop_outliers(beats, labels, unit) -> None:
 
 
 def anchors(beats, labels, mode: str, bar_quarters: Fraction, downbeat: float) -> list[tuple[float, float]]:
-    """Warp anchors (source seconds, quarter); always includes pins and quarter 0 at ``downbeat``.
+    """Tempo-map anchors (source seconds, quarter); always includes pins and quarter 0 at ``downbeat``.
 
     ``smooth`` places one anchor per bar on the smoothed tempo curve (no tracker jitter);
     ``every`` uses each labeled beat's detected time exactly.
@@ -418,7 +418,7 @@ def from_taps(beats: list[Beat], taps, *, lag_seconds: float | None = None) -> T
     # median residual absorbs any remaining error in the estimated tap lag.
     center = float(np.median([residual for _, _, residual in snaps])) if snaps else 0.0
     agreed = [(i, n) for i, n, residual in snaps if abs(residual - center) <= TAP_RESIDUAL]
-    # Pins become exact warp anchors, so prefer confident onsets; weak ones only if needed.
+    # Pins become exact tempo-map anchors, so prefer confident onsets; weak ones only if needed.
     strong = [(i, n) for i, n in agreed if beats[i].confidence >= STRONG_CONFIDENCE]
     indices: list[int] = []
     pinned: list[int] = []

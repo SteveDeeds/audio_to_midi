@@ -7,14 +7,13 @@ import time
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+    QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from audio_to_midi.adapters import normalize_key
 from audio_to_midi.notation import bar_and_beat, beat_length, format_number, pitch_name
 from audio_to_midi.timebase import beat_bpm, quarter_bpm
-from audio_to_midi.timing import WARP_MODES
 from audio_to_midi.preview import tapping_calibration, tapping_offset
 
 
@@ -29,7 +28,7 @@ def _buttons(dialog: QDialog, ok: str = "OK") -> QDialogButtonBox:
 class TimingDialog(QDialog):
     """Edit > Set tempo, meter, and key. Tempo is shown in the meter's beat unit."""
 
-    def __init__(self, parent, grid, key: str, tempo_locked: str = ""):
+    def __init__(self, parent, grid, key: str):
         super().__init__(parent)
         self.setWindowTitle("Tempo, meter, and key")
         layout = QVBoxLayout(self)
@@ -65,10 +64,9 @@ class TimingDialog(QDialog):
         form.addRow("Bar 1 starts at", self.offset)
         form.addRow("Key", self.key)
         layout.addLayout(form)
-        if tempo_locked:
-            self.bpm.setEnabled(False)
-            self.offset.setEnabled(False)
-            note = QLabel(tempo_locked)
+        if grid.anchors:
+            note = QLabel("Tempo is the average of the counted beats. Typing a new tempo or bar 1 "
+                          "replaces the counted tempo map with a constant tempo.")
             note.setWordWrap(True)
             layout.addWidget(note)
         layout.addWidget(_buttons(self, "Apply"))
@@ -238,49 +236,6 @@ class TappingCalibrationDialog(QDialog):
     def _uncorrected(self) -> None:
         self.offset_seconds = 0.0
         self.accept()
-
-
-class WarpDialog(QDialog):
-    """Edit > Warp mix to tempo: stretch to a constant tempo or use the mix as-is."""
-
-    def __init__(self, parent, session, grid):
-        super().__init__(parent)
-        self.setWindowTitle("Warp mix to tempo")
-        layout = QVBoxLayout(self)
-        summary = QLabel(session.summary() if session else (
-            "No beats were detected; the mix will be used as-is with the tempo and bar 1 from "
-            "Edit > Set tempo, meter, and key."
-        ))
-        summary.setWordWrap(True)
-        layout.addWidget(summary)
-        form = QFormLayout()
-        self.as_is = QCheckBox("Use as-is (no stretching) - the mix is already at a constant tempo")
-        self.target = QDoubleSpinBox()
-        self.target.setRange(1, 2000)
-        self.target.setDecimals(4)
-        self.target.setSuffix(" quarter BPM")
-        self.mode = QComboBox()
-        for value, label in WARP_MODES:
-            self.mode.addItem(label, value)
-        self.lead_in = QComboBox()
-        self.lead_in.addItem("Keep audio before bar 1 (pickup)", "pad")
-        self.lead_in.addItem("Trim audio before bar 1", "trim")
-        stretch = session is not None and session.fit is not None
-        self.target.setValue(session.target_bpm() if stretch else grid.bpm)
-        self.as_is.setChecked(not stretch or session.fit.steady)
-        self.as_is.setEnabled(stretch)
-        form.addRow(self.as_is)
-        form.addRow("Target tempo", self.target)
-        form.addRow("Anchors", self.mode)
-        form.addRow("Lead-in", self.lead_in)
-        layout.addLayout(form)
-        self.as_is.toggled.connect(self._toggled)
-        self._toggled(self.as_is.isChecked())
-        layout.addWidget(_buttons(self, "Warp"))
-
-    def _toggled(self, as_is: bool) -> None:
-        for widget in (self.target, self.mode, self.lead_in):
-            widget.setEnabled(not as_is)
 
 
 class NoteInfoDialog(QDialog):

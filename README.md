@@ -1,7 +1,8 @@
 # Audio to MIDI
 
 A machine-learning-assisted audio-to-MIDI project editor. Import a mix, count
-bars, warp, separate stems, correct notes and chords, then export MIDI or a
+bars with pinned downbeats (the audio is never stretched), separate stems,
+correct notes and chords, then export MIDI or a
 MusicXML lead sheet for tools such as MuseScore.
 
 The refactored project editor is now the default and only supported app.

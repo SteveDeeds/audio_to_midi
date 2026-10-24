@@ -1,9 +1,9 @@
-"""Beat counting for the Mix view: detected beats, pins, taps and the tempo fit.
+"""Beat counting for the Mix view: detected beats, pins, taps and the tempo map.
 
 UI-free so the main window and tests share one implementation. Beats are in
-seconds of the ORIGINAL mix; pins are stored as the user's (bar, beat) marks so
-they survive meter edits. The fit becomes the project grid until the mix is
-warped; after warping the grid comes from the warp revision instead.
+seconds of the original mix; pins are stored as the user's (bar, beat) marks so
+they survive meter edits. The audio is never stretched: the counted beats become
+the project grid's tempo map.
 """
 
 from __future__ import annotations
@@ -13,12 +13,7 @@ from fractions import Fraction
 
 from audio_to_midi import beats as beat_logic
 from audio_to_midi.beats import Beat, Fit
-from audio_to_midi.timebase import Grid, beat_bpm
-
-WARP_MODES = (
-    ("smooth", "Smoothed tempo curve (one anchor per bar)"),
-    ("every", "Every counted beat (exact, keeps detector jitter)"),
-)
+from audio_to_midi.timebase import Grid
 
 
 @dataclass
@@ -197,36 +192,21 @@ class BeatSession:
 
     # -- outputs ----------------------------------------------------------
     def grid(self, subdivision: Fraction) -> Grid | None:
-        """The constant-tempo grid through the pins, or None before anything is counted."""
-        if not self.fit:
-            return None
-        bpm = round(self.fit.bpm, 4) if self.fit.steady else self.fit.bpm
-        return Grid(bpm, self.numerator, self.denominator, subdivision, self.fit.downbeat)
+        """The grid through the counted beats and pins, or None before anything is counted.
 
-    def target_bpm(self) -> float:
-        """Suggested warp tempo in quarter notes: exact when steady, else rounded in the meter's beat."""
-        if not self.fit:
-            raise ValueError("Count the bars first: tap downbeats or pin two downbeats.")
-        if self.fit.steady:
-            return round(self.fit.bpm, 4)
-        return round(beat_bpm(self.fit.bpm, self.denominator)) * 4 / self.denominator
-
-    def warp_anchors(self, mode: str) -> list[tuple[float, float]]:
-        if not self.fit:
-            raise ValueError("Pin bar 1's downbeat (and a second downbeat later) before warping.")
-        return beat_logic.anchors(self.beats, self.labels, mode, self.units()[0], self.fit.downbeat)
-
-    def tempo_map(self) -> list[tuple[float, float]] | None:
-        """(source seconds, quarter) points of the counted tempo curve, as a smoothed warp would use them.
-
-        Lets the Mix view draw bars where the pins say they are before the mix is warped.
+        Bars follow the smoothed tempo curve (one anchor per bar) and land exactly on pins;
+        a steady fit, or one whose curve cannot be built, gives a constant-tempo grid.
         """
         if not self.fit:
             return None
+        if self.fit.steady:
+            return Grid(round(self.fit.bpm, 4), self.numerator, self.denominator, subdivision, self.fit.downbeat)
         try:
-            return self.warp_anchors("smooth")
+            points = beat_logic.anchors(self.beats, self.labels, "smooth", self.units()[0], self.fit.downbeat)
         except ValueError:
-            return None
+            points = ()
+        anchors = [(t, Fraction(q).limit_denominator(1_000_000)) for t, q in points]
+        return Grid(self.fit.bpm, self.numerator, self.denominator, subdivision, self.fit.downbeat, anchors)
 
     def summary(self) -> str:
         if not self.pins:
@@ -238,10 +218,7 @@ class BeatSession:
             return "Could not count from the pins yet - pin a second downbeat a few bars later."
         fit = self.fit
         minutes, seconds = divmod(fit.drift_at, 60)
-        verdict = (
-            "steady - use as-is (no stretching)" if fit.steady
-            else "drifts - warp to a fixed tempo"
-        )
+        verdict = "steady tempo" if fit.steady else "tempo drifts - bars follow the counted beats"
         parts = [f"Drift {fit.drift_ms:.0f} ms (near {int(minutes)}:{seconds:04.1f}), {verdict}."]
         if len(self.pins) == 1:
             parts.append("Only one pin: the count may be at double or half speed.")

@@ -2,6 +2,7 @@ from fractions import Fraction as F
 import os
 from pathlib import Path
 import tempfile
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -111,6 +112,55 @@ class EditorTests(unittest.TestCase):
         self.assertIn("missing model", self.window.status.text())
         self.window._add_note(F(0), 60)
         self.assertEqual(len(self.window._rows), 1)
+
+    def test_background_activity_status_clears_when_finished(self):
+        self.window._run(lambda cancel: None, lambda value: None, kind="mix",
+                         message="Computing the chord view spectrum...")
+        self.wait_idle()
+        self.assertEqual(self.window.status.text(), "")
+        self.assertTrue(self.window.cancel_button.isHidden())
+
+    def test_reported_activity_status_clears_when_finished(self):
+        def work(cancel, report):
+            report("Processing batch 1")
+
+        self.window._run(work, lambda value: None, message="Analyzing:", reports=True)
+        self.wait_idle()
+        self.assertEqual(self.window.status.text(), "")
+
+    def test_cancelled_activity_status_clears_when_worker_stops(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.window._run(lambda cancel: release.wait(5), lambda value: self.fail("Cancelled result"),
+                         message="Analyzing...")
+        self.window._cancel()
+        self.assertEqual(self.window.status.text(), "Analyzing...")
+        release.set()
+        self.wait_idle()
+        self.assertEqual(self.window.status.text(), "")
+
+    def test_queued_activity_keeps_status_until_last_job_finishes(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        self.window._run(lambda cancel: None, lambda value: None, kind="mix", message="First task...")
+        self.window._run(lambda cancel: release.wait(5), lambda value: None,
+                         kind="mix", message="Second task...")
+        first = self.window.job
+        timeout = time.monotonic() + 10
+        while self.window.job is first and time.monotonic() < timeout:
+            self.app.processEvents()
+            time.sleep(.005)
+        self.assertIsNot(self.window.job, first)
+        self.assertEqual(self.window.status.text(), "Second task...")
+        release.set()
+        self.wait_idle()
+        self.assertEqual(self.window.status.text(), "")
+
+    def test_background_completion_notice_is_not_cleared_as_activity(self):
+        self.window._run(lambda cancel: None, lambda value: self.window.status.setText("Notes updated."),
+                         message="Analyzing...")
+        self.wait_idle()
+        self.assertEqual(self.window.status.text(), "Notes updated.")
 
     def test_window_renders_and_track_switch_does_not_move_shared_window(self):
         second = add_stem(self.window.project, self.wav, "vocals")
@@ -328,7 +378,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual([a.text().replace("&", "") for a in window.menuBar().actions()],
                          ["File", "Edit", "View", "Model", "Help"])
         self.assertEqual([window.tracks.itemText(i) for i in range(window.tracks.count())], ["bass"])
-        for name in ("detect", "warp", "separate", "import_stems", "chords", "unwarp"):
+        for name in ("detect", "separate", "import_stems", "chords", "clear_pins"):
             self.assertFalse(window.actions[name].isEnabled(), name)
         self.assertTrue(window.actions["analyze"].isEnabled())
         self.assertIn("mix", window.actions["detect"].toolTip())
@@ -336,14 +386,12 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(window.view, "__mix__")
         self.assertEqual([window.tracks.itemText(i) for i in range(window.tracks.count())], ["Mix", "Chords"])
         self.assertTrue(window.actions["detect"].isEnabled())
-        self.assertTrue(window.actions["warp"].isEnabled())
-        self.assertFalse(window.actions["separate"].isEnabled())
+        for name in ("separate", "import_stems", "chords"):
+            self.assertTrue(window.actions[name].isEnabled(), name)  # the original mix is enough
         self.assertIn("Mix \u2713", window.stages.text())
 
-    def test_mix_view_pins_count_bars_and_feed_warp_anchors(self):
-        from PySide6.QtWidgets import QDialog
+    def test_mix_view_pins_count_bars(self):
         from audio_to_midi.beats import Beat
-        from audio_to_midi.dialogs import WarpDialog
         from audio_to_midi.timing import BeatSession
 
         window = self.window
@@ -380,28 +428,6 @@ class EditorTests(unittest.TestCase):
         self.assertIsNone(session.beats[at(9.0)].mark)
         window.timeline.resize(900, 400)
         window.timeline.grab()
-
-        captured = {}
-
-        def fake_prepare(*args, **kwargs):
-            captured.update(kwargs)
-            return {"store": None, "warp_revision": {"id": "w1"}}
-
-        def accept_stretched(dialog):
-            dialog.as_is.setChecked(False)
-            return QDialog.DialogCode.Accepted
-
-        adopted = []
-        with patch.object(WarpDialog, "exec", accept_stretched), \
-                patch("audio_to_midi.pipeline.prepare_mix", fake_prepare), \
-                patch.object(window, "_adopt", lambda store, warp_id: adopted.append(warp_id)):
-            window._warp()
-            self.wait_idle()
-        anchors = captured["beat_anchors"]
-        self.assertEqual(anchors[0], (1.0, 0.0))
-        self.assertTrue(all(a[0] < b[0] and a[1] < b[1] for a, b in zip(anchors, anchors[1:])))
-        self.assertAlmostEqual(captured["bpm"], 120, places=3)
-        self.assertEqual(adopted, ["w1"])
         saved = window.project.stages["timing"]["beats"]
         self.assertEqual(len(saved["beats"]), 72)
 
@@ -419,20 +445,16 @@ class EditorTests(unittest.TestCase):
         for index, bar in ((0, 1), (8, 3), (16, 5), (24, 7)):
             window._pin(index, bar)
         timeline = window.timeline
-        self.assertIsNotNone(timeline.tempo_map)
+        grid = window.project.grid
+        self.assertTrue(grid.anchors)
         timeline.resize(1400, 300)
         timeline.start, timeline.end = Fraction(0), Fraction(28)
         bars = {int(beat / 4) + 1: x for beat, x in timeline._grid_lines() if beat % 4 == 0}
-        grid = window.project.grid
-        drift = 0
         for index, bar in ((0, 1), (8, 3), (16, 5), (24, 7)):
-            pin_x = timeline._x_seconds(times[index])
-            self.assertLessEqual(abs(bars[bar] - pin_x), 1, f"bar {bar}")
-            drift = max(drift, abs(timeline._x(Fraction((bar - 1) * 4)) - pin_x))
-        self.assertGreater(drift, 10)  # a constant-tempo grid would miss the pins
+            self.assertEqual(grid.seconds_to_beat(times[index]), (bar - 1) * 4)
+            self.assertLessEqual(abs(bars[bar] - timeline._x_seconds(times[index])), 1, f"bar {bar}")
         labels = {label: round(timeline._x_seconds(s)) for s, kind, label in timeline.beats if kind == "pin"}
         self.assertEqual(set(labels), {"1", "3", "5", "7"})
-        self.assertEqual(timeline.counted(grid.seconds_to_beat(times[16])), 16)
 
         calls = []
         with patch("audio_to_midi.ui.click_track", side_effect=lambda t, *a: calls.append(list(t)) or 0):
@@ -446,17 +468,16 @@ class EditorTests(unittest.TestCase):
         straight = [x for _, x in timeline._grid_lines()]
         self.assertEqual(len(straight), int(28 / grid.subdivision))
 
-        window.project.stages["preparation"] = {"warp_revision": "warp"}
-        window._refresh()
-        self.assertIsNone(timeline.tempo_map)
-
     def test_edit_menu_clear_all_pins_preserves_beats_and_updates_gating(self):
         from audio_to_midi.beats import Beat
         from audio_to_midi.timing import BeatSession
 
         window = self.window
         action = window.actions["clear_pins"]
-        edit = window.menuBar().actions()[1].menu()
+        from PySide6.QtWidgets import QMenu
+
+        edit = next(m for m in action.associatedObjects() if isinstance(m, QMenu))
+        self.assertEqual(edit.title(), "&Edit")
         actions = edit.actions()
         self.assertEqual(action.text(), "Clear all pins")
         self.assertEqual(actions.index(action), actions.index(window.actions["tap"]) + 1)
@@ -470,13 +491,6 @@ class EditorTests(unittest.TestCase):
         window._pin(8, 2)
         self.assertTrue(action.isEnabled())
 
-        window.project.stages["preparation"] = {"warp_revision": "warp"}
-        window._update_actions()
-        self.assertFalse(action.isEnabled())
-        window.project.stages.pop("preparation")
-        window._update_actions()
-        self.assertTrue(action.isEnabled())
-
         times = [beat.time for beat in window.session.beats]
         action.trigger()
         self.assertEqual(window.session.pins, [])
@@ -488,48 +502,11 @@ class EditorTests(unittest.TestCase):
         saved = window.project.stages["timing"]["beats"]
         self.assertTrue(all(len(beat) == 2 for beat in saved["beats"]))
 
-    def test_warp_as_is_check_confirm_and_return_to_original(self):
-        from PySide6.QtWidgets import QDialog
-        from audio_to_midi.application import stale
-        from audio_to_midi.dialogs import WarpDialog
-
-        window = self.window
-        mix_path = self._mix_only(seconds=4.0)
-        yes = patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes)
-        window._apply_timing((120.0, 4, 4, 0.0, "C"))
-        with patch.object(WarpDialog, "exec", lambda dialog: QDialog.DialogCode.Accepted), \
-                patch.object(window, "_detect") as detect:
-            window._warp()
-            self.wait_idle()
-        self.assertTrue(window.warped)
-        detect.assert_called_once()
-        self.assertTrue(Path(window.project.mix_path).is_file())
-        self.assertNotEqual(Path(window.project.mix_path), mix_path.resolve())
-        self.assertNotIn("confirm", window.actions)
-        self.assertNotIn("Confirm", window.stages.text())
-        self.assertTrue(window.actions["separate"].isEnabled())  # warping alone unlocks stems
-        self.assertTrue(window.actions["import_stems"].isEnabled())
-        self.assertTrue(window.actions["chords"].isEnabled())
-        window.check = [0.5, 1.0, 1.52, 1.6]
-        window._refresh()
-        self.assertEqual([kind for _, kind, _ in window.timeline.beats], ["check_ok", "check_ok", "check_ok", "check_bad"])
-        self.assertIn("max 100 ms", window._check_text())
-        track = add_stem(window.project, mix_path, "bass")
-        window._sync_tracks()
-        self.assertFalse(stale(window.project, track))
-        with yes:
-            window._unwarp()
-        self.assertFalse(window.warped)
-        self.assertEqual(Path(window.project.mix_path), mix_path.resolve())
-        self.assertTrue(stale(window.project, track))
-        self.assertIn("(stale)", window.tracks.itemText(window.tracks.findData(track.id)))
-
     def test_separation_asks_once_and_runs_in_background(self):
         window = self.window
         runs = []
         window._run = lambda *args, **kwargs: runs.append((args, kwargs))
-        self.enterContext(patch.object(ProjectWindow, "warped", property(lambda _: True)))
-        window.project.stages["preparation"] = {"directory": str(self.root / "prep"), "warp_revision": "w1"}
+        self._mix_only(seconds=2.0)
         with patch("audio_to_midi.provision.missing", return_value=["demucs>=4.0.1"]), \
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as ask:
             window._separate()
@@ -546,7 +523,6 @@ class EditorTests(unittest.TestCase):
     def test_chord_detection_offers_separation_without_current_stems(self):
         window = self.window
         mix_path = self._mix_only(seconds=4.0)
-        self.enterContext(patch.object(ProjectWindow, "warped", property(lambda _: True)))
         runs = []
         window._run = lambda *args, **kwargs: runs.append((args, kwargs))
         buttons = QMessageBox.StandardButton
@@ -629,16 +605,14 @@ class EditorTests(unittest.TestCase):
         window._run = lambda *args, **kwargs: runs.append((args, kwargs))
         track = SimpleNamespace(role="bass", model="crepe_tiny", settings={})
         self.enterContext(patch.object(ProjectWindow, "active", property(lambda _: track)))
-        with patch("audio_to_midi.ui.stale", return_value=False), \
-                patch("audio_to_midi.provision.missing", return_value=["torchcrepe>=0.0.23"]), \
+        with patch("audio_to_midi.provision.missing", return_value=["torchcrepe>=0.0.23"]), \
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No) as ask:
             window._analyze(False)
             self.assertEqual(ask.call_count, 1)
             window._analyze(False, auto=True)
             self.assertEqual(ask.call_count, 1, "declined installs are not re-offered automatically")
         self.assertEqual(runs, [])
-        with patch("audio_to_midi.ui.stale", return_value=False), \
-                patch("audio_to_midi.provision.missing", return_value=["torchcrepe>=0.0.23"]), \
+        with patch("audio_to_midi.provision.missing", return_value=["torchcrepe>=0.0.23"]), \
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
             window._analyze(False)
             window._analyze(False, auto=True)
@@ -889,12 +863,12 @@ class EditorTests(unittest.TestCase):
         self.assertEqual([window.models.itemText(i) for i in range(window.models.count())],
                          ["Built-in templates", "BTC transformer (deep learning)"])
         self.assertEqual(window.models.currentData(), "template")
-        window.project.stages["preparation"] = {"warp_revision": "warp"}
         with patch.object(window, "_detect_chords") as detect:
             window.models.setCurrentIndex(window.models.findData("btc"))
             self.app.processEvents()
             self.assertEqual(detect.call_count, 1)
             self.assertIn("BTC", window.status.text())
+            self.assertNotIn("Detecting chords", window.status.text())
             self.assertTrue(window.actions["chord_btc"].isChecked())
             self.assertEqual(window.chord_model, "btc")
             self.assertEqual(window.settings.value("chords/model"), "btc")
@@ -903,11 +877,11 @@ class EditorTests(unittest.TestCase):
             self.assertEqual(detect.call_count, 2)
         self.assertEqual(window.models.currentData(), "template")
         self.assertEqual(window.settings.value("chords/model"), "template")
-        window.project.stages.pop("preparation")
+        window.project.mix_path = None
         with patch.object(window, "_detect_chords") as detect:
             window.actions["chord_btc"].trigger()
             self.app.processEvents()
-        detect.assert_not_called()  # unwarped: nothing to detect yet
+        detect.assert_not_called()  # no mix: nothing to detect yet
         self.wait_idle()
 
     def test_chords_view_edits_with_undo(self):
@@ -1025,7 +999,7 @@ class EditorTests(unittest.TestCase):
 
         window = self.window
         window.settings = QSettings(str(self.root / "settings.ini"), QSettings.Format.IniFormat)
-        window.project.stages["preparation"] = {"warp_revision": "warp"}
+        self._mix_only(seconds=2.0)
         self.assertEqual(window.chord_model, "template")
         with patch.object(window, "_detect_chords") as detect:
             window.actions["chord_btc"].trigger()
@@ -1063,9 +1037,9 @@ class EditorTests(unittest.TestCase):
         from audio_to_midi.domain import ChordSegment
 
         window = self.window
-        window.project.stages["preparation"] = {"warp_revision": "warp"}
+        self._mix_only(seconds=2.0)
         window.project.chords = [ChordSegment(F(0), F(4), "C")]
-        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
+        with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No):
             with patch.object(window, "_run") as run:
                 window._detect_chords()
         callback = run.call_args.args[1]

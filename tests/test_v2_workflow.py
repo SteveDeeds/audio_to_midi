@@ -108,7 +108,8 @@ class WorkflowTests(unittest.TestCase):
         out = self.root / "song.mid"
         export_midi(self.project, out)
         midi = mido.MidiFile(out)
-        self.assertEqual((midi.tracks[0][2].numerator, midi.tracks[0][2].denominator), (6, 8))
+        meter = next(m for m in midi.tracks[0] if m.type == "time_signature")
+        self.assertEqual((meter.numerator, meter.denominator), (6, 8))
         on = [m for track in midi.tracks for m in track if m.type == "note_on"]
         self.assertEqual([m.velocity for m in on], [76, 111, 100])
         self.assertEqual(on[-1].channel, 9)
@@ -121,6 +122,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(events, [("note_on", 0), ("note_off", 320), ("note_on", 0), ("note_off", 320)])
         self.assertFalse(any(m.type == "pitchwheel" for track in midi.tracks for m in track))
         self.assertTrue(app.complete(self.project, other))
+
+    def test_midi_tempo_map_follows_pinned_anchors(self):
+        self.project.grid = Grid(anchors=((0.5, F(0)), (2.5, F(4)), (3.5, F(8))))
+        out = self.root / "map.mid"
+        export_midi(self.project, out)
+        midi = mido.MidiFile(out)
+        tempos, tick = [], 0
+        for m in midi.tracks[0]:
+            tick += m.time
+            if m.type == "set_tempo":
+                tempos.append((tick, round(mido.tempo2bpm(m.tempo), 3)))
+        self.assertEqual(tempos, [(0, 120), (4 * midi.ticks_per_beat, 240)])
 
     def test_starting_midi_is_authoritative_and_honors_tempo_events(self):
         midi = mido.MidiFile()
@@ -309,50 +322,13 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             normalize_key("unknown")
 
-    def test_prepare_attach_and_edited_revision_protection(self):
-        from audio_to_midi.pipeline import RevisionConflict, prepare_mix
-        args = dict(bpm=120, meter=(4, 4), downbeat_seconds=0,
-                    beat_anchors=[(0, 0), (1, 2), (2, 4)], lead_in="trim")
-        result = prepare_mix(self.wav, self.root / "artifacts", **args)
-        project = Project.create("Prepared", Grid())
-        app.attach_prepared(project, self.root / "artifacts")
-        self.assertEqual(project.grid.bpm, 120)
-        self.assertTrue(Path(project.mix_path).is_file())
-        with self.assertRaisesRegex(ValueError, "overwrite"):
-            export_midi(project, self.wav)
-        app.mark_project_edited(project)
-        with self.assertRaises(RevisionConflict):
-            prepare_mix(self.wav, self.root / "artifacts", **{**args, "bpm": 100})
-        self.assertTrue(result["store"].output(result["warp_revision"], "full_mix").is_file())
-
-    def test_cannot_render_a_fixed_tempo_from_a_downbeat_alone(self):
-        from audio_to_midi.pipeline import prepare_mix
-        with self.assertRaisesRegex(ValueError, "at least two"):
-            prepare_mix(self.wav, self.root / "artifacts", bpm=120, meter=(4, 4),
-                        downbeat_seconds=0, lead_in="trim")
-
-    def test_external_warp_registration_never_rewarps_or_invents_a_map(self):
-        from audio_to_midi.pipeline import register_warped_mix
-        with patch("audio_to_midi.pipeline.render_full_mix", side_effect=AssertionError("must not rewarp")):
-            result = register_warped_mix(self.wav, self.root / "external", bpm=75, meter=(12, 8), offset_seconds=.1)
-        copied = result["store"].output(result["warp_revision"], "full_mix")
-        self.assertEqual(copied.read_bytes(), self.wav.read_bytes())
-        self.assertIsNone(result["warp_revision"]["metadata"]["warp_map"])
-        project = Project.create("External", Grid())
-        app.attach_prepared(project, self.root / "external")
-        self.assertEqual((project.grid.bpm, project.grid.numerator, project.grid.denominator), (75, 12, 8))
-        self.assertEqual(project.grid.offset_seconds, .1)
-
     def test_outputs_cannot_overwrite_original_audio(self):
-        from audio_to_midi.pipeline import WarpMap, render_full_mix
         original = self.wav.read_bytes()
         with self.assertRaisesRegex(ValueError, "overwrite"):
             export_midi(self.project, self.wav)
-        with self.assertRaisesRegex(ValueError, "overwrite"):
-            render_full_mix(self.wav, self.wav, WarpMap((0, 2), (0, 2)), lead_in="trim")
         self.assertEqual(self.wav.read_bytes(), original)
 
-    def test_exports_cannot_overwrite_original_mix_after_warping(self):
+    def test_exports_cannot_overwrite_the_timing_source(self):
         from audio_to_midi.domain import ChordSegment
         from audio_to_midi.midi import export_musicxml
 

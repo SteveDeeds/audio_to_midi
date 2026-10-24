@@ -1,12 +1,14 @@
 """Main window: menu bar, Mix / track / Chords views and background jobs.
 
-Stages: import mix -> detect beats -> count bars (tap or pin) -> warp
+Stages: import mix -> detect beats -> count bars (tap or pin)
 -> separate or import stems -> transcribe notes -> chords -> export.
+The audio is never stretched; counted beats and pins form the grid's tempo map.
 """
 
 from __future__ import annotations
 
 from copy import deepcopy
+from dataclasses import replace
 from fractions import Fraction
 from pathlib import Path
 import threading
@@ -25,12 +27,12 @@ from audio_to_midi import beats as beat_logic
 from audio_to_midi.adapters import Cancelled, MODELS
 from audio_to_midi.pipeline import Cancelled as PreparationCancelled
 from audio_to_midi.application import (
-    CHORD_MODELS, HARMONY_ROLES, TranscriptionService, add_stem, adopt_warp, analyze_harmony, complete, covered, current_warp,
+    CHORD_MODELS, HARMONY_ROLES, TranscriptionService, add_stem, analyze_harmony, complete, covered,
     detect_key, harmony_cqt, harmony_sources, import_profile, key_from_chroma, mark_project_edited, media_identity,
-    mix_cqt, publish, record_drum, record_onset, replace_stem, stale, stems_for_chords, token, track_end,
+    mix_cqt, publish, record_drum, record_onset, replace_stem, stems_for_chords, token, track_end,
 )
 from audio_to_midi.chord_view import ChordView
-from audio_to_midi.dialogs import NoteInfoDialog, PlaybackSettingsDialog, TappingCalibrationDialog, TimingDialog, WarpDialog
+from audio_to_midi.dialogs import NoteInfoDialog, PlaybackSettingsDialog, TappingCalibrationDialog, TimingDialog
 from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.midi import export_midi, export_musicxml, import_notes
 from audio_to_midi.notation import (
@@ -40,7 +42,7 @@ from audio_to_midi.preview import SYNC_TEST_PITCH, balance_gains, click_track, m
 from audio_to_midi.spectrogram import colorize, cqt_image, song_reference
 from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
-from audio_to_midi.timeline import PITCH_RANGES, Timeline, follow_curve  # noqa: F401  (re-exported)
+from audio_to_midi.timeline import PITCH_RANGES, Timeline
 from audio_to_midi.timing import BeatSession
 
 MIX, CHORDS = "__mix__", "__chords__"
@@ -109,6 +111,7 @@ class ProjectWindow(QMainWindow):
         self.folder: Path | None = None
         self.service = TranscriptionService()
         self.job: Job | None = None
+        self._job_status = ""
         self.pending = None
         self._installing: set[str] = set()
         self._declined_installs: set[str] = set()
@@ -137,7 +140,6 @@ class ProjectWindow(QMainWindow):
         self._key_dialog = None
         self._key_chroma: dict[tuple, dict] = {}
         self.session: BeatSession | None = None
-        self.check: list[float] | None = None
         self.taps: list[float] = []
         self.bars = 2
         self._clock: tuple[float, float, float] | None = None  # (monotonic start, from seconds, until seconds)
@@ -160,13 +162,7 @@ class ProjectWindow(QMainWindow):
 
     @property
     def timing(self) -> dict:
-        return self.project.stages.setdefault("timing", {
-            "source": self.project.mix_path, "beats": None, "check": None,
-        })
-
-    @property
-    def warped(self) -> bool:
-        return "preparation" in self.project.stages
+        return self.project.stages.setdefault("timing", {"source": self.project.mix_path, "beats": None})
 
     @property
     def tapping(self) -> bool:
@@ -215,9 +211,6 @@ class ProjectWindow(QMainWindow):
         self._act(edit, "clear_pins", "Clear all pins", self._clear_pins)
         self._act(edit, "calibrate_tapping", "Calibrate tapping...", self._calibrate_tapping)
         self._act(edit, "set_timing", "Set tempo, meter, and &key...", self._edit_timing)
-        edit.addSeparator()
-        self._act(edit, "warp", "&Warp mix to tempo...", self._warp)
-        self._act(edit, "unwarp", "Return to original mix...", self._unwarp)
         edit.addSeparator()
         self._act(edit, "separate", "&Separate stems...", self._separate)
         self._act(edit, "chords", "Detect &chords", self._detect_chords)
@@ -288,7 +281,7 @@ class ProjectWindow(QMainWindow):
         row.addWidget(self.models)
         row.addStretch(1)
         self.stages = QLabel()
-        self.stages.setToolTip("Workflow: import the mix, count bars, warp, then stems.")
+        self.stages.setToolTip("Workflow: import the mix, count bars, then stems.")
         row.addWidget(self.stages)
         root.addLayout(row)
 
@@ -434,14 +427,11 @@ class ProjectWindow(QMainWindow):
             self.timeline.selected = None
         self.timeline.beats = self._lane_beats() if view == MIX else []
         self.timeline.taps = list(self.taps) if view == MIX else []
-        self.timeline.tempo_map = (
-            self.session.tempo_map() if view == MIX and self.session is not None and not self.warped else None
-        )
         self.timeline.update()
         self.chord_view.start, self.chord_view.end = self.timeline.start, self.timeline.end
         self.chord_view.update()
-        first = bar_and_beat(grid, self.timeline.counted(self.timeline.start))[0]
-        last = bar_and_beat(grid, self.timeline.counted(max(self.timeline.start, self.timeline.end - grid.subdivision)))[0]
+        first = bar_and_beat(grid, self.timeline.start)[0]
+        last = bar_and_beat(grid, max(self.timeline.start, self.timeline.end - grid.subdivision))[0]
         self.window_label.setText(f"Bar {first}" if first == last else f"Bars {first}\u2013{last}")
         self.zoom_label.setText(f"{self.bars} bar{'s' if self.bars != 1 else ''}/screen")
         self.actions["zoom_in"].setEnabled(self.bars > ZOOMS[0])
@@ -460,63 +450,54 @@ class ProjectWindow(QMainWindow):
 
     def _summary_text(self) -> str:
         grid = self.project.grid
-        if not self.warped and self.session is not None and self.session.fit is None:
+        if self.session is not None and self.session.fit is None:
             tempo = f"~{beat_bpm(self.session.candidate_bpm, grid.denominator):.1f} BPM (bars not counted yet)"
         else:
             tempo = f"{format_number(Fraction(beat_bpm(grid.bpm, grid.denominator)).limit_denominator(10000))} BPM"
+            if len(grid.anchors) > 1:
+                tempo = "avg " + tempo
             if grid.denominator != 4:
                 tempo += f" (1/{grid.denominator} = beat)"
         parts = [
             tempo, f"{grid.numerator}/{grid.denominator}", f"Bar 1: {grid.offset_seconds:.3f} s",
             f"Key: {self.project.key or '-'}",
         ]
-        if self.warped:
-            parts.append("warped")
         track = self.active
         if track:
-            parts.append("stale stem - re-separate or re-import" if stale(self.project, track) else (
-                "notes complete" if complete(self.project, track) else "notes partial / not analyzed"
-            ))
+            parts.append("notes complete" if complete(self.project, track) else "notes partial / not analyzed")
         return " \u00b7 ".join(parts)
 
     def _stage_text(self) -> str:
         def mark(done: bool) -> str:
             return "\u2713" if done else "\u25cb"
 
-        counted = self.warped or bool(self.session and self.session.fit)
+        counted = bool(self.session and self.session.fit)
         stems = len(self.project.tracks)
         return (
             f"Mix {mark(bool(self.project.mix_path))} \u203a Count bars {mark(counted)} \u203a "
-            f"Warp {mark(self.warped)} \u203a Stems ({stems})"
+            f"Stems ({stems})"
         )
 
     def _update_actions(self) -> None:
         has_mix, track, busy = bool(self.project.mix_path), self.active, self.job is not None
-        warped, tapping = self.warped, self.tapping
+        tapping = self.tapping
         transcribable = track is not None and track.role != "other"
         rules = {
-            "import_stems": (warped, "Warp the mix first (Edit > Warp mix to tempo)."),
+            "import_stems": (has_mix, "Import a mix first."),
             "import_midi": (track is not None, "Choose a track first."),
             "import_chords": (has_mix, "Import a mix first."),
             "export": (bool(self.project.tracks or self.project.chords), "Nothing to export yet."),
             "export_xml": (bool(self.project.chords), "Detect or import chords first."),
             "detect": (has_mix and not tapping, "Import a mix first (File > Import mix)."),
-            "tap": (tapping or (self.session is not None and not warped),
-                    "Detect tempo first; tapping counts bars before the mix is warped."),
-            "clear_pins": (bool(self.session and self.session.pins) and not warped,
-                           "Return to original mix to clear pins." if warped else "No downbeat pins to clear."),
+            "tap": (tapping or self.session is not None, "Detect tempo first."),
+            "clear_pins": (bool(self.session and self.session.pins), "No downbeat pins to clear."),
             "calibrate_tapping": (not tapping and not busy, "Finish tapping or cancel the current task first."),
-            "warp": (has_mix and not warped,
-                     "Import a mix first." if not has_mix else "Already warped - use Return to original mix to redo."),
-            "unwarp": (warped, "The mix is not warped."),
-            "separate": (warped, "Warp the mix first (Edit > Warp mix to tempo)."),
-            "chords": (has_mix and warped, "Warp the mix first (Edit > Warp mix to tempo)."),
+            "separate": (has_mix, "Import a mix first."),
+            "chords": (has_mix, "Import a mix first."),
             "clear_track": (track is not None, "Choose a track first."),
             "clear_all": (bool(self.project.tracks or self.project.chords), "Nothing to clear."),
-            "analyze": (transcribable and not stale(self.project, track),
-                        "Choose a transcribable, up-to-date stem."),
-            "analyze_all": (transcribable and not stale(self.project, track),
-                            "Choose a transcribable, up-to-date stem."),
+            "analyze": (transcribable, "Choose a transcribable stem."),
+            "analyze_all": (transcribable, "Choose a transcribable stem."),
             "profile": (track is not None, "Choose a track first."),
             "cancel": (busy, "Nothing is running."),
             "key_chroma": (has_mix, "Import a mix first."),
@@ -531,9 +512,6 @@ class ProjectWindow(QMainWindow):
 
     # -- beat lane ----------------------------------------------------------
     def _lane_beats(self) -> list[tuple[float, str, str]]:
-        if self.warped:
-            return [(s, "check_ok" if abs(d) <= 30 else "check_bad", "" if abs(d) <= 30 else f"{d:+.0f}")
-                    for s, d in self._deviations()]
         session = self.session
         if session is None:
             return []
@@ -550,28 +528,6 @@ class ProjectWindow(QMainWindow):
                 lane.append((beat.time, "counted", ""))
         return lane
 
-    def _deviations(self) -> list[tuple[float, float]]:
-        """Detected beats of the warped mix vs. the nearest half beat of the grid, in ms."""
-        grid = self.project.grid
-        unit = beat_length(grid) / 2
-        result = []
-        for seconds in self.check or []:
-            beat = grid.seconds_to_beat(seconds)
-            nearest = round(beat / unit) * unit
-            result.append((seconds, (seconds - grid.beat_to_seconds(nearest)) * 1000))
-        return result
-
-    def _check_text(self) -> str:
-        values = [abs(d) for _, d in self._deviations()]
-        if not values:
-            return "No beats were detected in the warped mix."
-        bad = sum(v > 30 for v in values)
-        return (
-            f"Warped mix check: {len(values)} beats, median {np.median(values):.0f} ms and max {max(values):.0f} ms "
-            f"from the grid; {bad}             off by more than 30 ms (red). Listen with View > Metronome click, then Edit > Separate stems; "
-            "if it drifts, use Edit > Return to original mix and recount."
-        )
-
     # -- tracks and views ---------------------------------------------------
     def _sync_tracks(self) -> None:
         previous = self.tracks.currentData()
@@ -580,7 +536,7 @@ class ProjectWindow(QMainWindow):
         if self.project.mix_path:
             self.tracks.addItem("Mix", MIX)
         for track in self.project.tracks:
-            self.tracks.addItem(track.role + (" (stale)" if stale(self.project, track) else ""), track.id)
+            self.tracks.addItem(track.role, track.id)
         if self.project.mix_path:
             self.tracks.addItem("Chords", CHORDS)
         index = self.tracks.findData(previous) if previous else -1
@@ -645,7 +601,7 @@ class ProjectWindow(QMainWindow):
         reference = self._references.get(ident)
         if reference is None:
             self._request_reference(ident)
-        key = (*ident, grid.bpm, grid.offset_seconds, self.timeline.start, self.timeline.end, reference)
+        key = (*ident, grid, self.timeline.start, self.timeline.end, reference)
         if key not in self._cqt_cache:
             # Read only the visible window; never load a whole file on the UI thread.
             with sf.SoundFile(path) as audio:
@@ -740,7 +696,7 @@ class ProjectWindow(QMainWindow):
         if not self.project.mix_path:
             raise ValueError("Import a mix first.")
         sources = [("key", "Key detection input"), ("mix", "Full mix")] + [
-            (track.id, f"{track.role.title()} stem" + (" (stale)" if stale(self.project, track) else ""))
+            (track.id, f"{track.role.title()} stem")
             for track in self.project.tracks if track.audio_path and Path(track.audio_path).exists()
         ]
         if self._key_dialog is not None:
@@ -791,8 +747,8 @@ class ProjectWindow(QMainWindow):
 
     def _redetect_with(self, name: str) -> None:
         """Switching recognizer re-runs detection so the change is visible right away."""
-        if self.warped:
-            self.status.setText(f"Chord recognizer: {CHORD_MODELS[name]}. Detecting chords...")
+        if self.project.mix_path:
+            self.status.setText(f"Chord recognizer: {CHORD_MODELS[name]}.")
             QTimer.singleShot(0, self._detect_chords_safely)
 
     def _detect_chords_safely(self) -> None:
@@ -848,17 +804,21 @@ class ProjectWindow(QMainWindow):
         grid = self.project.grid
         if value is None or value == grid.subdivision:
             return
-        self.project.grid = Grid(grid.bpm, grid.numerator, grid.denominator, value, grid.offset_seconds)
+        self.project.grid = replace(grid, subdivision=value)
         self.project.revision += 1
         self._cancel(analysis_only=True)
         self._refresh()
         self._queue_visible()
 
     # -- background jobs ---------------------------------------------------
+    def _show_job_status(self, text: str) -> None:
+        self._job_status = text
+        self.status.setText(text)
+
     def _run(self, operation, callback, kind: str = "analysis", message: str = "", reports: bool = False) -> None:
         """``reports`` operations take (cancelled, report) and stream status lines."""
         if self.job is not None:
-            # Note analysis is cheap to restart; other jobs (detection, warp, separation) run to completion.
+            # Note analysis is cheap to restart; other jobs (detection, separation) run to completion.
             if getattr(self.job, "kind", "analysis") == "analysis":
                 self.job.cancelled.set()
             self.pending = operation, callback, kind, message, reports
@@ -866,7 +826,7 @@ class ProjectWindow(QMainWindow):
         job = Job(operation, self, reports)
         job.kind = kind
         if reports:
-            job.progress.connect(lambda line, m=message: self.status.setText(f"{m}  {line}" if m else line))
+            job.progress.connect(lambda line, m=message: self._show_job_status(f"{m}  {line}" if m else line))
         self.job = job
         job.result.connect(lambda value: self._guard(lambda: callback(value)))
         job.error.connect(lambda text, k=kind: self.status.setText(
@@ -874,12 +834,15 @@ class ProjectWindow(QMainWindow):
         ))
         job.finished.connect(self._job_finished)
         job.start()
-        self.status.setText(message or "Working in background; edits remain available. Cancel stops between model batches.")
+        self._show_job_status(message or "Working in background; edits remain available. Cancel stops between model batches.")
         self._update_actions()
 
     def _job_finished(self) -> None:
         old, self.job = self.job, None
         old.deleteLater()
+        if self.status.text() == self._job_status:
+            self.status.clear()
+        self._job_status = ""
         if self.pending:
             pending, self.pending = self.pending, None
             self._run(*pending)
@@ -902,7 +865,7 @@ class ProjectWindow(QMainWindow):
     # -- note analysis ----------------------------------------------------
     def _queue_visible(self) -> None:
         track = self.active
-        if not self.auto.isChecked() or track is None or track.role == "other" or stale(self.project, track):
+        if not self.auto.isChecked() or track is None or track.role == "other":
             return
         end = min(self.timeline.end, track_end(self.project, track))
         if self.timeline.start < end and not covered(self.project, track, self.timeline.start, end):
@@ -911,8 +874,6 @@ class ProjectWindow(QMainWindow):
     def _analyze(self, whole: bool, auto: bool = False) -> None:
         if not self.active or self.active.role == "other":
             raise ValueError("Choose a transcribable stem.")
-        if stale(self.project, self.active):
-            raise ValueError("This stem belongs to an older warp of the mix; re-separate or re-import it first.")
         from audio_to_midi import provision
 
         model = self.active.model
@@ -1248,7 +1209,7 @@ class ProjectWindow(QMainWindow):
 
     # -- project files ----------------------------------------------------
     def _confirm_replace(self) -> bool:
-        if self.session is not None or self.check is not None or "timing" in self.project.stages:
+        if self.session is not None or "timing" in self.project.stages:
             self._store_timing()
         return self.project == self._saved_project or QMessageBox.question(
             self, "Unsaved changes", "Unsaved changes will be lost. Continue?",
@@ -1259,12 +1220,11 @@ class ProjectWindow(QMainWindow):
         self._history.clear()
         self._future.clear()
         self.taps = []
-        self.session, self.check = None, None
+        self.session = None
         timing = self.project.stages.get("timing") or {}
         if timing.get("beats"):
             grid = self.project.grid
             self.session = BeatSession.from_json(timing["beats"], grid.numerator, grid.denominator)
-        self.check = timing.get("check")
         if self._key_dialog is not None:
             self._key_dialog.close()
             self._key_dialog = None
@@ -1334,7 +1294,6 @@ class ProjectWindow(QMainWindow):
     def _store_timing(self) -> None:
         timing = self.timing
         timing["beats"] = self.session.to_json() if self.session else None
-        timing["check"] = self.check
 
     def _save(self) -> None:
         if self.folder is None:
@@ -1348,7 +1307,7 @@ class ProjectWindow(QMainWindow):
                     return
             self.folder = Path(folder)
         self._bring_media_in(self.project, self.folder)
-        if self.session is not None or self.check is not None or "timing" in self.project.stages:
+        if self.session is not None or "timing" in self.project.stages:
             self._store_timing()
         save_project(self.project, self.folder)
         self._saved_project = deepcopy(self.project)
@@ -1364,9 +1323,9 @@ class ProjectWindow(QMainWindow):
     def _set_mix(self, path: Path) -> None:
         path = path.resolve(strict=True)
         sf.info(path)
-        if (self.project.tracks or self.warped) and QMessageBox.question(
+        if self.project.tracks and QMessageBox.question(
             self, "Replace mix",
-            "A new mix resets the tempo detection and warp; existing stems become stale. Continue?",
+            "A new mix resets the tempo detection; existing stems may no longer line up with it. Continue?",
         ) != QMessageBox.StandardButton.Yes:
             return
         self._cancel()
@@ -1374,21 +1333,21 @@ class ProjectWindow(QMainWindow):
         if self.folder is not None:
             path = import_media(path, self.folder)
         self.project.stages.pop("preparation", None)
-        self.project.stages["timing"] = {"source": str(path), "beats": None, "check": None}
+        self.project.stages["timing"] = {"source": str(path), "beats": None}
         self.project.mix_path = str(path)
         self.project.revision += 1
         for track in self.project.tracks:
             track.revision += 1
-        self.session, self.check, self.taps = None, None, []
+        self.session, self.taps = None, []
         self._set_window(Fraction(0))
         self._sync_tracks()
         self.tracks.setCurrentIndex(self.tracks.findData(MIX))
         self._detect()
 
     def _import_stems(self) -> None:
-        if not self.warped:
-            raise ValueError("Warp the mix before importing stems.")
-        paths, _ = QFileDialog.getOpenFileNames(self, "Import stems aligned to the warped mix", filter="Audio (*.wav *.flac)")
+        if not self.project.mix_path:
+            raise ValueError("Import a mix before importing stems.")
+        paths, _ = QFileDialog.getOpenFileNames(self, "Import stems aligned to the mix", filter="Audio (*.wav *.flac)")
         last = None
         for name in paths:
             path = Path(name)
@@ -1489,30 +1448,28 @@ class ProjectWindow(QMainWindow):
 
     # -- timing -----------------------------------------------------------
     def _edit_timing(self) -> None:
-        locked = (
-            "The tempo and bar 1 come from the warped mix. Use Edit > Return to original mix to change them."
-            if self.warped else ""
-        )
-        dialog = TimingDialog(self, self.project.grid, self.project.key, locked)
+        dialog = TimingDialog(self, self.project.grid, self.project.key)
         if dialog.exec() == TimingDialog.DialogCode.Accepted:
             self._apply_timing(dialog.values())
 
     def _apply_timing(self, values) -> None:
         bpm, numerator, denominator, offset, key = values
         old = self.project.grid
-        if self.warped:
-            bpm, offset = old.bpm, old.offset_seconds
-        grid = Grid(bpm, numerator, denominator, old.subdivision, offset)
+        # A typed tempo or bar 1 replaces the counted tempo map with a constant tempo.
+        retimed = abs(bpm - old.bpm) > 1e-3 or abs(offset - old.offset_seconds) > 1e-3
+        grid = (Grid(bpm, numerator, denominator, old.subdivision, offset) if retimed
+                else replace(old, numerator=numerator, denominator=denominator))
         if grid != old and self.project.tracks and QMessageBox.question(
             self, "Change shared grid",
-            "Notes remain at their musical positions; analysis becomes stale. "
-            "This does not warp audio. Continue?",
+            "Notes remain at their musical positions; analysis becomes stale. Continue?",
         ) != QMessageBox.StandardButton.Yes:
             return
-        if self.session is not None and not self.warped and (numerator, denominator) != (
+        if self.session is not None and (numerator, denominator) != (
             self.session.numerator, self.session.denominator,
         ):
             self.session.set_meter(numerator, denominator)
+            if not retimed:
+                grid = self.session.grid(old.subdivision) or grid
         self._cancel(analysis_only=True)
         if key != self.project.key:
             self.timing["key_source"] = "user" if key else "detected"
@@ -1531,7 +1488,6 @@ class ProjectWindow(QMainWindow):
         path = self.project.mix_path
         if not path:
             raise ValueError("Import a mix first (File > Import mix).")
-        warped = self.warped
 
         def work(cancel):
             audio, rate = sf.read(path, dtype="float32", always_2d=True)
@@ -1544,17 +1500,11 @@ class ProjectWindow(QMainWindow):
 
         def accept(value):
             detection, key = value
-            if self.project.mix_path != path or self.warped != warped:
+            if self.project.mix_path != path:
                 return
             if key and (not self.project.key or self.timing.get("key_source") != "user"):
                 self.project.key = key
                 self.timing["key_source"] = "detected"
-            if warped:
-                self.check = [beat.time for beat in detection.beats]
-                self._store_timing()
-                self._refresh()
-                self.status.setText(self._check_text())
-                return
             if self.session is not None and self.session.pins and QMessageBox.question(
                 self, "Replace beats", "Detecting again replaces the beats and your downbeat pins. Continue?",
             ) != QMessageBox.StandardButton.Yes:
@@ -1566,14 +1516,12 @@ class ProjectWindow(QMainWindow):
             self._session_changed()
             self.status.setText(self.session.summary())
 
-        self._run(work, accept, kind="detect", message=(
-            "Checking the warped mix's beats..." if warped else "Detecting beats, tempo and key (about 10 s per 5 minutes)..."
-        ))
+        self._run(work, accept, kind="detect", message="Detecting beats, tempo and key (about 10 s per 5 minutes)...")
 
     def _session_changed(self) -> None:
-        """Before warping, the counted beats define the project grid."""
+        """The counted beats and pins define the project grid's tempo map."""
         session = self.session
-        if session is not None and not self.warped:
+        if session is not None:
             subdivision = self.project.grid.subdivision
             grid = session.grid(subdivision)
             if grid is None and session.beats:
@@ -1589,9 +1537,6 @@ class ProjectWindow(QMainWindow):
 
     # -- beats in the Mix view -------------------------------------------------
     def _require_session(self) -> BeatSession:
-        if self.warped:
-            raise ValueError("The mix is already warped; the lane shows a check of the warped beats. "
-                             "Use Edit > Return to original mix to recount bars.")
         if self.session is None:
             raise ValueError("Detect beats first (Edit > Detect tempo, meter, and key).")
         return self.session
@@ -1610,9 +1555,6 @@ class ProjectWindow(QMainWindow):
         self.timeline.update()
 
     def _beat_clicked(self, seconds: float, right: bool, at) -> None:
-        if self.warped:
-            self.status.setText(self._check_text())
-            return
         session = self._require_session()
         index = session.nearest(seconds, BEAT_TOLERANCE)
         self._select_beat(index)
@@ -1751,106 +1693,10 @@ class ProjectWindow(QMainWindow):
         else:
             self._play_toggle()
 
-    # -- warp and confirmation -------------------------------------------------
-    def _warp(self) -> None:
-        if not self.project.mix_path:
-            raise ValueError("Import a mix first.")
-        if self.warped:
-            raise ValueError("The mix is already warped; use Edit > Return to original mix to warp again.")
-        if self.folder is None:
-            QMessageBox.information(self, "Warp mix", "Choose a project folder first; the warped mix is stored in it.")
-            self._save()
-            if self.folder is None:
-                return
-        if self.project.tracks and QMessageBox.question(
-            self, "Warp mix",
-            "Warping changes the audio under the existing tracks: detected pitches may no longer match and the "
-            "stems become stale. Note positions in bars and beats are kept. Continue?",
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        dialog = WarpDialog(self, self.session, self.project.grid)
-        if dialog.exec() != WarpDialog.DialogCode.Accepted:
-            return
-        from audio_to_midi.pipeline import prepare_mix, register_warped_mix
-
-        source = Path(self.project.mix_path)
-        self.timing["source"] = str(source)
-        directory = self.folder / "preparation"
-        new = directory.exists()
-        grid = self.project.grid
-        meter = (grid.numerator, grid.denominator)
-        if dialog.as_is.isChecked():
-            bpm, offset = grid.bpm, grid.offset_seconds
-
-            def operation(cancel):
-                return register_warped_mix(
-                    source, directory, bpm=bpm, meter=meter, offset_seconds=offset,
-                    force_new_revision=new, cancel=cancel,
-                )
-        else:
-            session = self._require_session()
-            anchors = session.warp_anchors(dialog.mode.currentData())
-            bpm, downbeat, lead_in = dialog.target.value(), session.fit.downbeat, dialog.lead_in.currentData()
-
-            def operation(cancel):
-                return prepare_mix(
-                    source, directory, bpm=bpm, meter=meter, downbeat_seconds=downbeat,
-                    beat_anchors=anchors, lead_in=lead_in, force_new_revision=new, cancel=cancel,
-                )
-
-        def accept(result):
-            if self.project.mix_path != str(source):
-                raise ValueError("The mix changed while warping; the warped file is kept in the preparation folder.")
-            self._adopt(result["store"], result["warp_revision"]["id"])
-
-        self._cancel(analysis_only=True)
-        self._stop()
-        self._run(operation, accept, kind="warp", message="Warping the mix to a constant tempo...")
-
-    def _adopt(self, store, warp_id: str) -> None:
-        adopt_warp(self.project, store, warp_id)
-        self.check = None
-        self._store_timing()
-        for track in self.project.tracks:
-            track.revision += 1
-        self._set_window(Fraction(0))
-        self._sync_tracks()
-        if self.folder is not None:
-            save_project(self.project, self.folder)
-        self.status.setText("Mix warped. Checking its beats against the grid...")
-        self._detect()
-
-    def _unwarp(self) -> None:
-        if not self.warped:
-            raise ValueError("The mix is not warped.")
-        source = self.timing.get("source")
-        if not source or not Path(source).exists():
-            raise ValueError("The original mix file is missing; use File > Import mix.")
-        if QMessageBox.question(
-            self, "Return to original mix",
-            "Go back to the original (unwarped) mix to recount bars and warp again? The warped audio stays on disk. "
-            "Detected notes are cleared because they may no longer match, and stems become stale. "
-            "Your note edits keep their bar/beat positions.",
-        ) != QMessageBox.StandardButton.Yes:
-            return
-        self._cancel()
-        self._stop()
-        self.project.stages.pop("preparation", None)
-        self.project.mix_path = source
-        self.check = None
-        for track in self.project.tracks:
-            track.notes.generated = []
-            track.notes.revision += 1
-            track.revision += 1
-        self.project.revision += 1
-        self._session_changed()
-        self._sync_tracks()
-        self.status.setText("Back on the original mix. Recount bars, then Edit > Warp mix to tempo.")
-
     # -- stems and chords ---------------------------------------------------
     def _separate(self, then_detect_chords: bool = False) -> None:
-        if not self.warped:
-            raise ValueError("Warp the mix first (Edit > Warp mix to tempo).")
+        if not self.project.mix_path:
+            raise ValueError("Import a mix first.")
         from audio_to_midi import provision
 
         needs = provision.missing("demucs")
@@ -1860,21 +1706,24 @@ class ProjectWindow(QMainWindow):
         )
         if QMessageBox.question(
             self, "Separate stems",
-            "Split the warped mix into drums, bass, vocals, piano, guitar and other with Demucs? "
+            "Split the mix into drums, bass, vocals, piano, guitar and other with Demucs? "
             "A full song takes a few minutes on a CPU. Existing tracks keep their edits and get the new audio." + first,
         ) != QMessageBox.StandardButton.Yes:
             return
+        if self.folder is None:
+            QMessageBox.information(self, "Separate stems", "Choose a project folder first; the stems are stored in it.")
+            self._save()
+            if self.folder is None:
+                return
         from audio_to_midi.pipeline import ArtifactStore, separate_mix
 
-        preparation = self.project.stages["preparation"]
-        store = ArtifactStore(Path(preparation["directory"]))
-        warp_id = preparation["warp_revision"]
-        new = bool(preparation.get("separation_revision"))
-        project_id = self.project.id
+        store = ArtifactStore(self.folder / "preparation")
+        new = bool(self.project.stages.get("preparation", {}).get("separation_revision"))
+        project_id, mix_path = self.project.id, self.project.mix_path
 
         def accept(revision):
-            if self.project.id != project_id or current_warp(self.project) != warp_id:
-                raise ValueError("The project or warp changed during separation; the stems stay in the preparation folder.")
+            if self.project.id != project_id or self.project.mix_path != mix_path:
+                raise ValueError("The project or mix changed during separation; the stems stay in the preparation folder.")
             for role in ("drums", "bass", "vocals", "piano", "guitar", "other"):
                 path = store.output(revision, role)
                 existing = next((t for t in self.project.tracks if t.role == role), None)
@@ -1882,7 +1731,7 @@ class ProjectWindow(QMainWindow):
                     add_stem(self.project, path, role)
                 else:
                     replace_stem(self.project, existing, path)
-            self.project.stages["preparation"]["separation_revision"] = revision["id"]
+            self.project.stages["preparation"] = {"directory": str(store.root), "separation_revision": revision["id"]}
             self._sync_tracks()
             if self.folder is not None:
                 save_project(self.project, self.folder)
@@ -1894,7 +1743,7 @@ class ProjectWindow(QMainWindow):
 
         self._run(
             lambda cancel, report: separate_mix(
-                store, warp_id, force_new_revision=new, cancel=cancel, progress=report,
+                store, mix_path, force_new_revision=new, cancel=cancel, progress=report,
             ), accept, kind="separate", message="Separating stems with Demucs:", reports=True,
         )
 
@@ -1903,8 +1752,8 @@ class ProjectWindow(QMainWindow):
         return "btc" if self.actions["chord_btc"].isChecked() else "template"
 
     def _detect_chords(self) -> None:
-        if not self.warped:
-            raise ValueError("Warp the mix first (Edit > Warp mix to tempo).")
+        if not self.project.mix_path:
+            raise ValueError("Import a mix first.")
         model = self.chord_model
         if model == "btc":
             from audio_to_midi import provision
@@ -1965,8 +1814,7 @@ class ProjectWindow(QMainWindow):
             if (
                 self.project.id != project.id or self.project.chords != project.chords
                 or self.project.grid != project.grid or self.project.mix_path != project.mix_path
-                or self.project.key != project.key or not self.warped
-                or current_warp(self.project) != current_warp(project)
+                or self.project.key != project.key
                 or _harmony_identity(self.project) != sources
             ):
                 self.status.setText("Chords or timing changed during detection; discarded stale results.")
@@ -2000,19 +1848,10 @@ class ProjectWindow(QMainWindow):
     def _clicks(self, a: float, b: float, length: int, rate: int) -> np.ndarray:
         grid = self.project.grid
         unit = beat_length(grid)
-        curve = self.timeline.counted_times() if self.view == MIX else None
-        if curve is None:
-            to_seconds = grid.beat_to_seconds
-            first = grid.seconds_to_beat(a)
-        else:
-            # Mix view before warping: click on the counted beats drawn on screen, not a constant tempo.
-            seconds, quarters = curve
-            to_seconds = lambda beat: follow_curve(float(beat), quarters, seconds)  # noqa: E731
-            first = Fraction(follow_curve(a, seconds, quarters)).limit_denominator(100_000)
-        steps = first / unit
+        steps = grid.seconds_to_beat(a) / unit
         beat = -((-steps.numerator) // steps.denominator) * unit
         strong, weak = [], []
-        while (seconds_at := to_seconds(beat)) < b:
+        while (seconds_at := grid.beat_to_seconds(beat)) < b:
             if seconds_at >= a:
                 (strong if beat % grid.bar_beats == 0 else weak).append(seconds_at - a)
             beat += unit
@@ -2160,7 +1999,7 @@ class ProjectWindow(QMainWindow):
         QMessageBox.information(self, "Getting started", (
             "1. File > New project, then File > Import mix.\n"
             "2. Count bars: Edit > Tap downbeats (Space on each bar's one) or right-click beats to pin downbeats.\n"
-            "3. Edit > Warp mix to tempo and listen with View > Metronome click.\n"
+            "3. Listen with View > Metronome click; pin more downbeats where the clicks drift.\n"
             "4. Edit > Separate stems (or File > Import stems), pick a track and analyze notes.\n"
             "5. Edit > Detect chords, then File > Export MIDI or lead sheet."
         ))

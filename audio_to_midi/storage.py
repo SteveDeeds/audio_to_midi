@@ -156,6 +156,7 @@ def _read_store(value: object) -> NoteStore:
 def _manifest(project: Project, folder: Path) -> dict:
     grid = asdict(project.grid)
     grid["subdivision"] = _fraction(project.grid.subdivision)
+    grid["anchors"] = [[s, _fraction(q)] for s, q in project.grid.anchors]
     tracks = []
     for track in project.tracks:
         tracks.append({
@@ -286,9 +287,10 @@ def load_project(folder: Path) -> Project:
             "key", "chords", "stages", "revision",
         }, "project")
         grid = _object(data["grid"], {
-            "bpm", "numerator", "denominator", "subdivision", "offset_seconds",
+            "bpm", "numerator", "denominator", "subdivision", "offset_seconds", "anchors",
         }, "grid")
-        grid = Grid(**{**grid, "subdivision": _read_fraction(grid["subdivision"])})
+        grid = Grid(**{**grid, "subdivision": _read_fraction(grid["subdivision"]),
+                       "anchors": [(s, _read_fraction(q)) for s, q in _list(grid["anchors"], "anchors")]})
         tracks = []
         for value in _list(data["tracks"], "tracks"):
             value = _object(value, {

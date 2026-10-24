@@ -65,20 +65,24 @@ class ChordView(QWidget):
     def _row_height(self) -> float:
         return max(4.0, (self.height() - self._chroma_top() - self.FOOTER) / 12)
 
+    def _seconds_x(self, seconds: float) -> float:
+        """The x axis is linear in the original audio's time, like the timeline."""
+        grid = self.project.grid
+        s0, s1 = grid.beat_to_seconds(self.start), grid.beat_to_seconds(self.end)
+        return self.LABELS + (seconds - s0) / max(1e-9, s1 - s0) * max(1, self.width() - self.LABELS)
+
     def _x(self, beat) -> float:
-        width = max(1, self.width() - self.LABELS)
-        return self.LABELS + float(Fraction(beat) - self.start) / float(self.end - self.start) * width
+        return self._seconds_x(self.project.grid.beat_to_seconds(Fraction(beat)))
 
     def _beat(self, x: float) -> Fraction:
-        width = max(1, self.width() - self.LABELS)
-        return self.start + Fraction(str(round((x - self.LABELS) / width, 6))) * (self.end - self.start)
+        grid = self.project.grid
+        s0, s1 = grid.beat_to_seconds(self.start), grid.beat_to_seconds(self.end)
+        seconds = s0 + (x - self.LABELS) / max(1, self.width() - self.LABELS) * (s1 - s0)
+        return grid.seconds_to_beat(seconds).limit_denominator(1_000_000)
 
     def _snap(self, x: float) -> Fraction:
         unit = Fraction(4, self.project.grid.denominator)
         return round(self._beat(x) / unit) * unit
-
-    def _seconds_x(self, seconds: float) -> float:
-        return self._x(self.project.grid.seconds_to_beat(seconds))
 
     def segment_at(self, beat: Fraction) -> int | None:
         for index, segment in enumerate(self.segments):

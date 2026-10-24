@@ -74,12 +74,18 @@ def export_midi(
     mid.tracks.append(conductor)
     conductor.extend([
         mido.MetaMessage("track_name", name=project.name),
-        mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(project.grid.bpm)),
         mido.MetaMessage(
             "time_signature", numerator=project.grid.numerator,
             denominator=project.grid.denominator,
         ),
     ])
+    tempos = project.grid.tempos()
+    first = max((i for i, (q, _) in enumerate(tempos) if q <= 0), default=0)
+    tick = 0
+    for i, (q, bpm) in enumerate(tempos[first:]):
+        at = 0 if i == 0 else round(q * PPQ)
+        conductor.append(mido.MetaMessage("set_tempo", tempo=mido.bpm2tempo(bpm), time=at - tick))
+        tick = at
     channels = iter([i for i in range(16) if i != 9])
     for track in project.tracks if tracks is None else tracks:
         if track.role == "other":

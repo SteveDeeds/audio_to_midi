@@ -31,7 +31,6 @@ def add_stem(project: Project, path: Path, role: str) -> Track:
         model=MODELS[role][0] if MODELS[role] else "",
     )
     track.settings["feature_schema"] = "legacy-cqt-v1"
-    track.settings["warp"] = current_warp(project)
     project.tracks.append(track)
     project.revision += 1
     return track
@@ -58,16 +57,6 @@ def _stem_info(project: Project, path: Path) -> sf._SoundFileInfo:
     return info
 
 
-def current_warp(project: Project) -> str | None:
-    preparation = project.stages.get("preparation")
-    return preparation.get("warp_revision") if preparation else None
-
-
-def stale(project: Project, track: Track) -> bool:
-    """True when the stem was separated/imported against an older warp of the mix."""
-    return track.settings.get("warp", current_warp(project)) != current_warp(project)
-
-
 def replace_stem(project: Project, track: Track, path: Path) -> None:
     """Swap a track's audio (e.g. re-separated stem); authored notes keep their bar/beat positions."""
     path = path.resolve(strict=True)
@@ -77,7 +66,6 @@ def replace_stem(project: Project, track: Track, path: Path) -> None:
     track.sample_rate = info.samplerate
     track.notes.generated = []
     track.notes.revision += 1
-    track.settings["warp"] = current_warp(project)
     track.revision += 1
     project.revision += 1
 
@@ -225,43 +213,9 @@ def mark_project_edited(project: Project) -> None:
     if preparation:
         from audio_to_midi.pipeline import ArtifactStore
         store = ArtifactStore(preparation["directory"])
-        for name in ("warp_revision", "separation_revision"):
+        for name in ("separation_revision",):
             if preparation.get(name):
                 store.mark_edited(preparation[name])
-
-
-def attach_prepared(project: Project, artifacts: Path) -> None:
-    from audio_to_midi.pipeline import ArtifactStore
-
-    if project.tracks or project.chords:
-        raise ValueError("Attach preparation to an empty project; existing edits must remain in their original revision.")
-    store = ArtifactStore(artifacts)
-    warp_id = store.manifest["active"].get("warp")
-    if not warp_id:
-        raise ValueError("No completed warp revision.")
-    adopt_warp(project, store, warp_id)
-
-
-def adopt_warp(project: Project, store, warp_id: str) -> None:
-    """Make a warp revision the project mix and grid (bar 1 from the warp metadata)."""
-    from audio_to_midi.timebase import Grid
-
-    warp = store.revision(warp_id)
-    if not store.valid(warp) or warp.get("stale"):
-        raise ValueError("Warp revision is invalid or stale.")
-    analysis = store.revision(warp["dependencies"][0])
-    data = json.loads(store.output(analysis, "analysis").read_text(encoding="utf-8"))
-    numerator, denominator = data["confirmed_meter"]
-    project.grid = Grid(
-        data["confirmed_bpm"], numerator, denominator, project.grid.subdivision,
-        warp["metadata"]["bar_one_seconds"],
-    )
-    project.mix_path = str(store.output(warp, "full_mix"))
-    project.stages["preparation"] = {
-        "directory": str(store.root), "warp_revision": warp_id,
-        "analysis_revision": analysis["id"],
-    }
-    project.revision += 1
 
 
 def import_profile(track: Track, path: Path) -> list[str]:
@@ -348,7 +302,7 @@ def harmony_sources(project: Project) -> HarmonySources:
     """
     usable = {
         t.role: t.audio_path for t in project.tracks
-        if t.audio_path and Path(t.audio_path).exists() and not stale(project, t)
+        if t.audio_path and Path(t.audio_path).exists()
     }
     harmonic = tuple(usable[role] for role in HARMONY_ROLES if role in usable)
     if not harmonic:
@@ -362,7 +316,7 @@ def harmony_sources(project: Project) -> HarmonySources:
 def stems_for_chords(project: Project) -> bool:
     """True when current piano/guitar/other stems exist, so chords need not come from the mix."""
     return any(
-        t.role in HARMONY_ROLES and t.audio_path and Path(t.audio_path).exists() and not stale(project, t)
+        t.role in HARMONY_ROLES and t.audio_path and Path(t.audio_path).exists()
         for t in project.tracks
     )
 

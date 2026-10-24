@@ -159,7 +159,7 @@ class TrackBackend:
         if cached is not None:
             return cached
         time = self.grid.beat_to_seconds(beat)
-        half = float(self.grid.subdivision) * 30 / self.grid.bpm
+        half = (self.grid.beat_to_seconds(beat + self.grid.subdivision) - time) / 2
         if self._feature_data is None:
             smooth = max(16, int(0.028 * self.sr))
             envelope = np.convolve(np.abs(self.audio).astype(float), np.ones(smooth) / smooth, mode="same")
@@ -315,7 +315,7 @@ class TrackBackend:
             else:
                 for answer in provider.block_notes(
                     ta, tb, self.role, self.model,
-                    float(grid.subdivision) * 30 / grid.bpm + 1e-6,
+                    (grid.beat_to_seconds(a + grid.subdivision) - grid.beat_to_seconds(a)) / 2 + 1e-6,
                 )[:int(track.settings.get("polyphony", 8))]:
                     stop = min(b, max(a + grid.subdivision, grid.snap(grid.seconds_to_beat(answer.release))))
                     previous = next((
