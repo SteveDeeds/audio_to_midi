@@ -19,6 +19,18 @@ ATTACK_SECONDS = 0.005
 RELEASE_SECONDS = 0.03
 HEADROOM = 0.95
 MIDI_PAN_LEFT = 16
+PLAYBACK_SPEEDS = (1.0, 0.9, 0.75, 0.5)
+
+
+def stretch_audio(audio: np.ndarray, speed: float) -> np.ndarray:
+    """Change preview duration without resampling or shifting pitch."""
+    if speed not in PLAYBACK_SPEEDS:
+        raise ValueError("Playback speed must be 100%, 90%, 75%, or 50%.")
+    if speed == 1.0 or not len(audio):
+        return audio
+    import librosa
+
+    return librosa.effects.time_stretch(audio, rate=speed)
 
 
 BALANCE_RANGE_DB = 40.0  # fade of the turned-down side just before the end of the slider

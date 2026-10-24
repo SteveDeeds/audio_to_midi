@@ -2,7 +2,7 @@
 
 Stages: import mix -> detect beats -> count bars (tap or pin)
 -> separate or import stems -> transcribe notes -> chords -> export.
-The audio is never stretched; counted beats and pins form the grid's tempo map.
+Source audio is never changed; counted beats and pins form the grid's tempo map.
 """
 
 from __future__ import annotations
@@ -38,7 +38,10 @@ from audio_to_midi.midi import export_midi, export_musicxml, import_notes
 from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, parse_number, position,
 )
-from audio_to_midi.preview import SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs, midi_volume, mix, render_notes
+from audio_to_midi.preview import (
+    PLAYBACK_SPEEDS, SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs, midi_volume, mix,
+    render_notes, stretch_audio,
+)
 from audio_to_midi.spectrogram import colorize, cqt_image, song_reference
 from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
@@ -120,6 +123,7 @@ class ProjectWindow(QMainWindow):
         self.settings = QSettings("audio_to_midi", "v2")
         self.sound_device = self.settings.value("preview/output", "") or None
         self.latency_ms = int(self.settings.value("preview/midi_latency_ms", 0))
+        self.playback_speed = 1.0
         try:
             self.balance = max(-100, min(100, int(self.settings.value("preview/balance", 0))))
         except (TypeError, ValueError):
@@ -142,7 +146,7 @@ class ProjectWindow(QMainWindow):
         self.session: BeatSession | None = None
         self.taps: list[float] = []
         self.bars = 2
-        self._clock: tuple[float, float, float] | None = None  # (monotonic start, from seconds, until seconds)
+        self._clock: tuple[float, float, float, float] | None = None  # (monotonic start, from, until, speed)
         self.actions: dict[str, QAction] = {}
         self.tool_buttons: dict[str, QToolButton] = {}
         self._build()
@@ -347,6 +351,16 @@ class ProjectWindow(QMainWindow):
         row.addWidget(self.balance_slider)
         row.addWidget(QLabel("Synth"))
         row.addSpacing(8)
+        row.addWidget(QLabel("Speed"))
+        self.speed_choice = QComboBox()
+        for speed in PLAYBACK_SPEEDS:
+            self.speed_choice.addItem(f"{speed:.0%}", speed)
+        self.speed_choice.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.speed_choice.setToolTip(
+            "Playback speed without changing pitch. Source audio and exports are unchanged. "
+            "Downbeat tapping always plays at 100%.")
+        self.speed_choice.currentIndexChanged.connect(lambda: self._guard(self._speed_changed))
+        row.addWidget(self.speed_choice)
         for text, slot in (("Play", self._play), ("Stop", self._stop)):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, f=slot: self._guard(f))
@@ -481,6 +495,7 @@ class ProjectWindow(QMainWindow):
     def _update_actions(self) -> None:
         has_mix, track, busy = bool(self.project.mix_path), self.active, self.job is not None
         tapping = self.tapping
+        self.speed_choice.setEnabled(not tapping)
         transcribable = track is not None and track.role != "other"
         rules = {
             "import_stems": (has_mix, "Import a mix first."),
@@ -1106,9 +1121,10 @@ class ProjectWindow(QMainWindow):
         Note("validate", start, end, pitch, velocity)
         if (start, end, pitch, velocity) == (old.start, old.end, old.pitch, old.velocity):
             return
-        if start != grid.snap(start) or end != grid.snap(end):
+        if start != grid.snap(start) or end != grid.snap_end(end):
             raise ValueError(
-                f"Start and length must fit the {format_number(grid.subdivision / beat_length(grid))}-beat grid."
+                f"Start must fit the {format_number(grid.subdivision / beat_length(grid))}-beat grid; "
+                f"note end must fit the {format_number(grid.subdivision / beat_length(grid) / 2)}-beat half-grid."
             )
         if end > track_end(self.project, self.active):
             raise ValueError("Release exceeds audio duration.")
@@ -1845,7 +1861,7 @@ class ProjectWindow(QMainWindow):
             self.preview = Preview()
         return self.preview
 
-    def _clicks(self, a: float, b: float, length: int, rate: int) -> np.ndarray:
+    def _clicks(self, a: float, b: float, length: int, rate: int, speed: float = 1.0) -> np.ndarray:
         grid = self.project.grid
         unit = beat_length(grid)
         steps = grid.seconds_to_beat(a) / unit
@@ -1853,7 +1869,7 @@ class ProjectWindow(QMainWindow):
         strong, weak = [], []
         while (seconds_at := grid.beat_to_seconds(beat)) < b:
             if seconds_at >= a:
-                (strong if beat % grid.bar_beats == 0 else weak).append(seconds_at - a)
+                (strong if beat % grid.bar_beats == 0 else weak).append((seconds_at - a) / speed)
             beat += unit
         return click_track(strong, length, rate, 1600.0, 0.7) + click_track(weak, length, rate, 1000.0, 0.45)
 
@@ -1865,6 +1881,12 @@ class ProjectWindow(QMainWindow):
 
     def _replay_balanced(self) -> None:
         now = self._now()
+        if now is not None:
+            self._play(now)
+
+    def _speed_changed(self) -> None:
+        now = self._now()
+        self.playback_speed = self.speed_choice.currentData()
         if now is not None:
             self._play(now)
 
@@ -1882,8 +1904,11 @@ class ProjectWindow(QMainWindow):
         if not len(segment):
             raise ValueError("No audio in this window.")
         b = a + len(segment) / rate
+        speed = 1.0 if self.tapping else self.playback_speed
+        self._stop()
+        segment = stretch_audio(segment, speed)
         clicks = self.actions["metronome"].isChecked()
-        extra = self._clicks(a, b, len(segment), rate) if clicks else np.zeros_like(segment)
+        extra = self._clicks(a, b, len(segment), rate, speed) if clicks else np.zeros_like(segment)
         rows, drums = [], False
         if track:
             # Same beat-to-seconds mapping as the piano roll, so heard timing matches drawn timing.
@@ -1903,30 +1928,33 @@ class ProjectWindow(QMainWindow):
         device = self.sound_device if track else None
         player = self._player()
         audio_gain, synth_gain = balance_gains(self.balance)
+        relative = [((start - a) / speed, (end - a) / speed, pitch, velocity)
+                    for start, end, pitch, velocity in rows]
         if device is None:
             if rows:
-                extra = extra + render_notes(rows, a, len(segment), rate, drums)
+                extra = extra + render_notes(relative, 0.0, len(segment), rate, drums)
             player.play_audio(mix(segment, extra if rows or clicks else None, audio_gain, synth_gain), rate)
             self.status.setText(
                 "Playing" + (": audio mostly right, notes and clicks mostly left (sample-aligned)." if rows or clicks else ".")
                 + " Space stops."
             )
         else:
-            relative = [(start - a, end - a, pitch, velocity) for start, end, pitch, velocity in rows]
             player.play_with_midi(mix(segment, extra, audio_gain, synth_gain), rate, relative, device,
                                   9 if drums else 0, self.latency_ms / 1000, midi_volume(synth_gain))
             self.status.setText(
                 f"Playing with MIDI out '{device}' at {self.latency_ms} ms latency compensation "
                 "(File > Playback settings)."
             )
-        self._clock = (time.monotonic(), a, b)
+        self.status.setText(self.status.text() + f" Speed: {speed:.0%}.")
+        lead = max(0.0, self.latency_ms / 1000) if device is not None else 0.0
+        self._clock = (time.monotonic() + lead, a, b, speed)
         self.clock.start()
 
     def _now(self) -> float | None:
         if self._clock is None:
             return None
-        started, origin, until = self._clock
-        now = origin + time.monotonic() - started
+        started, origin, until, speed = self._clock
+        now = origin + max(0.0, time.monotonic() - started) * speed
         return now if now <= until else None
 
     def _tick(self) -> None:

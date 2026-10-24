@@ -3,8 +3,35 @@ import unittest
 import numpy as np
 
 from audio_to_midi.preview import (
-    balance_gains, click_track, midi_schedule, midi_volume, mix, render_notes, tapping_calibration, tapping_offset,
+    PLAYBACK_SPEEDS, balance_gains, click_track, midi_schedule, midi_volume, mix, render_notes,
+    stretch_audio, tapping_calibration, tapping_offset,
 )
+
+
+class PlaybackSpeedTests(unittest.TestCase):
+    def test_all_speeds_preserve_pitch_and_change_duration(self):
+        rate = 8000
+        audio = np.sin(2 * np.pi * 440 * np.arange(rate) / rate).astype(np.float32)
+        for speed in PLAYBACK_SPEEDS:
+            with self.subTest(speed=speed):
+                slowed = stretch_audio(audio, speed)
+                self.assertEqual(len(slowed), round(len(audio) / speed))
+                self.assertEqual(slowed.dtype, np.float32)
+                middle = slowed[len(slowed) // 4:3 * len(slowed) // 4]
+                spectrum = np.abs(np.fft.rfft(middle * np.hanning(len(middle))))
+                frequency = np.argmax(spectrum) * rate / len(middle)
+                self.assertAlmostEqual(frequency, 440, delta=2)
+
+    def test_normal_speed_and_empty_audio_are_unchanged(self):
+        audio = np.array([0.1, -0.2], dtype=np.float32)
+        self.assertIs(stretch_audio(audio, 1.0), audio)
+        empty = np.empty(0, dtype=np.float32)
+        self.assertIs(stretch_audio(empty, 0.5), empty)
+
+    def test_unsupported_speeds_are_rejected(self):
+        for speed in (0, -1, 0.8, float("nan"), float("inf")):
+            with self.subTest(speed=speed), self.assertRaises(ValueError):
+                stretch_audio(np.zeros(8000, dtype=np.float32), speed)
 
 
 class TappingCalibrationTests(unittest.TestCase):

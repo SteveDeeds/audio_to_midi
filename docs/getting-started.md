@@ -335,6 +335,14 @@ it, and the view follows the playhead. In a stem view you hear the stem mostly
 on the right and the notes mostly on the left; in the Chords view you hear the
 mix with the chords.
 
+The **Speed** selector beside **Play** offers **100%**, **90%**, **75%**, and
+**50%** playback without changing pitch. Notes, chords, metronome clicks,
+external MIDI, and the playhead follow the selected speed. Changing speed while
+playing restarts from the current playhead; preparing slowed audio may take a
+moment. Source files, the tempo map, and exports are unchanged. Speed starts at
+100% when the app opens. Downbeat tapping always uses 100% playback (the speed
+selector is disabled while tapping), so tap-latency calibration remains valid.
+
 The **Audio ↔ Synth** slider next to **Play** sets the balance: all the way
 left plays only the audio, all the way right only the synth (notes, chords and
 metronome clicks), and the center plays both at full level. The other side

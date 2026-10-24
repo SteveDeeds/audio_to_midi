@@ -1234,6 +1234,109 @@ class EditorTests(unittest.TestCase):
         self.assertGreater(left[4100:7900].max(), 1000)
         self.assertEqual(left[8000:].max(), 0)
 
+    def test_playback_speeds_keep_builtin_notes_clicks_and_playhead_aligned(self):
+        window = self.window
+        window.sound_device = None
+        window._add_note(F(1), 69, F(2))
+        played = []
+        window.preview = SimpleNamespace(
+            play_audio=lambda stereo, rate: played.append((stereo, rate)),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        self.assertEqual([window.speed_choice.itemText(i) for i in range(4)],
+                         ["100%", "90%", "75%", "50%"])
+        self.assertEqual(window.playback_speed, 1.0)
+        for index, speed in enumerate((1.0, 0.9, 0.75, 0.5)):
+            with self.subTest(speed=speed):
+                window._stop()
+                window.speed_choice.setCurrentIndex(index)
+                with patch("audio_to_midi.ui.time.monotonic", return_value=100.0):
+                    window._play()
+                stereo, rate = played[-1]
+                self.assertEqual((rate, len(stereo)), (8000, round(16000 / speed)))
+                first, last = round(4000 / speed), round(8000 / speed)
+                left = stereo[:, 0].astype(float)
+                self.assertEqual(np.abs(left[:first]).max(), 0)
+                self.assertGreater(np.abs(left[first:first + 100]).max(), 1000)
+                self.assertEqual(np.abs(left[last:]).max(), 0)
+                middle = left[first + 400:last - 400]
+                spectrum = np.abs(np.fft.rfft(middle * np.hanning(len(middle))))
+                self.assertAlmostEqual(np.argmax(spectrum) * rate / len(middle), 440, delta=4)
+                clicks = window._clicks(0.0, 2.0, len(stereo), rate, speed)
+                self.assertGreater(np.abs(clicks[first:first + 100]).max(), 0.1)
+                self.assertEqual(np.abs(clicks[first - 100:first]).max(), 0)
+                with patch("audio_to_midi.ui.time.monotonic", return_value=101.0):
+                    self.assertAlmostEqual(window._now(), speed)
+                    window._tick()
+                    self.assertAlmostEqual(window.timeline.playhead, speed)
+                with patch("audio_to_midi.ui.time.monotonic", return_value=100 + 2 / speed + .01):
+                    self.assertIsNone(window._now())
+        window._stop()
+
+    def test_speed_change_restarts_at_current_position_and_failure_stops_clock(self):
+        window = self.window
+        played = []
+        window.preview = SimpleNamespace(
+            play_audio=lambda stereo, rate: played.append(stereo),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        window._play()
+        with patch.object(window, "_now", return_value=0.5):
+            window.speed_choice.setCurrentIndex(3)
+        self.assertEqual(len(played[-1]), 24000)  # remaining 1.5 seconds at 50%
+        self.assertEqual(window._clock[1:], (0.5, 2.0, 0.5))
+        with patch("audio_to_midi.ui.stretch_audio", side_effect=RuntimeError("Stretch failed")):
+            with self.assertRaisesRegex(RuntimeError, "Stretch failed"):
+                window._play()
+        self.assertIsNone(window._clock)
+        self.assertFalse(window.clock.isActive())
+
+    def test_slow_external_midi_preserves_pitches_and_wall_clock_latency(self):
+        from audio_to_midi.preview import midi_schedule
+
+        window = self.window
+        window._add_note(F(1), 69, F(2))
+        window.sound_device = "Test MIDI"
+        window.latency_ms = 100
+        window.actions["metronome"].setChecked(True)
+        window.speed_choice.setCurrentIndex(3)
+        played = []
+        window.preview = SimpleNamespace(
+            play_with_midi=lambda *args: played.append(args),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        with patch("audio_to_midi.ui.time.monotonic", return_value=100.0):
+            window._play()
+        stereo, rate, notes, device, channel, latency, volume = played[-1]
+        self.assertEqual((rate, len(stereo), device, channel, latency, volume),
+                         (8000, 32000, "Test MIDI", 0, 0.1, 127))
+        self.assertEqual(notes, [(1.0, 2.0, 69, 100)])
+        self.assertGreater(np.abs(stereo[8000:8100].astype(float)).max(), 1000)
+        events = midi_schedule(notes, latency)
+        self.assertAlmostEqual(next(t for t, kind, _, _ in events if kind == "on"), 1.0)
+        with patch("audio_to_midi.ui.time.monotonic", return_value=101.1):
+            self.assertAlmostEqual(window._now(), 0.5)
+        window._stop()
+
+    def test_tapping_uses_normal_speed_without_changing_selected_speed(self):
+        window = self.window
+        played = []
+        window.preview = SimpleNamespace(
+            play_audio=lambda stereo, rate: played.append(stereo),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        window.speed_choice.setCurrentIndex(3)
+        with patch.object(ProjectWindow, "tapping", new_callable=unittest.mock.PropertyMock, return_value=True):
+            window._update_actions()
+            self.assertFalse(window.speed_choice.isEnabled())
+            window._play()
+        self.assertEqual(len(played[-1]), 16000)
+        self.assertEqual(window._clock[3], 1.0)
+        self.assertEqual(window.playback_speed, 0.5)
+        window._stop()
+        window._update_actions()
+        self.assertTrue(window.speed_choice.isEnabled())
+
     def test_audio_synth_balance_slider_sets_gains_persists_and_replays_while_playing(self):
         from PySide6.QtCore import QSettings
 
