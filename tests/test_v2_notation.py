@@ -3,12 +3,18 @@ import unittest
 
 from audio_to_midi.notation import (
     bar_and_beat, format_number, key_fifths, note_value, parse_number, parse_pitch, pc_name, pitch_name,
-    position, preferred_key,
+    position, preferred_key, scale_pitch_classes,
 )
 from audio_to_midi.timebase import Grid
 
 
 class NotationTests(unittest.TestCase):
+    def test_scale_pitch_classes(self):
+        self.assertEqual(scale_pitch_classes("G"), {7, 9, 11, 0, 2, 4, 6})
+        self.assertEqual(scale_pitch_classes("Bb major"), {10, 0, 2, 3, 5, 7, 9})
+        self.assertEqual(scale_pitch_classes("C#m"), {1, 3, 4, 6, 8, 9, 11})
+        self.assertIsNone(scale_pitch_classes(""))
+
     def test_common_time_positions(self):
         grid = Grid(120, 4, 4)
         self.assertEqual(bar_and_beat(grid, F(35, 2)), (5, F(5, 2)))

@@ -59,6 +59,7 @@ ROLE_WORDS = {
     "piano": ("piano", "keys", "key"), "guitar": ("guitar", "gtr"), "other": ("other", "rest", "inst"),
 }
 BEAT_TOLERANCE = 0.15
+AUDITION_MIN_SECONDS = 0.3
 
 
 def _harmony_identity(project: Project):
@@ -1088,6 +1089,19 @@ class ProjectWindow(QMainWindow):
             record_drum(track, self.project, beat, stop, pitch, True)
         self._edited()
         self._select_at(beat, pitch)
+        self._audition(beat, pitch)
+
+    def _audition(self, start: Fraction, pitch: int) -> None:
+        """Play a just-added note's stretch of the stem together with its synth so a wrong pitch is audible."""
+        note = next((n for n in self._rows if n.start == start and n.pitch == pitch), None)
+        if note is None:
+            return
+        message = self.status.text()
+        try:
+            self._play(audition=note)
+        except Exception as exc:
+            message = f"Could not audition the note: {exc}"
+        self.status.setText(message)
 
     def _selected(self):
         if self.timeline.selected is None or self.timeline.selected not in self._rows:
@@ -1916,31 +1930,38 @@ class ProjectWindow(QMainWindow):
         if now is not None:
             self._play(now)
 
-    def _play(self, start_seconds: float | None = None) -> None:
+    def _play(self, start_seconds: float | None = None, audition=None) -> None:
+        """Play from the window start (or `start_seconds`); `audition` plays just that note's span."""
         view, track = self.view, self.active
         path = self.project.mix_path if view in (MIX, CHORDS) else (track.audio_path if track else None)
         if not path:
             raise ValueError("Import a mix or choose a track.")
         grid = self.project.grid
+        if audition is not None:
+            start_seconds = grid.beat_to_seconds(audition.start)
         a = max(0.0, grid.beat_to_seconds(self.timeline.start) if start_seconds is None else start_seconds)
         with sf.SoundFile(path) as audio:
             rate = audio.samplerate
             audio.seek(min(len(audio), round(a * rate)))
-            segment = audio.read(dtype="float32", always_2d=True).mean(axis=1)
+            if audition is None:
+                segment = audio.read(dtype="float32", always_2d=True).mean(axis=1)
+            else:
+                seconds = max(AUDITION_MIN_SECONDS, grid.beat_to_seconds(audition.end) - a)
+                segment = audio.read(round(seconds * rate), dtype="float32", always_2d=True).mean(axis=1)
         if not len(segment):
             raise ValueError("No audio in this window.")
         b = a + len(segment) / rate
         speed = 1.0 if self.tapping else self.playback_speed
         self._stop()
         segment = stretch_audio(segment, speed)
-        clicks = self.actions["metronome"].isChecked()
+        clicks = audition is None and self.actions["metronome"].isChecked()
         extra = self._clicks(a, b, len(segment), rate, speed) if clicks else np.zeros_like(segment)
         rows, drums = [], False
         if track:
             # Same beat-to-seconds mapping as the piano roll, so heard timing matches drawn timing.
             rows = [
                 (max(a, grid.beat_to_seconds(n.start)), min(b, grid.beat_to_seconds(n.end)), n.pitch, n.velocity)
-                for n in track.notes.resolved()
+                for n in ([audition] if audition is not None else track.notes.resolved())
                 if grid.beat_to_seconds(n.end) > a and grid.beat_to_seconds(n.start) < b
             ]
             drums = track.role == "drums"
@@ -1972,6 +1993,8 @@ class ProjectWindow(QMainWindow):
                 "(File > Playback settings)."
             )
         self.status.setText(self.status.text() + f" Speed: {speed:.0%}.")
+        if audition is not None:
+            return  # one-shot: not "playing", so speed/balance changes do not restart it
         lead = max(0.0, self.latency_ms / 1000) if device is not None else 0.0
         self._clock = (time.monotonic() + lead, a, b, speed)
         self.clock.start()

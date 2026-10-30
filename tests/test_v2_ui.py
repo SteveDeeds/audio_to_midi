@@ -1357,6 +1357,19 @@ class EditorTests(unittest.TestCase):
         self.assertIsNone(window._clock)
         self.assertFalse(window.clock.isActive())
 
+    def test_adding_a_note_auditions_its_span_with_the_synth(self):
+        window = self.window
+        played = []
+        window.preview = SimpleNamespace(
+            play_audio=lambda stereo, rate: played.append(stereo),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        window._add_note(F(1), 69, F(2))
+        stereo = played[-1]
+        self.assertEqual(len(stereo), 4000)  # one beat at 120 BPM, 8 kHz
+        self.assertGreater(np.abs(stereo[:, 0].astype(float)).max(), 1000)
+        self.assertIsNone(window._clock)
+
     def test_slow_external_midi_preserves_pitches_and_wall_clock_latency(self):
         from audio_to_midi.preview import midi_schedule
 

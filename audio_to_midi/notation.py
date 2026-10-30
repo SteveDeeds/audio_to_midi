@@ -112,6 +112,16 @@ def key_fifths(key: str) -> int:
     return fifths - 12 if fifths > 7 else fifths + 12 if fifths < -7 else fifths
 
 
+def scale_pitch_classes(key: str) -> frozenset[int] | None:
+    """Pitch classes (0 = C) of the key's major or natural-minor scale; None without a key."""
+    parsed = _parse_key(key)
+    if parsed is None:
+        return None
+    tonic, minor = parsed
+    tonic_pc = (_LETTER_PC[tonic[0]] + {"#": 1, "b": -1}.get(tonic[1:], 0)) % 12
+    return frozenset((tonic_pc + step) % 12 for step in (_MINOR if minor else _MAJOR))
+
+
 def _named(position: int) -> str:
     """Note name at a circle-of-fifths position (0 = C, 1 = G, -1 = F)."""
     letter = _LETTERS[(4 * position) % 7]

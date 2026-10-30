@@ -13,7 +13,9 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QToolTip, QWidget
 
 from audio_to_midi.domain import Note, Project, Track
-from audio_to_midi.notation import bar_and_beat, beat_length, format_number, note_value, pitch_name
+from audio_to_midi.notation import (
+    bar_and_beat, beat_length, format_number, note_value, pitch_name, scale_pitch_classes,
+)
 from audio_to_midi.spectrogram import HIGH_PITCH, LOW_PITCH
 from core.adtof_drums import CLASS_MIDI, drum_class
 
@@ -348,6 +350,10 @@ class Timeline(QWidget):
         rect = self._note_rect(note, end)
         outside = not self._visible(note)
         color = QColor("#84dba7" if note.source != "generated" else "#6b9fe8")
+        scale = scale_pitch_classes(self.project.key) if not self.drums else None
+        if scale is not None and note.pitch % 12 not in scale:
+            gray = color.lightness()
+            color = QColor(gray, gray, gray)
         if outside:
             color.setAlpha(110)
             rect.setHeight(3)
