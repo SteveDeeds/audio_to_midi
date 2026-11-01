@@ -1,0 +1,299 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Experimental vocal MIDI tuner</title>
+<style>
+:root{color-scheme:dark;font:15px system-ui;background:#16191e;color:#e9edf4}
+body{margin:0;padding:20px}h1{font-size:24px;margin:0 0 8px}h2{font-size:16px}
+button,select,input{font:inherit}button,select,input[type=number]{background:#29313e;color:#fff;
+border:1px solid #556176;border-radius:5px;padding:6px}
+button{cursor:pointer}button:disabled,input:disabled,select:disabled{opacity:.45;cursor:default}
+button.primary{background:#275985}a{color:#8fd0ff}
+.layout{display:grid;grid-template-columns:335px minmax(0,1fr);gap:18px;margin-top:18px}
+.controls{height:calc(100vh - 180px);overflow:auto;padding-right:10px}
+.panel{background:#20252e;border:1px solid #3e4858;border-radius:8px;padding:12px;margin-bottom:10px}
+.control{display:grid;grid-template-columns:1fr 80px;gap:6px;margin:13px 0}
+.control label{font-size:13px}.control input[type=range]{grid-column:1/-1;width:100%;margin:0}
+.control .help{grid-column:1/-1;font-size:11px;color:#aab5c6;line-height:1.3}
+.control.disabled{opacity:.45}.buttons{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
+.control[hidden]{display:none}
+.muted{color:#aab5c6;font-size:13px;line-height:1.4}.legend{font-size:12px;margin:8px 0}
+#status{padding:10px;background:#26374b;border-radius:6px;min-height:20px}
+#error{background:#652c36;padding:12px;border-radius:6px;white-space:pre-wrap}
+#error:empty{display:none}canvas{width:100%;display:block;background:#101116}
+#chart{height:380px;cursor:crosshair}#evidence{height:115px}
+audio{width:min(600px,100%);margin-top:10px}.view{display:flex;gap:10px;align-items:center;margin:10px 0}
+.view input{flex:1}table{font-size:12px;border-collapse:collapse;width:100%}
+td,th{border-bottom:1px solid #445063;padding:5px;text-align:left}
+.corrected{color:#ffd166}.low{color:#ff969c}
+#exports a{display:inline-block;margin:5px}details{margin-top:12px}
+@media(max-width:1000px){.layout{grid-template-columns:1fr}.controls{height:auto}}
+</style>
+</head>
+<body>
+<h1>Vocal MIDI parameter tuner <span class="muted">EXPERIMENTAL - app unchanged</span></h1>
+<div id="source" class="muted">Loading cached analysis...</div>
+<p class="muted">Adjust peak picking and note construction, not trained network weights. Cached CREPE full,
+actual periodicity, CQT and all four onset activation tracks are reused; neural inference does not rerun on changes.
+Key correction is optional: real chromatic/passing notes can be out of key.
+Five controls tune syllable attacks and connected pitch changes, without manual editing.</p>
+<div id="error" role="alert"></div>
+<div class="layout">
+<aside class="controls">
+ <div class="panel">
+  <label for="method">Onset model</label><br><select id="method" disabled style="width:100%;margin:8px 0"></select>
+  <p class="muted">Syllable mode: attacks retrigger; sustained pitch changes within a syllable slur.
+  Attacks and energy recovery are syllable proxies, not a phonetic transcription.</p>
+  <label for="key">Key awareness</label><br><select id="key" disabled style="width:100%;margin:8px 0"></select>
+  <div class="buttons"><button id="baseline" disabled>Original baseline</button><button id="reset" disabled>Tuning defaults</button></div>
+  <p class="muted">More splits: lower onset threshold, minimum split length or pitch hold.
+  Fewer fragments: increase syllable spacing. Starting defaults fix pitch hysteresis at 0.75 semitone
+  and extra energy-backed SuperFlux attacks at a 6 dB fall and recovery.</p>
+ </div>
+ <div id="numeric"></div>
+ <div class="panel"><div class="buttons"><button id="save" disabled>Save preset</button>
+ <button id="load" disabled>Load preset</button><input type="file" accept=".json" id="presetFile" hidden></div></div>
+</aside>
+<main>
+ <div id="status" role="status">Loading...</div>
+ <div class="panel" style="margin-top:10px">
+  <div class="view"><label for="span">View</label><select id="span"><option value="10">10 seconds</option>
+  <option value="5">5 seconds</option><option value="all">Full excerpt</option></select>
+  <label for="viewStart">Start</label><input type="range" id="viewStart" min="0" max="16.6" step=".1" value="0">
+  <output id="viewLabel">0.0s</output></div>
+  <div class="legend">Cyan: measured pitch | orange dashed: attack proposals | purple dotted: pitch-change proposals |
+  blue dashed: extra energy-backed syllables<br>
+  Boxes describe connection TO NEXT note: <span style="color:#73ff93">green S = slurred</span>,
+  <span style="color:#ffd166">yellow T = tied</span>, <span style="color:#f783ff">pink A = articulated</span>,
+  white = phrase end. Gold marks key-corrected notes.</div>
+  <canvas id="chart" aria-label="Live CQT with pitch, onset and note overlays"></canvas>
+  <canvas id="evidence" aria-label="Cached onset activation, CREPE periodicity and RMS"></canvas>
+  <div class="legend">Evidence: orange = onset activation, blue = CREPE periodicity (dashed gate),
+  gray = RMS mapped from -60 to 0 dB. Periodicity and pitch agreement are NOT calibrated correctness probabilities.</div>
+ </div>
+ <div class="panel">
+  <div class="buttons"><button class="primary" id="preview" disabled>Render current A+B</button>
+  <button id="export" disabled>Export MIDI + audio + CQT + settings</button></div>
+  <div id="audioStatus" class="muted">No preview yet. Render after choosing settings.</div>
+  <audio id="player" controls preload="metadata"></audio>
+  <p class="muted">Headphones: vocal LEFT, synth RIGHT. Connected notes sustain; gaps retrigger.
+  Syllable mode uses a minimum 10 ms rendering gap to encode articulation, not measured silence.
+  Click the CQT to seek in the rendered preview. Rendering and export use the full excerpt, regardless of zoom.</p>
+  <div id="exports"></div>
+ </div>
+ <details class="panel"><summary>Note table and measured certainty</summary>
+  <p class="muted">Voiced fraction covers the note body; pitch agreement is the fraction of voiced
+  frames within half a semitone of the measured note BEFORE key correction. Low agreement can indicate
+  a missed split, slide or vibrato, not necessarily a wrong note.</p>
+  <table><thead><tr><th>Start</th><th>End</th><th>Pitch</th><th>Raw MIDI</th><th>Voiced</th>
+  <th>Agreement</th><th>Link</th><th>Gap ms</th><th>Start evidence</th></tr></thead><tbody id="notes"></tbody></table>
+ </details>
+ <p class="muted">madmom pretrained model weights are
+ <a href="https://github.com/CPJKU/madmom_models">CC BY-NC-SA 4.0</a>;
+ commercial integration needs appropriate permission. All audio and processing remain local.</p>
+</main>
+</div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+let session=null,result=null,params=null,baseParams=null,timer=null,sequence=0,previewId=null,ready=false;
+const image=new Image();image.src="/assets/cqt.png";
+const palette={slurred:"#73ff93",tied:"#ffd166",articulated:"#f783ff",phrase_end:"#ffffff"};
+function error(e){$("error").textContent=e.message||String(e);}
+function clearError(){$("error").textContent="";}
+async function post(route,p){
+ const response=await fetch("/api/"+route,{method:"POST",
+ headers:{"Content-Type":"application/json","X-Tuner-Token":session.token},body:JSON.stringify(p)});
+ const body=await response.json();if(!response.ok)throw new Error(body.error||response.statusText);return body;
+}
+function buildControls(){
+ for(const [value,label] of Object.entries(session.methods))$("method").add(new Option(label,value));
+ for(const key of session.keys)$("key").add(new Option(key==="Off"?"Off / chromatic":key.endsWith("m")?
+ key.slice(0,-1)+" minor":key+" major",key));
+ const groups={};
+ for(const [name,title,low,high,step,group,only,help] of session.controls){
+  if(!groups[group]){const panel=document.createElement("div");panel.className="panel";
+   const heading=document.createElement("h2");heading.textContent=group;panel.append(heading);
+   $("numeric").append(panel);groups[group]=panel;}
+  const div=document.createElement("div");div.className="control";div.id="control_"+name;div.dataset.only=only;
+  const label=document.createElement("label");label.htmlFor=name;label.textContent=title;
+  const number=document.createElement("input");number.type="number";number.id=name;number.min=low;number.max=high;number.step=step;
+  const slider=document.createElement("input");slider.type="range";slider.id=name+"_range";slider.min=low;slider.max=high;slider.step=step;
+  slider.setAttribute("aria-label",title);
+  const detail=document.createElement("div");detail.className="help";detail.textContent=help;
+  div.append(label,number,slider,detail);groups[group].append(div);
+  slider.oninput=()=>{number.value=slider.value;changed();};
+  number.oninput=()=>{slider.value=number.value;changed();};
+ }
+ $("method").onchange=changed;$("key").onchange=changed;
+}
+function readParams(){
+ const p={...baseParams,method:$("method").value,key:$("key").value};
+ for(const [name] of session.controls){
+  const input=$(name);if(!input.validity.valid||input.value==="")throw new Error("Invalid value for "+name);
+  p[name]=Number(input.value);
+ }
+ return p;
+}
+function setParams(p){
+ baseParams={...p};$("method").value=p.method;$("key").value=p.key;
+ for(const [name] of session.controls){$(name).value=p[name];$(name+"_range").value=p[name];}
+}
+function enableControls(p){
+ for(const [name,,,,,,only] of session.controls){
+  let enabled=only==="all"||(only==="neural"&&p.method.startsWith("madmom"))||
+   (only==="flux"&&!p.method.startsWith("madmom"))||(only==="hybrid"&&p.method==="pitch_aware")||
+   (only==="key"&&p.key!=="Off")||(only==="syllabic"&&(p.syllabic||p.method==="pitch_aware"));
+  if(["pitch_hold","pitch_hysteresis"].includes(name))enabled=p.syllabic||p.split_pitch||p.method==="pitch_aware";
+  $(name).disabled=!enabled;$(name+"_range").disabled=!enabled;$("control_"+name).classList.toggle("disabled",!enabled);
+  $("control_"+name).hidden=(only==="neural"&&!p.method.startsWith("madmom"))||
+   (only==="flux"&&p.method.startsWith("madmom"));
+ }
+}
+function changed(){
+ clearTimeout(timer);++sequence;ready=false;$("player").pause();
+ $("player").removeAttribute("src");$("player").load();previewId=null;
+ $("status").textContent="Settings changed; updating cached notes...";
+ $("audioStatus").textContent="Settings changed: render a new preview to hear these notes.";
+ $("preview").disabled=true;$("export").disabled=true;
+ timer=setTimeout(apply,350);
+}
+async function apply(){
+ const id=++sequence;
+ try{
+  const p=readParams();enableControls(p);clearError();$("status").textContent="Updating from cached evidence...";
+  const next=await post("tune",p);if(id!==sequence)return;
+  params=p;result=next;ready=true;renderResult();
+ }catch(e){if(id===sequence){error(e);$("status").textContent="Parameters not applied; fix the error above.";}}
+}
+function renderResult(){
+ const s=result.stats,l=s.links;
+ $("status").textContent=`${params.syllabic?"Syllable mode":"Legacy baseline"}: ${s.notes} notes | `+
+ `${s.syllable_starts} syllable starts + ${s.slur_pitch_starts} pitch-only starts | ${s.extra_syllable_proposals} extra syllable proposals | `+
+ `${l.slurred} slurred, ${l.tied} tied, ${l.articulated} articulated | ${s.key_adjusted} key corrections | `+
+ `${result.runtime_ms.toFixed(0)} ms from cache`;
+ if(!s.notes)error(new Error("No notes at these thresholds. Lower the certainty/energy gates or minimum length."));
+ $("preview").disabled=!s.notes;$("export").disabled=!s.notes;
+ const body=$("notes");body.replaceChildren();
+ for(const n of result.notes){
+  const tr=document.createElement("tr");
+  const values=[n.start.toFixed(3),n.end.toFixed(3),n.name+(n.key_adjusted?" *":""),
+   n.raw_midi.toFixed(2),(100*n.voiced_fraction).toFixed(0)+"%",(100*n.pitch_agreement).toFixed(0)+"%",
+   n.link_to_next,n.gap_to_next_ms===null?"":n.gap_to_next_ms,n.start_evidence];
+  values.forEach((value,i)=>{const td=document.createElement("td");td.textContent=value;
+   if(i===2&&n.key_adjusted)td.className="corrected";
+   if(i===5&&n.pitch_agreement<.6)td.className="low";tr.append(td);});body.append(tr);
+ }
+ draw();
+}
+function view(){
+ const duration=session.metadata.duration_seconds;
+ const span=$("span").value==="all"?duration:Math.min(duration,Number($("span").value));
+ $("viewStart").max=Math.max(0,duration-span);
+ const lo=Math.min(Number($("viewStart").value),duration-span);
+ $("viewLabel").textContent=lo.toFixed(1)+"s";
+ return {lo,hi:lo+span,span};
+}
+function canvas(id){
+ const element=$(id),dpr=devicePixelRatio||1,w=element.clientWidth,h=element.clientHeight;
+ if(element.width!==Math.round(w*dpr)||element.height!==Math.round(h*dpr)){
+  element.width=Math.round(w*dpr);element.height=Math.round(h*dpr);}
+ const context=element.getContext("2d");context.setTransform(dpr,0,0,dpr,0,0);context.clearRect(0,0,w,h);
+ return {context,w,h};
+}
+function line(ctx,times,values,x,y,lo,hi,color,dashed=[]){
+ ctx.strokeStyle=color;ctx.lineWidth=1;ctx.setLineDash(dashed);ctx.beginPath();let connected=false;
+ times.forEach((t,i)=>{const v=values[i];if(t<lo||t>hi||v===null||!Number.isFinite(v)){connected=false;return;}
+ if(!connected){ctx.moveTo(x(t),y(v));connected=true;}else ctx.lineTo(x(t),y(v));});ctx.stroke();ctx.setLineDash([]);
+}
+function draw(){
+ if(!result||!session||!image.complete||!image.naturalWidth)return;
+ const {lo,hi,span}=view(),{context:ctx,w,h}=canvas("chart");
+ const left=48,top=14,width=w-left-12,height=h-top-38;
+ const low=session.metadata.pitch_low,high=session.metadata.pitch_high;
+ const x=t=>left+(t-lo)/span*width,y=p=>top+(high-p)/(high-low)*height;
+ ctx.drawImage(image,lo/session.metadata.duration_seconds*image.width,0,
+  span/session.metadata.duration_seconds*image.width,image.height,left,top,width,height);
+ ctx.save();ctx.beginPath();ctx.rect(left,top,width,height);ctx.clip();
+ line(ctx,result.times,result.pitch,x,y,lo,hi,"#35e9ff");
+ for(const [events,color,dash] of [[result.onsets,"#ffb02e",[4,4]],[result.pitch_changes,"#c5a1ff",[2,4]],
+  [result.energy_onsets,"#74acff",[6,3]]]){
+  ctx.strokeStyle=color;ctx.setLineDash(dash);ctx.lineWidth=.8;
+  for(const t of events){if(t<lo||t>hi)continue;ctx.beginPath();ctx.moveTo(x(t),top);ctx.lineTo(x(t),top+height);ctx.stroke();}
+ }ctx.setLineDash([]);
+ for(const n of result.notes){
+  if(n.end<lo||n.start>hi)continue;
+  ctx.strokeStyle=palette[n.link_to_next];ctx.lineWidth=2;
+  ctx.strokeRect(x(n.start),y(n.midi+.35),x(n.end)-x(n.start),y(n.midi-.35)-y(n.midi+.35));
+  ctx.fillStyle=n.key_adjusted?"#ffd166":palette[n.link_to_next];ctx.font="11px system-ui";
+  const tag={slurred:"S",tied:"T",articulated:"A",phrase_end:"end"}[n.link_to_next];
+  ctx.fillText(n.name+" "+tag+(n.key_adjusted?" *":""),Math.max(left,x(n.start))+2,y(n.midi+.6));
+ }
+ if(previewId===result.parameter_id){ctx.strokeStyle="white";ctx.lineWidth=2;ctx.beginPath();
+ ctx.moveTo(x($("player").currentTime),top);ctx.lineTo(x($("player").currentTime),top+height);ctx.stroke();}
+ ctx.restore();ctx.fillStyle="#cbd5e5";ctx.font="11px system-ui";
+ for(let p=Math.ceil(low);p<=high;p+=2)ctx.fillText(String(p),12,y(p)+4);
+ for(let t=Math.ceil(lo);t<=hi;t++){ctx.fillText(String(t),x(t)-5,h-17);}
+ ctx.fillText(`Crop seconds | source ${(session.metadata.start_seconds+lo).toFixed(3)}-${(session.metadata.start_seconds+hi).toFixed(3)}s`,left,h-2);
+ const {context:ec,w:ew,h:eh}=canvas("evidence"),ex=t=>left+(t-lo)/span*(ew-left-12),ey=v=>8+(1-v)*(eh-28);
+ line(ec,result.envelope_times,result.envelope,ex,ey,lo,hi,"#ffb02e");
+ line(ec,result.times,result.periodicity,ex,ey,lo,hi,"#74acff");
+ line(ec,result.times,result.db.map(d=>Math.max(0,Math.min(1,(d+60)/60))),ex,ey,lo,hi,"#aaa",[2,3]);
+ ec.strokeStyle="#74acff";ec.setLineDash([5,5]);ec.beginPath();ec.moveTo(left,ey(params.periodicity));
+ ec.lineTo(ew-12,ey(params.periodicity));ec.stroke();ec.setLineDash([]);
+ ec.fillStyle="#cbd5e5";ec.font="11px system-ui";ec.fillText("1.0",12,14);ec.fillText("0.0",12,eh-20);
+}
+$("span").onchange=draw;$("viewStart").oninput=draw;image.onload=draw;window.onresize=draw;
+$("chart").onclick=e=>{
+ if(!result||previewId!==result.parameter_id)return;
+ const rect=$("chart").getBoundingClientRect(),{lo,span}=view();
+ $("player").currentTime=Math.max(0,Math.min(session.metadata.duration_seconds,lo+(e.clientX-rect.left-48)/(rect.width-60)*span));draw();
+};
+$("player").ontimeupdate=draw;
+$("player").onplay=()=>{function frame(){draw();if(!$("player").paused)requestAnimationFrame(frame);}requestAnimationFrame(frame);};
+$("preview").onclick=async()=>{
+ const id=result.parameter_id,revision=sequence,p={...params};$("preview").disabled=true;clearError();
+ try{const data=await post("preview",p);if(!ready||result.parameter_id!==id||sequence!==revision)throw new Error("Settings changed while rendering; render again.");
+  $("player").src=data.url;$("player").load();previewId=id;
+  $("audioStatus").textContent=`Current preview: ${data.duration_seconds}s, vocal LEFT / synth RIGHT. Press Play.`;draw();
+ }catch(e){error(e);}finally{$("preview").disabled=!ready||!result?.notes.length;}
+};
+$("export").onclick=async()=>{
+ const p={...params};$("export").disabled=true;clearError();$("exports").textContent="Exporting current settings...";
+ try{const data=await post("export",p);$("exports").replaceChildren();
+  const label=document.createElement("p");label.textContent="Saved: "+data.directory;$("exports").append(label);
+  for(const [name,url] of Object.entries(data.files)){const a=document.createElement("a");a.href=url;a.textContent=name;
+   a.download=name;$("exports").append(a);}
+ }catch(e){$("exports").textContent="Export failed.";error(e);}finally{$("export").disabled=!ready||!result?.notes.length;}
+};
+$("baseline").onclick=()=>{setParams(session.baseline);changed();};
+$("reset").onclick=()=>{setParams(session.defaults);changed();};
+$("save").onclick=()=>{
+ try{const p=readParams();const url=URL.createObjectURL(new Blob([JSON.stringify(p,null,2)],{type:"application/json"}));
+ const a=document.createElement("a");a.href=url;a.download="vocal-tuning-preset.json";a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);
+ }catch(e){error(e);}
+};
+$("load").onclick=()=>$("presetFile").click();
+$("presetFile").onchange=async()=>{
+ try{const file=$("presetFile").files[0];if(!file)return;
+ const revision=++sequence;clearTimeout(timer);$("status").textContent="Validating imported preset...";
+ const data=JSON.parse(await file.text()),p=data.parameters||data;await post("tune",p);
+ if(sequence!==revision)throw new Error("Preset discarded because settings changed while it was loading.");
+ setParams({...session.baseline,...p});changed();
+ }catch(e){error(e);}finally{$("presetFile").value="";}
+};
+async function start(){
+ try{const response=await fetch("/api/state");if(!response.ok)throw new Error("Cannot load cached session.");
+ session=await response.json();buildControls();params=session.defaults;result=session.result;ready=true;setParams(params);enableControls(params);
+ for(const id of ["method","key","baseline","reset","save","load"])$(id).disabled=false;
+ $("source").textContent=`Source ${session.metadata.start_seconds.toFixed(3)}-${session.metadata.end_seconds.toFixed(3)}s `+
+ `(${session.metadata.duration_seconds}s) | ${session.metadata.pitch_tracker} | ${session.metadata.source}`;
+ renderResult();
+ }catch(e){error(e);$("status").textContent="Tuner initialization failed.";}
+}
+start();
+</script>
+</body>
+</html>
