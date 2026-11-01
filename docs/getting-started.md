@@ -381,7 +381,12 @@ The setting is remembered.
   role, or chords only. If tracks are not fully analyzed, the app asks before
   writing a partial file.
 - **File > Export score (MusicXML)...** writes a MuseScore-ready score with
-  the transcribed tracks and the chord symbols on the top staff.
+  the transcribed tracks and the chord symbols on the top staff. Bass and drums
+  are named **Electric Bass** and **Drum Kit**. Scores and chord-only lead sheets
+  have one opening tempo: total quarter-note beats divided by elapsed time
+  between the first and last timing anchors (or the set BPM without a timing
+  map). No later tempo changes are exported, even for playback. MIDI retains
+  the original tempo map to stay aligned with the audio.
 
 ## Troubleshooting
 

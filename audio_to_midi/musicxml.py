@@ -4,7 +4,7 @@ One part per transcribed track on the conventional staff for its role (bass and
 guitar written an octave up, piano on a grand staff, drums on a percussion staff
 with kit noteheads). Rhythm is notated by beat with ties, triplets and beams;
 connected single-line notes get legato slurs; chord symbols ride on the top
-pitched part; the tempo map plays back while only real tempo changes are shown.
+pitched part; one opening average tempo keeps the notation and playback steady.
 Only the exported copy is tidied: project notes are never changed.
 """
 
@@ -43,8 +43,8 @@ INSTRUMENTS = {
     "vocals": Instrument("Voice", "Vo.", "voice.vocals", 54, (("G", 2, 0),)),
     "guitar": Instrument("Guitar", "Gtr.", "pluck.guitar.electric", 28, (("G", 2, -1),), 1),
     "piano": Instrument("Piano", "Pno.", "keyboard.piano", 1, (("G", 2, 0), ("F", 4, 0))),
-    "bass": Instrument("Bass", "Bs.", "pluck.bass.electric", 34, (("F", 4, 0),), 1),
-    "drums": Instrument("Drums", "Dr.", "drum.group.set", 1, (("percussion", None, 0),)),
+    "bass": Instrument("Electric Bass", "El. Bs.", "pluck.bass.electric", 34, (("F", 4, 0),), 1),
+    "drums": Instrument("Drum Kit", "D. Kit", "drum.group.set", 1, (("percussion", None, 0),)),
 }
 ROLE_ORDER = ("vocals", "guitar", "piano", "bass", "drums")
 MONOPHONIC = frozenset({"vocals", "bass"})
@@ -446,22 +446,6 @@ def _build_parts(sources, meter: _Meter) -> list[_Part]:
     return parts
 
 
-def _tempo_marks(grid, meter: _Meter, bars: int) -> dict[int, tuple[float, bool]]:
-    """Bar -> (quarter BPM, visible). Every audible change plays back; only changes of 3% or more show."""
-    marks, played, shown = {}, None, None
-    for bar in range(bars):
-        seconds = grid.beat_to_seconds(meter.bar * (bar + 1)) - grid.beat_to_seconds(meter.bar * bar)
-        bpm = round(60 * float(meter.bar) / seconds, 2) if seconds > 0 else float(grid.bpm)
-        if played is not None and abs(bpm - played) < 0.5:
-            continue
-        visible = shown is None or abs(bpm - shown) >= 0.03 * shown
-        marks[bar] = (bpm, visible)
-        played = bpm
-        if visible:
-            shown = bpm
-    return marks
-
-
 def _sub(parent: ET.Element, tag: str, value=None, **attributes) -> ET.Element:
     element = ET.SubElement(parent, tag, {k.replace("_", "-"): str(v) for k, v in attributes.items()})
     if value is not None:
@@ -498,11 +482,9 @@ def _harmony(parent: ET.Element, symbol: str, names, offset: int) -> None:
         _sub(harmony, "offset", offset)
 
 
-def _tempo(parent: ET.Element, bpm: float, visible: bool, meter: _Meter) -> None:
+def _tempo(parent: ET.Element, bpm: float, meter: _Meter) -> None:
     direction = _sub(parent, "direction", placement="above")
     metronome = _sub(_sub(direction, "direction-type"), "metronome", parentheses="no")
-    if not visible:
-        metronome.set("print-object", "no")
     _sub(metronome, "beat-unit", "quarter")
     if meter.compound:
         _sub(metronome, "beat-unit-dot")
@@ -701,15 +683,14 @@ def score_xml(project, tracks=None, include_chords: bool = True) -> str:
             _sub(midi, "midi-program", part.instrument.program)
 
     names, fifths = spelling(project.key), key_fifths(project.key)
-    tempos = _tempo_marks(grid, meter, bars)
     for part in parts:
         element = _sub(root, "part", id=part.id)
         for bar in range(bars):
             measure = _sub(element, "measure", number=bar + 1)
             if bar == 0:
                 _attributes(measure, part, divisions, fifths, grid)
-            if part is parts[0] and bar in tempos:
-                _tempo(measure, *tempos[bar], meter)
+            if part is parts[0] and bar == 0:
+                _tempo(measure, grid.average_bpm, meter)
             written = False
             for i, voice in enumerate(part.voices):
                 pieces = voice.bars[bar]

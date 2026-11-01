@@ -323,6 +323,7 @@ def musicxml(segments, grid, title: str, key: str = "") -> str:
     from audio_to_midi.notation import key_fifths, spelling
 
     names = spelling(key)
+    bpm = grid.average_bpm
     bar_q = Fraction(4 * grid.numerator, grid.denominator)
     denominators = [Fraction(x).denominator for s in segments for x in (s.start, s.end)] + [bar_q.denominator, 1]
     divisions = int(np.lcm.reduce(np.array(denominators, dtype=np.int64)))
@@ -356,8 +357,8 @@ def musicxml(segments, grid, title: str, key: str = "") -> str:
                 f"<time><beats>{grid.numerator}</beats><beat-type>{grid.denominator}</beat-type></time>"
                 "<clef><sign>G</sign><line>2</line></clef></attributes>"
                 f'<direction placement="above"><direction-type><metronome><beat-unit>quarter</beat-unit>'
-                f"<per-minute>{grid.bpm:g}</per-minute></metronome></direction-type>"
-                f'<sound tempo="{grid.bpm:g}"/></direction>'
+                f"<per-minute>{bpm:g}</per-minute></metronome></direction-type>"
+                f'<sound tempo="{bpm:g}"/></direction>'
             )
         cuts = sorted({bar_start, bar_end} | {s.start for s in segments if bar_start < s.start < bar_end})
         for left, right in zip(cuts, cuts[1:]):

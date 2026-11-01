@@ -99,6 +99,14 @@ class Grid:
         return [(q0, 60 * float(q1 - q0) / (t1 - t0))
                 for (t0, q0), (t1, q1) in zip(self.anchors, self.anchors[1:])]
 
+    @property
+    def average_bpm(self) -> float:
+        """Quarter-note BPM over the full timing-anchor span, independent of export scope."""
+        if len(self.anchors) < 2:
+            return self.bpm
+        (t0, q0), (t1, q1) = self.anchors[0], self.anchors[-1]
+        return 60 * float(q1 - q0) / (t1 - t0)
+
     def snap(self, beat: Fraction) -> Fraction:
         """Snap to the nearest grid point; exact ties go toward positive infinity."""
         beat_value(beat, "beat", nonnegative=False)
