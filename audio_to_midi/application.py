@@ -16,6 +16,7 @@ import soundfile as sf
 from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.adapters import MODELS, Prediction, TrackBackend, normalize_key
 from audio_to_midi.notation import preferred_key
+from audio_to_midi.vocal_settings import VOCAL_MODELS
 
 
 def add_stem(project: Project, path: Path, role: str) -> Track:
@@ -96,6 +97,8 @@ def identity(project: Project, track: Track) -> str:
         "harmony": harmony_identity(project),
         "settings": {k: v for k, v in track.settings.items() if k not in ("coverage", "coverage_identity")},
         "training": track.training, "revision": track.revision,
+        **({"vocal_boundary_policy": 1} if track.role == "vocals" else {}),
+        **({"vocal_syllable_policy": 1} if track.model in VOCAL_MODELS else {}),
     }, sort_keys=True).encode()).hexdigest()
 
 
@@ -178,6 +181,7 @@ class TranscriptionService:
             project.grid, project.key, track.model,
             harmony_identity(project),
             track.settings.get("license_acknowledged", False),
+            track.settings.get("madmom_license_acknowledged", False),
         ))
         cached = self._backends.get(track.id)
         if cached is None or cached[0] != backend_key:

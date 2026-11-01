@@ -8,7 +8,7 @@ Source audio is never changed; counted beats and pins form the grid's tempo map.
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import replace
+from dataclasses import asdict, replace
 from fractions import Fraction
 from pathlib import Path
 import threading
@@ -19,7 +19,7 @@ import soundfile as sf
 from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
+    QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
     QPushButton, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
@@ -47,6 +47,7 @@ from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline
 from audio_to_midi.timing import BeatSession
+from audio_to_midi.vocal_settings import CONTROLS as VOCAL_CONTROLS, MODEL_DESCRIPTIONS, VOCAL_MODELS, VocalParameters
 
 MIX, CHORDS = "__mix__", "__chords__"
 GRIDS = (
@@ -286,6 +287,32 @@ class ProjectWindow(QMainWindow):
         self.models.setMinimumWidth(150)
         self.models.currentTextChanged.connect(self._model_changed)
         row.addWidget(self.models)
+        self.vocal_panel = QWidget()
+        vocal_layout = QHBoxLayout(self.vocal_panel)
+        vocal_layout.setContentsMargins(0, 0, 0, 0)
+        vocal_layout.setSpacing(6)
+        self.vocal_controls: dict[str, QDoubleSpinBox] = {}
+        for name, text, low, high, step, decimals, suffix, help_text in VOCAL_CONTROLS:
+            column = QVBoxLayout()
+            column.setSpacing(1)
+            label = QLabel(text)
+            label.setToolTip(help_text)
+            control = QDoubleSpinBox()
+            control.setObjectName(f"vocal_{name}")
+            control.setDecimals(decimals)
+            control.setRange(low, high)
+            control.setSingleStep(step)
+            control.setSuffix(suffix)
+            control.setMaximumWidth(86)
+            control.setKeyboardTracking(False)
+            control.setToolTip(help_text)
+            control.valueChanged.connect(lambda _: self._guard(self._vocal_parameters_changed))
+            self.vocal_controls[name] = control
+            column.addWidget(label)
+            column.addWidget(control)
+            vocal_layout.addLayout(column)
+        self.vocal_panel.setToolTip("Select madmom_cnn or madmom_brnn for vocal syllable controls. Only visible bars are analyzed.")
+        row.addWidget(self.vocal_panel)
         row.addStretch(1)
         self.stages = QLabel()
         self.stages.setToolTip("Workflow: import the mix, count bars, then stems.")
@@ -520,8 +547,16 @@ class ProjectWindow(QMainWindow):
             "clear_track": (track is not None, "Choose a track first."),
             "clear_all": (bool(self.project.tracks or self.project.chords), "Nothing to clear."),
             "analyze": (transcribable, "Choose a transcribable stem."),
-            "analyze_all": (transcribable, "Choose a transcribable stem."),
-            "profile": (track is not None, "Choose a track first."),
+            "analyze_all": (
+                transcribable and track is not None and track.model not in VOCAL_MODELS,
+                "Neural vocal models only analyze visible bars. Navigate to another window to process it."
+                if track and track.model in VOCAL_MODELS else "Choose a transcribable stem.",
+            ),
+            "profile": (
+                track is not None and track.model not in VOCAL_MODELS,
+                "Neural vocal models honor direct note/onset edits; feature profiles belong to legacy models."
+                if track and track.model in VOCAL_MODELS else "Choose a track first.",
+            ),
             "cancel": (busy, "Nothing is running."),
             "key_chroma": (has_mix, "Import a mix first."),
         }
@@ -579,6 +614,10 @@ class ProjectWindow(QMainWindow):
         view = self.view
         if track and MODELS[track.role]:
             self.models.addItems(MODELS[track.role])
+            for index in range(self.models.count()):
+                description = MODEL_DESCRIPTIONS.get(self.models.itemText(index))
+                if description:
+                    self.models.setItemData(index, description, Qt.ItemDataRole.ToolTipRole)
             self.models.setCurrentText(track.model)
         elif view == CHORDS:
             for name, text in CHORD_MODELS.items():
@@ -586,6 +625,7 @@ class ProjectWindow(QMainWindow):
             self.models.setCurrentIndex(self.models.findData(self.chord_model))
         self.models.setEnabled(bool(track and MODELS[track.role]) or view == CHORDS)
         self.models.setToolTip("Chord recognizer used by Edit > Detect chords" if view == CHORDS else "")
+        self._sync_vocal_controls()
         self._building = False
         self.timeline.set_role(track.role if track else (MIX if view == MIX else None))
         self.timeline.selected = None
@@ -799,9 +839,36 @@ class ProjectWindow(QMainWindow):
         if not self._building and self.active and model:
             self._cancel(analysis_only=True)
             self.active.model = model
+            if model in VOCAL_MODELS:
+                self.active.settings.setdefault("vocal_parameters", asdict(VocalParameters()))
             self.active.revision += 1
+            self._sync_vocal_controls()
             self._refresh()
             self._queue_visible()
+            if model in VOCAL_MODELS and self.active.settings.get("onset_profile"):
+                self.status.setText("Neural vocal models use direct note/onset feedback; the legacy feature profile remains saved for legacy models.")
+
+    def _sync_vocal_controls(self) -> None:
+        track = self.active
+        self.vocal_panel.setVisible(bool(track and track.role == "vocals"))
+        parameters = VocalParameters.from_dict(track.settings.get("vocal_parameters", {}) if track else {})
+        for name, control in self.vocal_controls.items():
+            blocked = control.blockSignals(True)
+            control.setValue(getattr(parameters, name))
+            control.blockSignals(blocked)
+            control.setEnabled(bool(track and track.model in VOCAL_MODELS))
+
+    def _vocal_parameters_changed(self) -> None:
+        if self._building or self.active is None or self.active.model not in VOCAL_MODELS:
+            return
+        parameters = VocalParameters.from_dict({name: control.value() for name, control in self.vocal_controls.items()})
+        if asdict(parameters) == self.active.settings.get("vocal_parameters"):
+            return
+        self._cancel(analysis_only=True)
+        self.active.settings["vocal_parameters"] = asdict(parameters)
+        self.active.revision += 1
+        self._refresh()
+        self._queue_visible()
 
     # -- window, zoom and grid ------------------------------------------------
     def _set_window(self, start: Fraction) -> None:
@@ -908,10 +975,15 @@ class ProjectWindow(QMainWindow):
         from audio_to_midi import provision
 
         model = self.active.model
+        if whole and model in VOCAL_MODELS:
+            raise ValueError("Neural vocal models only process visible bars. Navigate to another window to analyze it.")
+        license_key = "madmom_license_acknowledged" if model in VOCAL_MODELS else "license_acknowledged"
         terms = (
             "ADTOF weights are licensed for non-commercial use only. "
             if model == "adtof" else
-            "Review the Piano-HR checkpoint's terms before relying on its output. " if model == "piano_hr" else ""
+            "Review the Piano-HR checkpoint's terms before relying on its output. " if model == "piano_hr" else
+            "MADMoM onset weights are CC BY-NC-SA 4.0 (non-commercial). Commercial use needs appropriate permission. "
+            "First installation requires git and, on Windows, MSVC C++ Build Tools. " if model in VOCAL_MODELS else ""
         )
         needs = provision.missing(model)
         if needs:
@@ -925,7 +997,7 @@ class ProjectWindow(QMainWindow):
             ) != QMessageBox.StandardButton.Yes:
                 self._declined_installs.add(model)
                 return
-            self.active.settings["license_acknowledged"] = True
+            self.active.settings[license_key] = True
             self._installing.add(model)
 
             def installed(_value, whole=whole):
@@ -942,10 +1014,10 @@ class ProjectWindow(QMainWindow):
             self._run(install, installed, kind="install",
                       message=f"Installing {provision.LABELS.get(model, model)}:", reports=True)
             return
-        if terms and not self.active.settings.get("license_acknowledged"):
+        if terms and not self.active.settings.get(license_key):
             if QMessageBox.question(self, "Model terms", terms + "Continue?") != QMessageBox.StandardButton.Yes:
                 return
-            self.active.settings["license_acknowledged"] = True
+            self.active.settings[license_key] = True
         self._cancel(analysis_only=True)
         run_id = self._analysis_run
         track_id = self.active.id
@@ -960,6 +1032,11 @@ class ProjectWindow(QMainWindow):
             return
         project = deepcopy(self.project)
         track = project.track(track_id)
+        if track.model in VOCAL_MODELS and (
+            whole or self.active is None or self.active.id != track_id or
+            start < self.timeline.start or end > self.timeline.end
+        ):
+            raise ValueError("Neural vocal analysis must stay inside the current visible window.")
         result_token = token(self.project, self.project.track(track_id))
         chunk_end = min(end, start + project.grid.bar_beats * 2) if whole else end
 
@@ -977,6 +1054,13 @@ class ProjectWindow(QMainWindow):
 
     def _publish(self, value) -> None:
         result_token, prediction = value
+        track = next((t for t in self.project.tracks if t.id == result_token.track_id), None)
+        if track and track.model in VOCAL_MODELS and (
+            self.active is None or self.active.id != track.id or
+            prediction.start < self.timeline.start or prediction.end > self.timeline.end
+        ):
+            self.status.setText("Discarded inference outside the current visible window; no hidden notes changed.")
+            return
         if publish(self.project, result_token, prediction):
             self._refresh()
             self.status.setText("Notes updated.")
@@ -1459,10 +1543,13 @@ class ProjectWindow(QMainWindow):
             t for t in self.project.tracks if t.role == scope
         ]
         partial = any(not complete(self.project, t) for t in selected)
+        next_step = ("Choose No to cancel and analyze more visible windows."
+                     if any(t.model in VOCAL_MODELS for t in selected)
+                     else "Choose No to analyze whole tracks first.")
         if partial and QMessageBox.question(
             self, "Partial export",
             "Some tracks are unprocessed or stale. Export only currently resolved notes "
-            f"as an explicitly partial {kind}? Choose No to analyze whole tracks first.",
+            f"as an explicitly partial {kind}? {next_step}",
         ) != QMessageBox.StandardButton.Yes:
             return None
         return selected, scope in (choices[0], "chords"), partial
@@ -1495,6 +1582,8 @@ class ProjectWindow(QMainWindow):
     def _profile(self) -> None:
         if not self.active:
             raise ValueError("Select a track first.")
+        if self.active.model in VOCAL_MODELS:
+            raise ValueError("Feature profiles belong to legacy models. Neural vocal models honor direct note/onset edits instead.")
         path, _ = QFileDialog.getOpenFileName(self, "Import onset profile", filter="Profile (*.json)")
         if path:
             ignored = import_profile(self.active, Path(path))
@@ -1979,7 +2068,8 @@ class ProjectWindow(QMainWindow):
                     for start, end, pitch, velocity in rows]
         if device is None:
             if rows:
-                extra = extra + render_notes(relative, 0.0, len(segment), rate, drums)
+                extra = extra + render_notes(relative, 0.0, len(segment), rate, drums,
+                                             legato=bool(track and track.model in VOCAL_MODELS))
             player.play_audio(mix(segment, extra if rows or clicks else None, audio_gain, synth_gain), rate)
             self.status.setText(
                 "Playing" + (": audio mostly right, notes and clicks mostly left (sample-aligned)." if rows or clicks else ".")

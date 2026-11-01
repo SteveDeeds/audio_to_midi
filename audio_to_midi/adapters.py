@@ -11,15 +11,16 @@ import librosa
 import numpy as np
 import soundfile as sf
 
-from audio_to_midi.domain import Note, Project, Track
+from audio_to_midi.domain import Note, NoteStore, Project, Track
 from audio_to_midi import velocity
 from core.models import CorrectionModel
 from core import onset_features
+from audio_to_midi.vocal_settings import VOCAL_MODELS, VocalParameters
 
 
 MODELS = {
     "bass": ("crepe_tiny", "crepe_full"),
-    "vocals": ("pyin", "crepe_full", "crepe_tiny"),
+    "vocals": ("pyin", "crepe_full", "crepe_tiny", *VOCAL_MODELS),
     "piano": ("basic_pitch", "piano_hr"),
     "guitar": ("basic_pitch", "piano_hr"),
     "drums": ("adtof",),
@@ -59,6 +60,8 @@ class Prediction:
 class TrackBackend:
     """One worker-owned audio/provider cache per track and settings identity."""
 
+    VOCAL_KEEP_THRESHOLD = 0.25
+
     def __init__(self, track: Track, project: Project):
         self.audio, self.sr = sf.read(track.audio_path, dtype="float32", always_2d=True)
         if not np.all(np.isfinite(self.audio)):
@@ -80,7 +83,8 @@ class TrackBackend:
         self._cqt_data = None
         self._drum_levels = None
         self._path = track.audio_path
-        self._license_acknowledged = track.settings.get("license_acknowledged", False)
+        license_key = "madmom_license_acknowledged" if track.model in VOCAL_MODELS else "license_acknowledged"
+        self._license_acknowledged = track.settings.get(license_key, False) is True
         self.features: dict[Fraction, tuple[float, float, float, float]] = {}
         self.attacks: np.ndarray | None = None
         self._harmony_paths = (
@@ -97,11 +101,16 @@ class TrackBackend:
             raise ValueError(f"Unsupported {self.role} model: {self.model}")
         if self.provider is not None:
             return
-        if (self.role == "drums" or self.model == "piano_hr") and not self._license_acknowledged:
+        if (self.role == "drums" or self.model == "piano_hr" or self.model in VOCAL_MODELS) and not self._license_acknowledged:
             raise ValueError(
                 "Acknowledge this backend's checkpoint license and possible first-use download "
-                "before transcription (ADTOF is non-commercial; review piano-HR terms)."
+                "before transcription (ADTOF/MADMoM onset weights are non-commercial; review piano-HR terms)."
             )
+        if self.role == "vocals" and self.model in VOCAL_MODELS:
+            from audio_to_midi.vocals import VocalTranscriber
+
+            self.provider = VocalTranscriber(self.audio, self.sr, self.model, normalize_key(self.project_key))
+            return
         if self.role in ("bass", "vocals"):
             from core.mono_pitch import MonoTranscriber
             from core.chord_analysis import key_to_scale_pcs
@@ -200,6 +209,29 @@ class TrackBackend:
         power = velocity.harmonic_power(times, magnitude, self.CQT_LOW_MIDI, pitch, t0, t1)
         return velocity.velocity(power, self._cqt_data[2])
 
+    def _onset_labels(self, track: Track) -> dict[Fraction, bool]:
+        labels = {
+            Fraction(str(row["beat"])): bool(row["keep"])
+            for row in track.training if row.get("domain") == "onset"
+        }
+        if self.role != "vocals":
+            return labels
+        # A corrected held note is evidence against re-attacks, even when
+        # its old markers and positive onset labels have not been cleaned up.
+        for note in track.notes.authored:
+            for beat in labels:
+                if note.start < beat < note.end:
+                    labels[beat] = False
+            beat = self.grid.snap(note.start)
+            if beat <= note.start:
+                beat += self.grid.subdivision
+            while beat < note.end:
+                labels[beat] = False
+                beat += self.grid.subdivision
+        for note in track.notes.authored:
+            labels[note.start] = True
+        return labels
+
     def predict(
         self, track: Track, start: Fraction, end: Fraction,
         cancelled: Callable[[], bool],
@@ -213,6 +245,19 @@ class TrackBackend:
         t1 = min(self.duration, grid.beat_to_seconds(end))
         if t1 <= t0:
             raise ValueError("Requested interval has no audio.")
+        if self.role == "vocals" and self.model in VOCAL_MODELS:
+            parameters = VocalParameters.from_dict(track.settings.get("vocal_parameters", {}))
+            notes, onsets = provider.transcribe(track.id, grid, start, end, parameters,
+                                                self._onset_labels(track), cancelled)
+            # This provider is monophonic: authored vocal notes exclude generated
+            # alternatives of any pitch, not only the same-pitch overlay.
+            blockers = [(max(start, n.start), min(end, n.end), None)
+                        for n in track.notes.authored if n.start < end and start < n.end]
+            if blockers:
+                notes = NoteStore(generated=notes, rejections=blockers).resolved()
+            if cancelled():
+                raise Cancelled()
+            return Prediction(start, end, tuple(notes), tuple(onsets))
         audio_start = min(end, max(start, grid.snap(grid.seconds_to_beat(t0))))
         if self.role == "drums":
             provider.prepare()
@@ -256,28 +301,33 @@ class TrackBackend:
         profile = track.settings.get("onset_profile")
         if profile:
             model.load_dict(profile, merge=False)
-        labels = [row for row in track.training if row.get("domain") == "onset"]
+        labels = self._onset_labels(track)
         examples = []
-        for label in labels:
-            beat = Fraction(str(label["beat"]))
+        for beat, keep in labels.items():
+            if cancelled():
+                raise Cancelled()
             examples.append((
-                *self._candidate_features(beat), bool(label["keep"]),
+                *self._candidate_features(beat), keep,
                 int(beat * 1000000), "user",
             ))
         if examples:
             model.record_candidate_batch(examples)
+        # Held-note negatives are plentiful; retain sensitivity to quieter
+        # syllables while the note interiors still veto false boundaries.
+        threshold = self.VOCAL_KEEP_THRESHOLD if (
+            self.role == "vocals" and track.notes.authored and False in labels.values()
+        ) else 0.5
         active = set()
         cursor = audio_start
         while cursor < end:
             probability = model.candidate_keep_prob(*self._candidate_features(cursor)) if examples or profile else None
-            if (probability is not None and probability >= 0.5) or (
+            if (probability is not None and probability >= threshold) or (
                 probability is None and cursor in baseline
             ):
                 active.add(cursor)
             cursor += grid.subdivision
-        for label in labels:
-            beat = Fraction(str(label["beat"]))
-            if bool(label["keep"]):
+        for beat, keep in labels.items():
+            if keep:
                 active.add(beat)
             else:
                 active.discard(beat)
@@ -288,9 +338,9 @@ class TrackBackend:
                 grid.snap(grid.seconds_to_beat(t))
                 for t in provider.pitch_changes(t0, t1, self.role, self.model)
             )
-        for label in labels:
-            if not label["keep"]:
-                active.discard(Fraction(str(label["beat"])))
+        for beat, keep in labels.items():
+            if not keep:
+                active.discard(beat)
         bounds = sorted({audio_start, end} | {b for b in active if audio_start <= b < end})
         notes: list[Note] = []
         for a, b in zip(bounds, bounds[1:]):

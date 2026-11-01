@@ -93,13 +93,16 @@ def tapping_offset(taps, downbeats) -> tuple[float, float, int]:
     return float(np.median(values)), float(np.std(values)), len(values)
 
 
-def render_notes(rows, start_seconds: float, length: int, sample_rate: int, drums: bool = False) -> np.ndarray:
+def render_notes(rows, start_seconds: float, length: int, sample_rate: int, drums: bool = False,
+                 legato: bool = False) -> np.ndarray:
     """Render (start_s, end_s, pitch, velocity) rows into a mono buffer of `length` samples.
 
     Sample 0 corresponds to `start_seconds`, the same instant as the stem segment's first sample.
     """
     out = np.zeros(length, dtype=np.float32)
-    for start, end, pitch, velocity in rows:
+    rows = sorted(rows, key=lambda row: row[0]) if legato else list(rows)
+    phase = 0.0
+    for index, (start, end, pitch, velocity) in enumerate(rows):
         first = max(0, round((start - start_seconds) * sample_rate))
         last = min(length, round((end - start_seconds) * sample_rate))
         if drums:
@@ -112,9 +115,23 @@ def render_notes(rows, start_seconds: float, length: int, sample_rate: int, drum
             out[first:last] += amp * _drum(int(pitch), t)
             continue
         freq = 440.0 * 2 ** ((int(pitch) - 69) / 12)
-        tone = sum(weight * np.sin(2 * np.pi * freq * k * t) for k, weight in ((1, 1.0), (2, 0.3), (3, 0.15)))
         duration = t[-1] + 1 / sample_rate
-        envelope = np.minimum(1, np.minimum(t / ATTACK_SECONDS, (duration - t) / RELEASE_SECONDS))
+        if legato:
+            connected_before = index > 0 and abs(rows[index - 1][1] - start) < 1e-9
+            connected_after = index + 1 < len(rows) and abs(end - rows[index + 1][0]) < 1e-9
+            if not connected_before:
+                phase = 0.0
+            tone = sum(weight * np.sin(k * phase + 2 * np.pi * freq * k * t)
+                       for k, weight in ((1, 1.0), (2, 0.3), (3, 0.15)))
+            phase = float((phase + 2 * np.pi * freq * (last - first) / sample_rate) % (2 * np.pi))
+            envelope = np.ones_like(t)
+            if not connected_before:
+                envelope = np.minimum(envelope, t / ATTACK_SECONDS)
+            if not connected_after:
+                envelope = np.minimum(envelope, (duration - t) / RELEASE_SECONDS)
+        else:
+            tone = sum(weight * np.sin(2 * np.pi * freq * k * t) for k, weight in ((1, 1.0), (2, 0.3), (3, 0.15)))
+            envelope = np.minimum(1, np.minimum(t / ATTACK_SECONDS, (duration - t) / RELEASE_SECONDS))
         out[first:last] += amp * tone * np.clip(envelope, 0, 1)
     return out
 

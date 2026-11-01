@@ -1,5 +1,9 @@
 -r requirements.txt
 torchcrepe>=0.0.23
+setuptools>=75
+Cython>=3
+# MADMoM needs --no-build-isolation and MSVC C++ Build Tools on Windows.
+madmom @ git+https://github.com/CPJKU/madmom.git@27f032e8947204902c675e5e341a3faf5dc86dae
 piano-transcription-inference>=0.0.6
 onnxruntime>=1.16
 mir_eval>=0.7

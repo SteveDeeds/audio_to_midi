@@ -16,7 +16,7 @@ OPTIONAL_PACKAGES = {
     "torchcrepe": "torchcrepe", "basic-pitch": "basic_pitch",
     "onnxruntime": "onnxruntime", "mir_eval": "mir_eval", "resampy": "resampy",
     "scikit-learn": "sklearn", "piano-transcription-inference": "piano_transcription_inference",
-    "adtof-pytorch": "adtof_pytorch", "demucs": "demucs",
+    "adtof-pytorch": "adtof_pytorch", "demucs": "demucs", "madmom": "madmom",
 }
 PIANO_HR_CHECKPOINT = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
 
@@ -51,7 +51,7 @@ def inspect_environment() -> dict:
         "notes": [
             "Optional neural models are not required to edit projects, import/export MIDI, or use pYIN.",
             "Basic Pitch 0.4.0 uses ONNX here; its mandatory TensorFlow package metadata can make pip check report TensorFlow missing.",
-            "Missing models (CREPE, Basic Pitch, Piano-HR, ADTOF, Demucs) are pip-installed into this Python and their weights downloaded the first time they are used.",
-            "ADTOF weights are non-commercial; review all checkpoint licenses before distribution.",
+            "Missing models (CREPE, MADMoM, Basic Pitch, Piano-HR, ADTOF, Demucs) are pip-installed into this Python and their weights downloaded the first time they are used.",
+            "ADTOF and MADMoM onset weights are non-commercial; review all checkpoint licenses before distribution.",
         ],
     }

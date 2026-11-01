@@ -212,6 +212,81 @@ class WorkflowTests(unittest.TestCase):
             result = backend.predict(self.track, F(0), F(4), lambda: False)
         self.assertNotIn(F(1), result.onsets)
 
+    def test_vocal_held_note_teaches_no_restrikes_without_marker_cleanup(self):
+        self.project.grid = Grid(120, 4, 4)
+        self.track.role = "vocals"
+        self.track.notes.author(F(0), F(2), 60)
+        for i in range(1, 8):
+            app.record_onset(self.track, F(i, 4), True)
+            self.track.notes.onsets.append(F(i, 4))
+        before = deepcopy(self.track)
+
+        class Mono:
+            def prepare(self, *args, **kwargs):
+                return True
+            def onset_times(self, *args):
+                return np.arange(0, 2, .125)
+            def pitch_changes(self, *args):
+                return [.25, .5, .75]
+            def block_pitch(self, a, b, *args):
+                return [60], b
+
+        backend = TrackBackend.create(self.track, self.project)
+        backend.provider = Mono()
+        def features(beat):
+            return (.8, .8, -15., .1) if beat in (F(0), F(2)) else (.01, .01, -15., 0.)
+        with patch.object(backend, "_candidate_features", side_effect=features), \
+                patch.object(backend, "_velocity", return_value=100):
+            result = backend.predict(self.track, F(0), F(4), lambda: False)
+        self.assertEqual(result.onsets, (F(0), F(2)))
+        self.assertEqual([(n.start, n.end) for n in result.notes], [(F(0), F(2)), (F(2), F(4))])
+        self.assertEqual(self.track, before, "Inference must not mutate saved edits or labels")
+
+    def test_vocal_note_labels_preserve_repeated_syllables_and_half_grid_releases(self):
+        self.project.grid = Grid(120, 4, 4)
+        self.track.role = "vocals"
+        self.track.notes.author(F(0), F(7, 8), 60)
+        self.track.notes.author(F(1), F(2), 60)
+        app.record_onset(self.track, F(1, 2), True)
+        app.record_onset(self.track, F(1), False)
+        app.record_onset(self.track, F(9, 4), True)
+        backend = TrackBackend.create(self.track, self.project)
+        labels = backend._onset_labels(self.track)
+        self.assertTrue(labels[F(0)])
+        self.assertTrue(labels[F(1)], "An authored rearticulation takes precedence")
+        self.assertTrue(labels[F(9, 4)], "Markers outside edited notes stay authoritative")
+        self.assertFalse(labels[F(1, 2)], "A stale positive inside a held note is rejected")
+        self.assertFalse(labels[F(3, 4)])
+        self.assertNotIn(F(7, 8), labels, "A release is not automatically a new onset")
+        self.assertNotIn(F(2), labels)
+        self.track.notes.undo()
+        self.assertNotIn(F(5, 4), backend._onset_labels(self.track))
+        self.track.notes.redo()
+        self.assertFalse(backend._onset_labels(self.track)[F(5, 4)])
+
+    def test_bass_authored_notes_do_not_change_onset_learning(self):
+        self.track.notes.author(F(0), F(2), 60)
+        app.record_onset(self.track, F(1), True)
+        backend = TrackBackend.create(self.track, self.project)
+        self.assertEqual(backend._onset_labels(self.track), {F(1): True})
+
+    def test_new_vocal_timing_invalidates_old_coverage_without_changing_bass_identity(self):
+        vocal = app.add_stem(self.project, self.wav, "vocals")
+        from audio_to_midi import application
+        original_dumps = application.json.dumps
+        def old_dumps(value, **kwargs):
+            return original_dumps(
+                {key: item for key, item in value.items() if key != "vocal_boundary_policy"},
+                **kwargs,
+            )
+        with patch.object(application.json, "dumps", side_effect=old_dumps):
+            old_vocal = app.identity(self.project, vocal)
+            old_bass = app.identity(self.project, self.track)
+        vocal.settings["coverage"] = [["0", "4"]]
+        vocal.settings["coverage_identity"] = old_vocal
+        self.assertFalse(app.complete(self.project, vocal))
+        self.assertEqual(app.identity(self.project, self.track), old_bass)
+
     def test_mono_velocity_follows_cqt_harmonic_energy(self):
         from audio_to_midi import velocity
 

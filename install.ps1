@@ -18,11 +18,13 @@ if (-not (Test-Path -LiteralPath $executable)) {
     & $Python -m venv $environmentPath
     if ($LASTEXITCODE -ne 0) { throw "Failed to create the Python environment." }
 }
-$manifest = "requirements.txt"
-if ($Models) { $manifest = "requirements-models.txt" }
-& $executable -m pip install -r (Join-Path $root $manifest)
+& $executable -m pip install -r (Join-Path $root "requirements.txt")
 if ($LASTEXITCODE -ne 0) { throw "Dependency installation failed." }
 if ($Models) {
+    & $executable -m pip install "setuptools>=75" "Cython>=3"
+    if ($LASTEXITCODE -ne 0) { throw "Neural model build prerequisites failed." }
+    & $executable -m pip install --no-build-isolation -r (Join-Path $root "requirements-models.txt")
+    if ($LASTEXITCODE -ne 0) { throw "Model installation failed; MADMoM requires git and MSVC C++ Build Tools on Windows." }
     & $executable -m pip install --no-deps basic-pitch==0.4.0
     if ($LASTEXITCODE -ne 0) { throw "Basic Pitch ONNX package installation failed." }
 }

@@ -13,6 +13,7 @@ from typing import Any
 from uuid import uuid4
 
 from .timebase import Grid, beat_value, finite_number
+from .vocal_settings import VOCAL_MODELS, VocalParameters
 
 
 SUPPORTED_ROLES = frozenset({"drums", "bass", "vocals", "piano", "guitar", "other"})
@@ -24,6 +25,7 @@ SUPPORTED_MODELS = frozenset({
     "vocals__pyin+key", "vocals__crepe_full+key",
     "piano__basic_pitch", "piano__piano_hr",
     "guitar__basic_pitch", "guitar__piano_hr",
+    *VOCAL_MODELS,
 })
 
 
@@ -363,6 +365,10 @@ class Track:
         self.notes.validate()
         if type(self.settings) is not dict or type(self.training) is not list:
             raise ValueError("settings must be a dict and training a list")
+        if "vocal_parameters" in self.settings:
+            VocalParameters.from_dict(self.settings["vocal_parameters"])
+        if "madmom_license_acknowledged" in self.settings and type(self.settings["madmom_license_acknowledged"]) is not bool:
+            raise ValueError("MADMoM license acknowledgement must be true or false")
         if any(type(example) is not dict for example in self.training):
             raise ValueError("training must contain dictionaries")
         _json_safe(self.settings)

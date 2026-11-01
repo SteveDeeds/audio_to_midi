@@ -96,6 +96,64 @@ class EditorTests(unittest.TestCase):
         self.assertNotIn(ident, self.window._references)
         self.assertIn("ValueError: invalid audio", self.window.status.text())
 
+    def use_neural_vocals(self):
+        self.track.role = "vocals"
+        self.track.model = "madmom_cnn"
+        self.track.settings["madmom_license_acknowledged"] = True
+        self.window._sync_tracks()
+
+    def test_neural_vocal_controls_are_compact_labeled_and_persisted(self):
+        self.use_neural_vocals()
+        self.window.show()
+        self.app.processEvents()
+        self.assertFalse(self.window.vocal_panel.isHidden())
+        self.assertEqual(len(self.window.vocal_controls), 5)
+        for control in self.window.vocal_controls.values():
+            self.assertTrue(control.isEnabled())
+            self.assertTrue(control.toolTip())
+        self.assertGreaterEqual(self.window.vocal_panel.x(),
+                                self.window.models.x() + self.window.models.width())
+        snapshot = token(self.window.project, self.track)
+        self.track.notes.generated = [Note("hidden", F(10), F(12), 60)]
+        self.window.vocal_controls["neural_threshold"].setValue(.55)
+        self.assertEqual(self.track.settings["vocal_parameters"]["neural_threshold"], .55)
+        self.assertNotEqual(snapshot, token(self.window.project, self.track))
+        self.assertEqual(self.track.notes.generated, [Note("hidden", F(10), F(12), 60)])
+        self.window.models.setCurrentText("pyin")
+        self.assertFalse(self.window.vocal_controls["neural_threshold"].isEnabled())
+
+    def test_neural_vocal_whole_track_analysis_is_disabled_and_rejected(self):
+        self.use_neural_vocals()
+        self.assertFalse(self.window.actions["analyze_all"].isEnabled())
+        self.assertFalse(self.window.actions["profile"].isEnabled())
+        with patch("audio_to_midi.provision.missing") as missing:
+            with self.assertRaisesRegex(ValueError, "visible"):
+                self.window._analyze(True)
+            missing.assert_not_called()
+
+    def test_neural_vocal_publication_checks_current_view_even_if_token_is_current(self):
+        self.use_neural_vocals()
+        snapshot = token(self.window.project, self.track)
+        result = Prediction(F(0), F(4), (Note("g", F(0), F(4), 60),), (F(0),))
+        self.window._set_window(F(8))
+        self.window._publish((snapshot, result))
+        self.assertEqual(self.track.notes.generated, [])
+        self.assertEqual(self.track.notes.onsets, [])
+        self.assertIn("visible", self.window.status.text())
+
+    def test_neural_vocal_analysis_requests_only_current_displayed_bars(self):
+        self.use_neural_vocals()
+        sf.write(self.wav, np.zeros(64000), 8000)
+        self.track.duration = 8
+        self.window._set_window(F(4))
+        result = Prediction(F(4), F(12), (Note("g", F(4), F(8), 60),), (F(4),))
+        with patch.object(self.window.service, "predict", return_value=result) as predict, \
+                patch("audio_to_midi.provision.missing", return_value=[]):
+            self.window._analyze(False)
+            self.wait_idle()
+        self.assertEqual(predict.call_args.args[2:4], (F(4), F(12)))
+        self.assertEqual(self.track.notes.generated, list(result.notes))
+
     def test_undo_does_not_restore_obsolete_generated_publication(self):
         self.window._add_note(F(0), 60)
         result = Prediction(F(0), F(4), (Note("new", F(1), F(2), 67),), ())

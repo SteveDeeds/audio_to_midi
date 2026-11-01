@@ -39,6 +39,12 @@ first time; the status bar shows progress, and **Cancel** stops it. ADTOF needs
 `git` on PATH. ADTOF drum weights are non-commercial; review the piano-HR
 checkpoint terms before relying on it.
 
+The optional `madmom_cnn` and `madmom_brnn` vocal models also install on first
+use. Their onset weights are **CC BY-NC-SA 4.0 (non-commercial)**; the app asks
+for a separate acknowledgement even if CREPE is already installed. A fresh
+madmom build needs `git`, Cython/setuptools (installed by the app), and a C++
+compiler; on Windows use Microsoft C++ Build Tools.
+
 To install all the transcription models ahead of time instead (for example
 before going offline):
 
@@ -228,12 +234,52 @@ on, its length and velocity.
 Velocity comes from how loud the note is in its stem: the power at the note's
 pitch and its first harmonics over the note's first 200 ms, compared with the
 loudest notes of the whole stem (General MIDI curve, so 12 dB quieter is about
-half the velocity). This applies to bass, vocals and Basic Pitch; the piano_hr
+half the velocity). This applies to bass, legacy vocals and Basic Pitch; the piano_hr
 model predicts piano key velocities itself. Drum velocity is the RMS level at
 each hit in that kit piece's band (kick 30-150 Hz, snare 150 Hz-5 kHz, toms
 60-600 Hz, hi-hat 6-16 kHz, cymbals 4-16 kHz), so a kick and a hi-hat on the
 same beat are measured separately; each piece is scaled to its own loudest
 hits. Notes you draw start at 100.
+
+### Syllable-aware vocals
+
+On a **vocals** track, choose **madmom_cnn** or **madmom_brnn**. These combine
+the reviewed neural onset models with CREPE full pitch. Existing `pyin` and
+CREPE choices are unchanged. Five compact controls sit immediately right of
+the model selector; hover over a label or value for its description. They are
+enabled for the two new models and saved per track:
+
+| Control | Starting value | Useful tuning range | Effect |
+|---|---|---|---|
+| Onset | 0.30 | 0.20-0.60 | Lower finds weaker syllable attacks. |
+| Voice | -35 dB | -45 to -25 dB | Reject quiet regions relative to this visible crop. |
+| Spacing | 0.12 s | 0.10-0.16 s | Suppress closely spaced attack duplicates. |
+| Slur hold | 0.09 s | 0.06-0.12 s | Require pitch changes to persist; lower accepts shorter slur notes. |
+| Min split | 0.08 s | 0.05-0.10 s | Minimum proposed split interval before articulation shortening. |
+
+Separate syllables, including repeats of the same pitch, leave **half the
+selected grid cell** between notes. Pitch changes within one syllable have
+**exactly touching** note ends/starts, with continuous built-in synth playback.
+For example, Grid **1/4** is a quarter-note cell, so its articulation gap is
+an eighth note. These are musical-time gaps that follow tempo pins, not fixed
+millisecond silences. Natural phrase rests can be longer. A coarse grid merges
+nearby proposals; use a finer grid if syllables or slur notes disappear.
+
+These models analyze and replace notes/onset markers **only in the displayed
+bars**. Moving or zooming the view cancels pending work and prevents an old
+window's result being published. Changing controls reuses that crop's neural
+evidence, without updating hidden notes. Existing notes that cross a window
+edge keep their outside fragments; those protected edges are not rewritten to
+force an articulation gap. Whole-track analysis is disabled for these models.
+Review successive windows to build coverage; export can explicitly export
+partial coverage but never silently transcribes the rest.
+
+The project key gently corrects an out-of-key pitch by at most one semitone.
+Velocity uses the visible crop's RMS energy rather than whole-stem harmonic
+power. Direct onset additions/removals and corrected held notes still guide
+boundaries, and authored notes remain protected. Legacy learned onset-feature
+profiles are retained for legacy models, but are not used/imported by these
+two neural models; their Onset control sets acceptance instead.
 
 There are two tools, with buttons next to **Grid** (or **View** menu):
 
@@ -277,6 +323,22 @@ track.
 
 Your corrections teach lightweight onset logic for the project; they do not
 retrain the large pitch models.
+
+For **legacy vocals**, corrected note starts teach where attacks belong, and the
+interior of each corrected note teaches where there must not be another
+attack. You can lengthen a sustained note without removing all its old onset
+markers: the note takes precedence over stale markers inside it when the
+region is transcribed again. Separate corrected notes on the same pitch still
+teach separate syllables. Note ends are not automatically treated as attacks,
+and untouched regions are not assumed to be correct or silent.
+
+This evidence is derived from the current edits, so undo/redo also changes
+what the vocal onset model learns. With held-note corrections, vocal onset
+acceptance uses a more sensitive threshold (0.25 rather than 0.5) to avoid
+losing quieter syllables as the negative examples accumulate. Pitch-change
+evidence is retained outside corrected held notes. Other instruments keep
+their existing onset policy. Older saved vocal analysis is refreshed with
+this policy; corrected notes remain protected.
 
 ## 6. Chords
 
