@@ -20,7 +20,7 @@ from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from audio_to_midi import beats as beat_logic
@@ -103,6 +103,22 @@ class Job(QThread):
         except Exception as exc:
             # Thread boundary: every failure is presented by the shell.
             self.error.emit(f"{type(exc).__name__}: {exc}")
+
+
+class StatusLabel(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setFixedHeight(self.fontMetrics().height())
+
+    def setText(self, text: str) -> None:
+        super().setText(" ".join(text.split()))
+        self.setToolTip(text)
+
+    def clear(self) -> None:
+        self.setText("")
 
 
 class ProjectWindow(QMainWindow):
@@ -231,6 +247,8 @@ class ProjectWindow(QMainWindow):
             [QKeySequence("Left"), QKeySequence("PgUp")])
         self._act(view, "next", "&Next bars", lambda: self._navigate(1), "Right").setShortcuts(
             [QKeySequence("Right"), QKeySequence("PgDown")])
+        self._act(view, "octave_up", "Pitch view: octave up", lambda: self.timeline.shift_pitch(12), "Up")
+        self._act(view, "octave_down", "Pitch view: octave down", lambda: self.timeline.shift_pitch(-12), "Down")
         self._act(view, "zoom_in", "Zoom &in", lambda: self._zoom(-1), "Ctrl+=")
         self._act(view, "zoom_out", "Zoom &out", lambda: self._zoom(1), "Ctrl+-")
         view.addSeparator()
@@ -417,8 +435,7 @@ class ProjectWindow(QMainWindow):
         self.pages.addWidget(self.chord_view)
         root.addWidget(self.pages, 1)
 
-        self.status = QLabel()
-        self.status.setWordWrap(True)
+        self.status = StatusLabel()
         self.statusBar().addWidget(self.status, 1)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self._cancel)
@@ -559,6 +576,10 @@ class ProjectWindow(QMainWindow):
             ),
             "cancel": (busy, "Nothing is running."),
             "key_chroma": (has_mix, "Import a mix first."),
+            "octave_up": (self.view != CHORDS and not self.timeline.drums,
+                          "Pitch scrolling is unavailable in chords and drum lanes."),
+            "octave_down": (self.view != CHORDS and not self.timeline.drums,
+                            "Pitch scrolling is unavailable in chords and drum lanes."),
         }
         for name, (ok, why) in rules.items():
             action = self.actions[name]
@@ -910,8 +931,8 @@ class ProjectWindow(QMainWindow):
 
     # -- background jobs ---------------------------------------------------
     def _show_job_status(self, text: str) -> None:
-        self._job_status = text
         self.status.setText(text)
+        self._job_status = self.status.text()
 
     def _run(self, operation, callback, kind: str = "analysis", message: str = "", reports: bool = False) -> None:
         """``reports`` operations take (cancelled, report) and stream status lines."""

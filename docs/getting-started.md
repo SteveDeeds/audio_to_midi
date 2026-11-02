@@ -213,12 +213,16 @@ are analyzed automatically. **Model > Analyze visible bars** and
 button in the status bar) stops it.
 Background activity messages clear when the task finishes or stops after cancellation.
 Errors and result summaries remain visible.
+Status messages stay on one line without resizing the piano roll; hover over
+the status text to read the full message, including any original line breaks.
 
 **Navigate** with **Previous** / **Next** (Left / Right arrow, or PgUp / PgDn);
 each step scrolls half a screen. The label between them
 shows the visible bars. **Zoom out (-)** / **Zoom in (+)** next to them (also
 Ctrl + mouse wheel, View > Zoom, Ctrl+- / Ctrl+=) show 1, 2, 4, 8 or 16 bars per
-screen; the readout beside the buttons shows the current setting. The plain mouse wheel scrolls pitch; **Ctrl + Shift + wheel**
+screen; the readout beside the buttons shows the current setting. **Up / Down arrows**
+shift the piano-roll view up / down one octave without transposing notes, stopping
+at MIDI pitches 0 and 127. The plain mouse wheel scrolls pitch; **Ctrl + Shift + wheel**
 zooms pitch (not in the drums view). **Grid** sets the editing step (1/4 to 1/32, including
 triplets).
 
@@ -301,6 +305,12 @@ between grid lines, with a minimum length of half a grid cell. Extend a note
 to the next note's start for connected (legato) playback, or leave a half-grid
 gap for a separate articulation. Clicking an empty cell still adds a
 one-beat note.
+
+Onset markers follow the resolved note starts: simultaneous notes share one
+marker, and a marker disappears when its last note is removed or moved.
+Detected candidates with no note are not shown as onsets. Clicking the onset
+lane still teaches an attack boundary for reanalysis, but it only shows a
+marker once a note actually starts there.
 
 - **Info (I)**: click a note to open a small editor with its bar, beat, length
   in beats, pitch and velocity, plus **Delete note**. Beats accept `2 1/2`,

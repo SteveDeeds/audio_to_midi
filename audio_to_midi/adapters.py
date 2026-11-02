@@ -247,8 +247,8 @@ class TrackBackend:
             raise ValueError("Requested interval has no audio.")
         if self.role == "vocals" and self.model in VOCAL_MODELS:
             parameters = VocalParameters.from_dict(track.settings.get("vocal_parameters", {}))
-            notes, onsets = provider.transcribe(track.id, grid, start, end, parameters,
-                                                self._onset_labels(track), cancelled)
+            notes, _ = provider.transcribe(track.id, grid, start, end, parameters,
+                                          self._onset_labels(track), cancelled)
             # This provider is monophonic: authored vocal notes exclude generated
             # alternatives of any pitch, not only the same-pitch overlay.
             blockers = [(max(start, n.start), min(end, n.end), None)
@@ -257,7 +257,7 @@ class TrackBackend:
                 notes = NoteStore(generated=notes, rejections=blockers).resolved()
             if cancelled():
                 raise Cancelled()
-            return Prediction(start, end, tuple(notes), tuple(onsets))
+            return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
         audio_start = min(end, max(start, grid.snap(grid.seconds_to_beat(t0))))
         if self.role == "drums":
             provider.prepare()
@@ -392,7 +392,7 @@ class TrackBackend:
                             if previous:
                                 candidate = Note(previous.id, a, stop, candidate.pitch, previous.velocity, "generated")
                         notes.append(candidate)
-        return Prediction(start, end, tuple(notes), tuple(b for b in sorted(active) if start <= b < end))
+        return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
 
     def _note(self, start: Fraction, end: Fraction, pitch: int, velocity: int) -> Note:
         return Note(

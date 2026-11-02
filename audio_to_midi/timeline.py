@@ -104,6 +104,18 @@ class Timeline(QWidget):
     def set_role(self, role: str | None) -> None:
         self.low, self.high = PITCH_RANGES.get(role, (36, 96))
 
+    def shift_pitch(self, semitones: int) -> None:
+        if self.drums:
+            return
+        offset = max(-self.low, min(127 - self.high, semitones))
+        self.low += offset
+        self.high += offset
+        self.update()
+
+    @property
+    def onsets(self) -> list[Fraction]:
+        return sorted({note.start for note in self.notes})
+
     def set_cqt(self, rgb: np.ndarray | None) -> None:
         if rgb is None or rgb.size == 0:
             self.cqt, self._cqt_buffer = None, None
@@ -261,7 +273,7 @@ class Timeline(QWidget):
         if self.mode == "mix":
             self._paint_beats(painter, bottom)
         elif self.track is not None:
-            for beat in self.track.notes.onsets:
+            for beat in self.onsets:
                 if self.start <= beat <= self.end:
                     x = round(self._x(beat))
                     painter.setPen(QPen(QColor("#f7b554"), 2))
@@ -486,7 +498,6 @@ class Timeline(QWidget):
             self.low = max(0, min(127 - 2 * half, middle - half))
             self.high = self.low + 2 * half
         else:
-            offset = max(-self.low, min(127 - self.high, 3 * steps))
-            self.low += offset
-            self.high += offset
+            self.shift_pitch(3 * steps)
+            return
         self.update()

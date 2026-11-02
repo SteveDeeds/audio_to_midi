@@ -193,6 +193,35 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([n.start for n in prediction.notes], [F(0), F(1), F(2)])
         self.assertEqual([n.end for n in prediction.notes], [F(1), F(2), F(4)])
 
+    def test_silent_onset_candidates_are_not_published_as_onsets(self):
+        class Mono:
+            def prepare(self, *args, **kwargs):
+                return True
+            def onset_times(self, *args):
+                return np.array([0, .5, 1])
+            def pitch_changes(self, *args):
+                return []
+            def block_pitch(self, a, b, *args):
+                return None if a == .5 else ([60], b)
+
+        backend = TrackBackend.create(self.track, self.project)
+        backend.provider = Mono()
+        prediction = backend.predict(self.track, F(0), F(4), lambda: False)
+        self.assertEqual(prediction.onsets, (F(0), F(2)))
+        self.track.notes.reject(F(2), F(4), 60)
+        prediction = Prediction(prediction.start, prediction.end, prediction.notes,
+                                (F(0), F(1), F(2), F(3)))
+        self.assertTrue(app.publish(self.project, app.token(self.project, self.track), prediction))
+        self.assertEqual(self.track.notes.onsets, [F(0)])
+
+    def test_publication_does_not_add_onset_for_continuing_note_at_window_edge(self):
+        self.track.notes.generated = [Note("held", F(0), F(2), 60)]
+        self.track.notes.onsets = [F(0)]
+        prediction = Prediction(F(2), F(4), (Note("held", F(2), F(4), 60),), (F(2),))
+        self.assertTrue(app.publish(self.project, app.token(self.project, self.track), prediction))
+        self.assertEqual(self.track.notes.resolved(), [Note("held", F(0), F(4), 60)])
+        self.assertEqual(self.track.notes.onsets, [F(0)])
+
     def test_stable_mono_changes_split_bass_but_deleted_onsets_stay_deleted(self):
         class Mono:
             def prepare(self, *args, **kwargs):

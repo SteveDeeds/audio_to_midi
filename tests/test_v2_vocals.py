@@ -221,7 +221,7 @@ def test_main_publication_never_changes_offscreen_fragments_or_onsets(project_tr
                  for n in track.notes.resolved() if n.start < b and a < n.end]
         assert before.onsets == [F(0), F(2), F(12), F(14)]
         assert prior == after
-    assert track.notes.onsets == [F(0), F(2), F(4), F(8), F(12), F(14)]
+    assert track.notes.onsets == [F(0), F(2), F(4), F(12), F(14)]
 
 
 def test_control_change_invalidates_pending_result_but_not_hidden_notes(project_track):
