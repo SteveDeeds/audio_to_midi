@@ -275,7 +275,7 @@ class NoteStore:
         before = self._snapshot()
         self.onsets = [b for b in self.onsets if b != beat]
         self.authored = [n for n in self.authored if n.start != beat]
-        next_event = min([b for b in self.onsets if beat < b < window_end] + [window_end])
+        next_event = min([n.start for n in notes if beat < n.start < window_end] + [window_end])
         affected_end = window_end
         for note in removed:
             next_pitch = min([n.start for n in notes

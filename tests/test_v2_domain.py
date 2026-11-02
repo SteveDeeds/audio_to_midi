@@ -266,6 +266,13 @@ class NoteTests(unittest.TestCase):
         store.replace_generated(F(0), F(4), [note("a", 0, 1), note("b", 1, 2)])
         self.assertEqual(spans(store), [(F(0), F(7, 2), 60)])
 
+    def test_delete_onset_ignores_orphan_markers_when_extending_previous(self):
+        store = NoteStore(generated=[
+            note("first", 0, 1), note("delete", 1, 2), note("next", 3, 4),
+        ], onsets=[F(0), F(1), F(2)])
+        store.delete_onset(F(1), F(5))
+        self.assertEqual(spans(store), [(F(0), F(3), 60), (F(3), F(4), 60)])
+
     def test_delete_without_previous_does_not_invent_note(self):
         store = NoteStore(generated=[note("a", 1, 2)])
         store.delete_onset(F(1), F(4))

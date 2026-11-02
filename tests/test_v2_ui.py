@@ -190,6 +190,47 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(self.window.status.text(), "")
         self.assertTrue(self.window.cancel_button.isHidden())
 
+    def test_status_stays_one_line_without_resizing_the_roll(self):
+        from PySide6.QtCore import Qt
+
+        window = self.window
+        window.show()
+        self.wait_idle()
+        self.app.processEvents()
+        geometry = window.timeline.geometry()
+        status_height = window.statusBar().height()
+        window_size = window.size()
+        for message in (
+            "First line\rSecond line\nThird line\r\nFourth line",
+            "Progress:\u2028next batch\u2029finished",
+            "<b>Error</b><br>Details",
+            "A very long status message " * 100,
+            "",
+        ):
+            with self.subTest(message=message[:40]):
+                window.status.setText(message)
+                self.app.processEvents()
+                self.assertEqual(window.status.text(), " ".join(message.split()))
+                self.assertEqual(window.status.toolTip(), message)
+                self.assertEqual(window.status.textFormat(), Qt.TextFormat.PlainText)
+                self.assertFalse(window.status.wordWrap())
+                self.assertEqual(window.timeline.geometry(), geometry)
+                self.assertEqual(window.statusBar().height(), status_height)
+                self.assertEqual(window.size(), window_size)
+        window.status.setText("Details\nhere")
+        window.status.clear()
+        self.assertEqual(window.status.text(), "")
+        self.assertEqual(window.status.toolTip(), "")
+
+    def test_multiline_reported_activity_clears_when_finished(self):
+        def work(cancel, report):
+            report("Processing\r\nbatch 1\nof 2")
+
+        self.window._run(work, lambda value: None, message="Analyzing:\n", reports=True)
+        self.wait_idle()
+        self.assertEqual(self.window.status.text(), "")
+        self.assertEqual(self.window.status.toolTip(), "")
+
     def test_reported_activity_status_clears_when_finished(self):
         def work(cancel, report):
             report("Processing batch 1")
@@ -268,6 +309,64 @@ class EditorTests(unittest.TestCase):
         QTest.keyClick(window.timeline, Qt.Key.Key_PageUp)
         QTest.keyClick(window.timeline, Qt.Key.Key_Left)
         self.assertEqual(window.timeline.start, F(0))
+
+    def test_up_down_arrows_scroll_an_octave_without_editing_notes(self):
+        from PySide6.QtCore import Qt
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        self.track.notes.author(F(0), F(1), 60)
+        window._refresh()
+        before = self.track.notes.resolved()
+        span = (window.timeline.start, window.timeline.end)
+        low, high = window.timeline.low, window.timeline.high
+        window.show()
+        window.activateWindow()
+        window.timeline.setFocus()
+        self.app.processEvents()
+        QTest.keyClick(window.timeline, Qt.Key.Key_Up)
+        self.assertEqual((window.timeline.low, window.timeline.high), (low + 12, high + 12))
+        window._refresh()
+        QTest.keyClick(window.timeline, Qt.Key.Key_Down)
+        self.assertEqual((window.timeline.low, window.timeline.high), (low, high))
+        self.assertEqual(self.track.notes.resolved(), before)
+        self.assertEqual((window.timeline.start, window.timeline.end), span)
+
+        window.timeline.low, window.timeline.high = 80, 120
+        QTest.keyClick(window.timeline, Qt.Key.Key_Up)
+        self.assertEqual((window.timeline.low, window.timeline.high), (87, 127))
+        window.timeline.low, window.timeline.high = 5, 45
+        QTest.keyClick(window.timeline, Qt.Key.Key_Down)
+        self.assertEqual((window.timeline.low, window.timeline.high), (0, 40))
+
+        self.track.role = "drums"
+        self.track.model = "adtof"
+        window._sync_tracks()
+        drum_range = (window.timeline.low, window.timeline.high)
+        QTest.keyClick(window.timeline, Qt.Key.Key_Up)
+        QTest.keyClick(window.timeline, Qt.Key.Key_Down)
+        self.assertEqual((window.timeline.low, window.timeline.high), drum_range)
+
+    def test_onset_markers_follow_resolved_notes_and_undo(self):
+        self.track.notes.generated = [
+            Note("a", F(0), F(1), 60), Note("b", F(1), F(2), 62),
+            Note("voice", F(1), F(3), 67),
+        ]
+        self.track.notes.onsets = [F(0), F(1), F(3)]
+        self.window._refresh()
+        self.assertEqual(self.window.timeline.onsets, [F(0), F(1)])
+        self.window._checkpoint()
+        self.track.notes.reject(F(1), F(2), 62)
+        self.window._edited()
+        self.assertEqual(self.window.timeline.onsets, [F(0), F(1)])
+        self.window._checkpoint()
+        self.track.notes.reject(F(1), F(3), 67)
+        self.window._edited()
+        self.assertEqual(self.window.timeline.onsets, [F(0)])
+        self.window._undo()
+        self.assertEqual(self.window.timeline.onsets, [F(0), F(1)])
+        self.window._redo()
+        self.assertEqual(self.window.timeline.onsets, [F(0)])
 
     def test_save_reopen_preserves_edit_state(self):
         self.window.folder = self.root / "project"

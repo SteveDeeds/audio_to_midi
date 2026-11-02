@@ -126,7 +126,7 @@ def publish(project: Project, result_token: ResultToken, prediction: Prediction)
     track.notes.replace_generated(prediction.start, prediction.end, list(prediction.notes))
     track.notes.onsets = sorted(
         {b for b in track.notes.onsets if not prediction.start <= b < prediction.end}
-        | set(prediction.onsets)
+        | {n.start for n in track.notes.resolved() if prediction.start <= n.start < prediction.end}
     )
     coverage = track.settings.get("coverage", []) if (
         track.settings.get("coverage_identity") == result_token.identity
