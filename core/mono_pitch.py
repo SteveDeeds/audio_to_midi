@@ -20,6 +20,13 @@ from core.analysis import detect_key_from_chroma
 from core.chord_analysis import key_to_scale_pcs
 
 
+def pitch_agreement(contour: np.ndarray, midi: int) -> float:
+    """Voiced-frame agreement with a proposed pitch, not a calibrated probability."""
+    if not len(contour):
+        raise ValueError("Cannot score a note without pitch evidence.")
+    return float(np.mean(np.isfinite(contour) & (np.abs(contour - midi) <= 0.5)))
+
+
 def clean_key_contour(
     quantized: np.ndarray, raw: np.ndarray, allowed: np.ndarray, hop: float,
 ) -> np.ndarray:

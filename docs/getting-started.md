@@ -149,6 +149,17 @@ app which beats are downbeats, and it counts every other beat from them.
 - Exported MIDI carries the tempo map as tempo changes, so it lines up with
   the original recording in a DAW.
 
+You can also count bars while listening to **any stem** (drums, bass, vocals,
+or another part). Choose that track and **Info (I)** to see the same colored
+beat markers over its audio and notes. Right-click in the waveform,
+spectrogram, or note lanes for the timing menu. A pin uses **exactly where you
+right-clicked**, not the nearest detected beat or the note's start; click the
+attack you hear or see. If there is no beat there, choosing a downbeat adds
+and pins one. Pins are shared by all tracks and the Mix view, not per-stem.
+Left-click a beat in the upper lane to select it for **D** / **U**.
+Near a beat marker, *Unpin nearby beat* and *Remove nearby beat* let you
+manage that marker; downbeat pinning still uses the exact click position.
+
 **Tap downbeats instead.** Check **Edit > Tap downbeats**. The mix plays from
 the current window, and you press **Space** on the "one" of every bar. Your
 taps appear as markers on the initial keypress; holding Space does not add
@@ -207,6 +218,30 @@ Choose a stem in **Track** and its **Model** next to it:
 | Piano / guitar | `basic_pitch`, `piano_hr` |
 | Drums | `adtof` |
 
+### Choosing how many AI notes to keep
+
+Each instrument track has an **AI notes: None -- All** slider. At the far left,
+all AI-generated notes are hidden so you can start from scratch; move slightly
+right to keep only notes with the strongest detection evidence. At the far
+right, all notes returned by the detector are included, even low-confidence
+ones. Manual edits and imported MIDI remain visible at every position.
+
+The filter applies to the whole track, playback, MIDI, and MusicXML export.
+It does not delete predictions, train the model, or rerun detection. Moving it
+back restores filtered notes, except notes you explicitly deleted. The position
+is saved per track and supports Undo/Redo.
+
+Evidence scores are model-specific, not calibrated probabilities: Basic Pitch
+uses its note activation, Piano-HR uses pitch-frame activation (not key velocity),
+drums use hit strength, and monophonic models use pitch-frame agreement.
+Older saved detections have unknown scores and appear only at **All**; analyze
+again to obtain scores. **All** includes the detector's returned candidates,
+not notes excluded by its internal decoder thresholds or pitch range.
+New saves use project schema 4; schema 3 projects still open, but older app
+versions cannot read new saves.
+
+### Running detection
+
 With **Model > Reanalyze after edits** checked (the default), the visible bars
 are analyzed automatically. **Model > Analyze visible bars** and
 **Analyze whole track** run it on demand; **Cancel analysis** (Esc, or the
@@ -234,6 +269,13 @@ measured). The chords view's pitch-class strip is scaled to the whole song the
 same way, on a 40 dB log scale so weaker chord tones still show. Blue notes are model proposals; green ones
 are yours. **Hover over a note** to see its name, the bar and beat it starts
 on, its length and velocity.
+
+**Left-click a blue note with the Brush tool to confirm it.** It turns green,
+keeping its pitch, timing, and velocity, and stays visible even with **AI notes**
+set to **None**. Confirmation is saved and supports Undo/Redo; clicking a green
+note just selects it. A click on the release edge also confirms; dragging the
+edge still resizes. The Info tool continues to open the note dialog without
+confirming merely by opening it.
 
 Velocity comes from how loud the note is in its stem: the power at the note's
 pitch and its first harmonics over the note's first 200 ms, compared with the
@@ -315,9 +357,14 @@ marker once a note actually starts there.
 - **Info (I)**: click a note to open a small editor with its bar, beat, length
   in beats, pitch and velocity, plus **Delete note**. Beats accept `2 1/2`,
   `5/2` or `2.5`; pitches accept `Eb4` or `63`. Clicking empty space does
-  nothing, so you can inspect notes without adding any. Right-click still
-  deletes. Starts must fit the selected grid; note ends can use half-grid
-  intervals, just like dragging.
+  nothing, so you can inspect notes without adding any. **Right-click** opens
+  a context menu instead of immediately deleting: on a note it includes
+  **Note details...** and **Delete note**, plus shared beat/downbeat controls
+  at the exact clicked audio position. Empty space offers the timing controls
+  too. Detect beats first to enable timing actions. The upper lane shows
+  counted beats and pins alongside note onsets without editing onset boundaries;
+  switch to **Brush (B)** to add or remove onsets. Starts must fit the selected
+  grid; note ends can use half-grid intervals, just like dragging.
 
 **Drums** have their own view: the spectrogram fills the top half, and below it
 are ADTOF's five lanes - Cymbal, Hi-hat, Tom, Snare and Kick - instead of piano
@@ -459,6 +506,15 @@ The setting is remembered.
   between the first and last timing anchors (or the set BPM without a timing
   map). No later tempo changes are exported, even for playback. MIDI retains
   the original tempo map to stay aligned with the audio.
+  Score export asks for **Quantization**, defaulting to **1/16** notes independently
+  of the editor grid. Triplets are only used when explicitly selected (available
+  in meters with quarter-note notation beats). Gaps shorter than the selected
+  quantization are omitted as ordinary articulation, without a slur. Originally
+  touching notes receive a slur; rests at least one quantization step long remain.
+  These changes affect only the exported score, not project notes or MIDI.
+  For command-line score export, use `--quantization` in quarter-note units:
+  `1/4` means sixteenths (default), `1/8` means thirty-seconds, and `1/6`
+  means sixteenth triplets.
 
 ## Troubleshooting
 

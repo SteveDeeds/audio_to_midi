@@ -10,7 +10,8 @@ def transcriber_with_notes(stem, tracker, notes, duration=4.0):
     """Cache `notes` (onset, end, midi, velocity[, struck]) as one analysed batch."""
     transcriber = PolyTranscriber(np.zeros(int(100 * duration), dtype=np.float32), 100)
     transcriber._chunks[(stem, tracker, (0.0, duration))] = [
-        PolyNote(n[0], n[1], n[2], n[3], n[4] if len(n) > 4 else True) for n in notes
+        PolyNote(n[0], n[1], n[2], n[3], n[4] if len(n) > 4 else True,
+                 n[5] if len(n) > 5 else None) for n in notes
     ]
     transcriber._rebuild(stem, tracker)
     return transcriber
@@ -22,6 +23,14 @@ CHORDS = [
 ]
 
 class TestBlockNotes(unittest.TestCase):
+    def test_confidence_survives_held_blocks_independently_of_velocity(self):
+        transcriber = transcriber_with_notes("piano", "piano_hr", [
+            (0, 2, 60, .2, True, .99), (0, 2, 64, .9, True, .3),
+        ])
+        for a, b in ((0, 1), (1, 2)):
+            notes = transcriber.block_notes(a, b, "piano", "piano_hr", .125)
+            self.assertEqual({n.midi: n.confidence for n in notes}, {60: .99, 64: .3})
+
     def test_struck_and_held_pitches_per_block(self):
         transcriber = transcriber_with_notes("piano", "basic_pitch", CHORDS)
         first = transcriber.block_notes(0.0, 1.0, "piano", "basic_pitch", 0.125)
@@ -54,8 +63,8 @@ class TestPolyBatches(unittest.TestCase):
 
         def fake(y, sr, stem, tracker):
             start = calls[-1] if calls else 0.0
-            return [(t - start, 9.0 - start, 60, 0.8) for t in (1.0, 3.5) if start <= t < start + len(y) / sr] + (
-                [(0.0, 9.0 - start, 60, 0.8)] if start > 1.0 else []
+            return [(t - start, 9.0 - start, 60, 0.8, .9) for t in (1.0, 3.5) if start <= t < start + len(y) / sr] + (
+                [(0.0, 9.0 - start, 60, 0.8, .9)] if start > 1.0 else []
             )
 
         calls = []

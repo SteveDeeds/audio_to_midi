@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 import hashlib
@@ -126,7 +126,8 @@ def publish(project: Project, result_token: ResultToken, prediction: Prediction)
     track.notes.replace_generated(prediction.start, prediction.end, list(prediction.notes))
     track.notes.onsets = sorted(
         {b for b in track.notes.onsets if not prediction.start <= b < prediction.end}
-        | {n.start for n in track.notes.resolved() if prediction.start <= n.start < prediction.end}
+        | {n.start for n in replace(track.notes, detection_level=100).resolved()
+           if prediction.start <= n.start < prediction.end}
     )
     coverage = track.settings.get("coverage", []) if (
         track.settings.get("coverage_identity") == result_token.identity

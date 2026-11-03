@@ -46,6 +46,14 @@ def parser() -> argparse.ArgumentParser:
     export.add_argument("folder", type=Path)
     export.add_argument("output", type=Path)
     export.add_argument("--allow-partial", action="store_true")
+    from audio_to_midi.musicxml import QUANTIZATIONS
+
+    export.add_argument(
+        "--quantization", type=Fraction, default=Fraction(1, 4),
+        choices=[step for _, step in QUANTIZATIONS],
+        help="MusicXML only, in quarter-note units: 1/4 = sixteenths (default), "
+             "1/3 = eighth triplets, 1/6 = sixteenth triplets",
+    )
     export.add_argument("--role", choices=["bass", "vocals", "piano", "guitar", "drums", "chords"], help="Export one stem or just the chord track; default is every track plus chords. "
                         "Output .mid is MIDI; .musicxml/.xml/.mxl is a MuseScore-ready score")
     separate = commands.add_parser(
@@ -199,7 +207,10 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"Unprocessed or stale tracks: {', '.join(incomplete)}. Transcribe or use --allow-partial.")
             if args.output.suffix.lower() in (".musicxml", ".xml", ".mxl"):
                 from audio_to_midi.midi import export_musicxml
-                export_musicxml(project, args.output, selected, include_chords=args.role in (None, "chords"))
+                export_musicxml(
+                    project, args.output, selected, include_chords=args.role in (None, "chords"),
+                    quantization=args.quantization,
+                )
                 print(f"{'PARTIAL' if incomplete else 'Complete'} MusicXML: {args.output}")
                 return 0
             export_midi(project, args.output, selected, include_chords=args.role in (None, "chords"))

@@ -101,6 +101,55 @@ class GridTests(unittest.TestCase):
 
 
 class NoteTests(unittest.TestCase):
+    def test_confidence_filter_endpoints_thresholds_and_authored_notes(self):
+        generated = [
+            Note("high", F(0), F(4), 60, confidence=.995),
+            Note("medium", F(0), F(4), 64, confidence=.7),
+            Note("low", F(0), F(4), 67, confidence=0),
+            note("unknown", pitch=69),
+        ]
+        store = NoteStore(generated=generated)
+        store.author(F(0), F(1), 72)
+        authored = store.authored[0]
+        for level, expected in ((0, []), (1, ["high"]), (30, ["high", "medium"]),
+                                (100, ["high", "medium", "low", "unknown"])):
+            store.detection_level = level
+            self.assertEqual([n.id for n in store.resolved() if n.source == "generated"], expected)
+            self.assertIn(authored, store.resolved())
+        self.assertEqual(store.generated, generated)
+
+    def test_filtered_restrike_does_not_shorten_a_confident_held_note(self):
+        store = NoteStore(generated=[
+            Note("held", F(0), F(4), 60, confidence=.99),
+            Note("spurious", F(1), F(2), 60, confidence=.2),
+        ], detection_level=10)
+        self.assertEqual(spans(store), [(F(0), F(4), 60)])
+        store.detection_level = 100
+        self.assertEqual(spans(store), [(F(0), F(1), 60), (F(1), F(2), 60)])
+
+    def test_confidence_filter_is_monotonic_and_preserves_explicit_deletions(self):
+        store = NoteStore(generated=[
+            Note(str(i), F(0), F(4), 60 + i, confidence=score)
+            for i, score in enumerate((0, .01, .2, .5, .7, .99, 1))
+        ])
+        store.reject(F(0), F(4), 63)
+        previous = set()
+        for level in range(101):
+            store.detection_level = level
+            current = {n.id for n in store.resolved()}
+            self.assertLessEqual(previous, current)
+            self.assertNotIn("3", current)
+            previous = current
+        self.assertEqual(len(store.generated), 7)
+
+    def test_invalid_confidence_and_detection_level(self):
+        for value in (-.1, 1.1, float("nan"), float("inf"), True, "1"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                Note("bad", F(0), F(1), 60, confidence=value)
+        for value in (-1, 101, True, .5):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                NoteStore(detection_level=value)
+
     def test_note_bounds_identity_and_frozen(self):
         value = note()
         with self.assertRaises(FrozenInstanceError):
@@ -381,6 +430,28 @@ class StorageTests(unittest.TestCase):
         self.assertFalse(loaded.track("bass").notes.undo())
         self.assertEqual(loaded.track("bass").notes.generation,
                          self.project.track("bass").notes.generation)
+
+    def test_confidence_and_filter_round_trip_and_schema_three_upgrade(self):
+        from dataclasses import replace
+        store = self.project.tracks[0].notes
+        store.generated[0] = replace(store.generated[0], confidence=.95)
+        store.detection_level = 10
+        save_project(self.project, self.folder)
+        loaded = load_project(self.folder)
+        self.assertEqual(loaded, self.project)
+        data = self.manifest()
+        data["schema_version"] = 3
+        for track in data["tracks"]:
+            track["notes"].pop("detection_level")
+            for kind in ("generated", "authored"):
+                for value in track["notes"][kind]:
+                    value.pop("confidence")
+        self.write_manifest(data)
+        loaded = load_project(self.folder)
+        self.assertEqual(loaded.tracks[0].notes.detection_level, 100)
+        self.assertTrue(all(n.confidence is None for n in loaded.tracks[0].notes.generated))
+        save_project(loaded, self.folder)
+        self.assertEqual(self.manifest()["schema_version"], 4)
 
     def test_schema_exact_fractions_and_relative_managed_paths(self):
         save_project(self.project, self.folder)

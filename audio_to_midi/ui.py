@@ -35,6 +35,7 @@ from audio_to_midi.chord_view import ChordView
 from audio_to_midi.dialogs import NoteInfoDialog, PlaybackSettingsDialog, TappingCalibrationDialog, TimingDialog
 from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.midi import export_midi, export_musicxml, import_notes
+from audio_to_midi.musicxml import QUANTIZATIONS
 from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, parse_number, position,
 )
@@ -257,7 +258,7 @@ class ProjectWindow(QMainWindow):
         view.addSeparator()
         tools = QActionGroup(self)
         for name, text, key in (("brush", "&Brush tool (add, resize, delete notes)", "B"),
-                                ("info", "&Info tool (click a note to edit it)", "I")):
+                                ("info", "&Info tool (note details and timing menu)", "I")):
             action = self._act(view, name, text, lambda checked, n=name: self._set_tool(n) if checked else None,
                                key, checkable=True)
             tools.addAction(action)
@@ -335,6 +336,33 @@ class ProjectWindow(QMainWindow):
         self.stages = QLabel()
         self.stages.setToolTip("Workflow: import the mix, count bars, then stems.")
         row.addWidget(self.stages)
+        root.addLayout(row)
+
+        row = QHBoxLayout()
+        self.confidence_panel = QWidget()
+        confidence_layout = QHBoxLayout(self.confidence_panel)
+        confidence_layout.setContentsMargins(0, 0, 0, 0)
+        confidence_layout.addWidget(QLabel("AI notes: None"))
+        self.confidence_slider = QSlider(Qt.Orientation.Horizontal)
+        self.confidence_slider.setObjectName("detection_confidence")
+        self.confidence_slider.setRange(0, 100)
+        self.confidence_slider.setValue(100)
+        self.confidence_slider.setTracking(False)
+        self.confidence_slider.setMinimumWidth(160)
+        self.confidence_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.confidence_slider.setToolTip(
+            "Left: no AI notes. Just right of left: strongest evidence only. "
+            "Right: all detected notes, including low or unknown confidence. "
+            "Manual/imported notes are kept. This affects playback and export, "
+            "without deleting predictions or rerunning the model."
+        )
+        self.confidence_slider.valueChanged.connect(lambda _: self._guard(self._confidence_changed))
+        confidence_layout.addWidget(self.confidence_slider)
+        confidence_layout.addWidget(QLabel("All"))
+        self.confidence_label = QLabel()
+        confidence_layout.addWidget(self.confidence_label)
+        row.addWidget(self.confidence_panel)
+        row.addStretch(1)
         root.addLayout(row)
 
         row = QHBoxLayout()
@@ -424,7 +452,11 @@ class ProjectWindow(QMainWindow):
         self.timeline.note_removed.connect(lambda note: self._guard(lambda: self._remove_note(note)))
         self.timeline.note_resized.connect(lambda note, end: self._guard(lambda: self._resize_note(note, end)))
         self.timeline.note_selected.connect(self._select_note)
+        self.timeline.note_confirmed.connect(lambda note: self._guard(lambda: self._confirm_note(note)))
         self.timeline.note_info_requested.connect(lambda note, at: self._guard(lambda: self._note_info(note)))
+        self.timeline.info_context_requested.connect(
+            lambda seconds, note, at: self._guard(lambda: self._info_menu(seconds, note, at))
+        )
         self.timeline.beat_clicked.connect(lambda s, right, at: self._guard(lambda: self._beat_clicked(s, right, at)))
         self.timeline.context_requested.connect(lambda b, p, at: self._guard(lambda: self._roll_menu(b, at)))
         self.timeline.zoom_requested.connect(lambda steps: self._guard(lambda: self._zoom(-steps)))
@@ -484,10 +516,20 @@ class ProjectWindow(QMainWindow):
             if n.end > self.timeline.start and n.start < self.timeline.end
         ] if track else []
         self.timeline.notes = self._rows
+        self.confidence_panel.setVisible(track is not None and track.role != "other")
+        self.confidence_slider.blockSignals(True)
+        self.confidence_slider.setValue(track.notes.detection_level if track else 100)
+        self.confidence_slider.blockSignals(False)
+        level = self.confidence_slider.value()
+        self.confidence_label.setText(
+            "No AI notes" if level == 0 else "All detections" if level == 100
+            else f"Evidence >= {100 - level}%"
+        )
         if self.timeline.selected not in self._rows:
             self.timeline.selected = None
-        self.timeline.beats = self._lane_beats() if view == MIX else []
-        self.timeline.taps = list(self.taps) if view == MIX else []
+        show_beats = view == MIX or (track is not None and self.timeline.tool == "info")
+        self.timeline.beats = self._lane_beats() if show_beats else []
+        self.timeline.taps = list(self.taps) if show_beats else []
         self.timeline.update()
         self.chord_view.start, self.chord_view.end = self.timeline.start, self.timeline.end
         self.chord_view.update()
@@ -586,7 +628,9 @@ class ProjectWindow(QMainWindow):
             action.setEnabled(bool(ok))
             action.setToolTip("" if ok else why)
         for key in ("D", "U"):
-            self.shortcuts[key].setEnabled(self.view == MIX)
+            self.shortcuts[key].setEnabled(
+                self.view == MIX or (self.view == "track" and self.timeline.tool == "info")
+            )
         self.cancel_button.setVisible(busy)
 
     # -- beat lane ----------------------------------------------------------
@@ -663,7 +707,7 @@ class ProjectWindow(QMainWindow):
     def _set_tool(self, name: str) -> None:
         self.timeline.tool = name
         self.timeline.unsetCursor()
-        self.timeline.update()
+        self._refresh()
 
     def _audio_path(self) -> str | None:
         track = self.active
@@ -1105,7 +1149,7 @@ class ProjectWindow(QMainWindow):
     def _edit_state(track: Track) -> tuple:
         return deepcopy((
             track.notes.authored, track.notes.rejections, track.notes.onsets,
-            track.training, track.settings.get("imported_midi"),
+            track.training, track.settings.get("imported_midi"), track.notes.detection_level,
         ))
 
     def _checkpoint(self, key: str | None = None) -> None:
@@ -1129,11 +1173,12 @@ class ProjectWindow(QMainWindow):
             self._refresh()
             return
         track = self.project.track(key)
-        authored, rejections, onsets, training, imported = state
+        authored, rejections, onsets, training, imported, detection_level = state
         track.notes.authored = authored
         track.notes.rejections = rejections
         track.notes.onsets = onsets
         track.training = training
+        track.notes.detection_level = detection_level
         if imported is None:
             track.settings.pop("imported_midi", None)
         else:
@@ -1154,6 +1199,17 @@ class ProjectWindow(QMainWindow):
         self._queue_visible()
 
     # -- note editing -----------------------------------------------------
+    def _confidence_changed(self) -> None:
+        if self._building or self.active is None:
+            return
+        level = self.confidence_slider.value()
+        if level == self.active.notes.detection_level:
+            return
+        self._checkpoint()
+        self.active.notes.detection_level = level
+        self._stop()
+        self._refresh()
+
     def _require_transcribable(self) -> Track:
         if not self.active or self.active.role == "other":
             raise ValueError("Choose a transcribable stem.")
@@ -1216,6 +1272,21 @@ class ProjectWindow(QMainWindow):
     def _select_note(self, note) -> None:
         self.timeline.selected = note
         self.timeline.update()
+
+    def _confirm_note(self, note: Note) -> None:
+        track = self._require_transcribable()
+        if note not in self._rows:
+            raise ValueError("The note changed before it could be confirmed; try again.")
+        if note.source != "generated":
+            self._select_note(note)
+            return
+        self._checkpoint()
+        confirmed = track.notes.author(note.start, note.end, note.pitch, note.velocity)
+        record_onset(track, note.start, True)
+        if track.role == "drums":
+            record_drum(track, self.project, note.start, note.end, note.pitch, True)
+        self._edited(track)
+        self._select_note(confirmed)
 
     def _select_at(self, start: Fraction, pitch: int) -> None:
         match = next((n for n in self._rows if n.start == start and n.pitch == pitch), None)
@@ -1291,6 +1362,18 @@ class ProjectWindow(QMainWindow):
 
     def _popup(self, menu: QMenu, at) -> None:
         menu.exec(at or QCursor.pos())
+
+    def _info_menu(self, seconds: float, note, at) -> None:
+        menu = QMenu(self)
+        if note is not None:
+            menu.addAction("Note details...", lambda: self._guard(lambda: self._note_info(note)))
+            menu.addAction("Delete note", lambda: self._guard(lambda: self._remove_note(note)))
+            menu.addSeparator()
+        if self.session is None:
+            menu.addAction("Detect beats first (Edit > Detect tempo, meter, and key)").setEnabled(False)
+        else:
+            self._beat_menu(menu, seconds, tolerance=0.0, pin_here=True)
+        self._popup(menu, at)
 
     def _roll_menu(self, beat: Fraction, at) -> None:
         """Right-click on an empty part of the roll."""
@@ -1592,12 +1675,23 @@ class ProjectWindow(QMainWindow):
         if chosen is None:
             return
         selected, include_chords, partial = chosen
+        grid = self.project.grid
+        quarter_beats = grid.denominator <= 4
+        choices = [label for label, _ in QUANTIZATIONS if quarter_beats or "triplet" not in label]
+        quantization, accepted = QInputDialog.getItem(
+            self, "Export score", "Quantization", choices, choices.index("1/16"), editable=False,
+        )
+        if not accepted:
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export score", f"{self.project.name}.musicxml",
             "MusicXML (*.musicxml *.xml);;Compressed MusicXML (*.mxl)",
         )
         if path:
-            export_musicxml(self.project, Path(path), selected, include_chords=include_chords)
+            export_musicxml(
+                self.project, Path(path), selected, include_chords=include_chords,
+                quantization=dict(QUANTIZATIONS)[quantization],
+            )
             self.status.setText(f"{'PARTIAL' if partial else 'Complete'} score exported: {path}")
 
     def _profile(self) -> None:
@@ -1701,7 +1795,7 @@ class ProjectWindow(QMainWindow):
         self._load_envelope()
         self._refresh()
 
-    # -- beats in the Mix view -------------------------------------------------
+    # -- shared beat timing ----------------------------------------------------
     def _require_session(self) -> BeatSession:
         if self.session is None:
             raise ValueError("Detect beats first (Edit > Detect tempo, meter, and key).")
@@ -1728,10 +1822,19 @@ class ProjectWindow(QMainWindow):
             if index >= 0:
                 mark = session.mark_of(index)
                 where = f"bar {mark[0]} beat {format_number(mark[1])}" if mark else "not counted"
+                actions = ("D: pin as downbeat, U: unpin, Delete: remove." if self.view == MIX else
+                           "D: pin as downbeat, U: unpin; right-click for beat actions.")
                 self.status.setText(f"Beat at {session.beats[index].time:.3f} s ({where}). "
-                                    "D: pin as downbeat, U: unpin, Delete: remove.")
+                                    + actions)
             return
         menu = QMenu(self)
+        self._beat_menu(menu, seconds, tolerance=BEAT_TOLERANCE)
+        self._popup(menu, at)
+
+    def _beat_menu(self, menu: QMenu, seconds: float, *, tolerance: float, pin_here: bool = False) -> None:
+        session = self._require_session()
+        index = session.nearest(seconds, tolerance)
+        self._select_beat(index)
         if index >= 0:
             guess = session.guess_bar(index)
             menu.addAction(f"Downbeat of bar {guess}", lambda: self._guard(lambda: self._pin(index, guess)))
@@ -1740,11 +1843,42 @@ class ProjectWindow(QMainWindow):
                 menu.addAction("Unpin", lambda: self._guard(lambda: self._unpin(index)))
             menu.addAction("Remove this beat", lambda: self._guard(lambda: self._remove_beat(index)))
         else:
+            if pin_here:
+                bar, beat = bar_and_beat(self.project.grid, self.project.grid.seconds_to_beat(seconds))
+                guess = bar if beat == 1 else bar + 1
+                menu.addAction(f"Downbeat of bar {guess}",
+                               lambda: self._guard(lambda: self._pin_at(seconds, guess)))
+                menu.addAction("Downbeat of bar...",
+                               lambda: self._guard(lambda: self._pin_at_ask(seconds, guess)))
             menu.addAction("Add a beat here", lambda: self._guard(lambda: self._add_beat(seconds)))
+            if pin_here:
+                nearby = session.nearest(seconds, BEAT_TOLERANCE)
+                if nearby >= 0:
+                    menu.addSeparator()
+                    if session.beats[nearby].mark:
+                        menu.addAction("Unpin nearby beat", lambda: self._guard(lambda: self._unpin(nearby)))
+                    menu.addAction("Remove nearby beat", lambda: self._guard(lambda: self._remove_beat(nearby)))
         if session.pins:
             menu.addSeparator()
             menu.addAction("Clear all pins", lambda: self._guard(self._clear_pins))
-        self._popup(menu, at)
+
+    def _pin_at(self, seconds: float, bar: int) -> None:
+        """Add and pin an exact audio position without leaving a beat behind on failure."""
+        session = self._require_session()
+        index = session.add_beat(seconds)
+        try:
+            session.pin(index, bar)
+        except ValueError:
+            session.remove_beat(index)
+            raise
+        self._select_beat(index)
+        self._session_changed()
+        self.status.setText(session.summary())
+
+    def _pin_at_ask(self, seconds: float, guess: int) -> None:
+        bar, ok = QInputDialog.getInt(self, "Pin downbeat", "Bar number", guess, -999, 9999)
+        if ok:
+            self._pin_at(seconds, bar)
 
     def _pin(self, index: int, bar: int, beat: int = 1) -> None:
         self._require_session().pin(index, bar, beat)

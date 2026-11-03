@@ -2,8 +2,8 @@
 
 One part per transcribed track on the conventional staff for its role (bass and
 guitar written an octave up, piano on a grand staff, drums on a percussion staff
-with kit noteheads). Rhythm is notated by beat with ties, triplets and beams;
-connected single-line notes get legato slurs; chord symbols ride on the top
+with kit noteheads). Rhythm uses explicit export quantization, ties and beams;
+originally touching single-line notes get slurs; chord symbols ride on the top
 pitched part; one opening average tempo keeps the notation and playback steady.
 Only the exported copy is tidied: project notes are never changed.
 """
@@ -107,14 +107,17 @@ _DUPLE = sorted(
 _VALUE = {length: (name, dots) for length, name, dots, _ in _DUPLE}
 # Triplet values (3 in the time of 2 eighths) by sounding length.
 _TRIPLET = ((Q(2, 3), "quarter", 0, Q(1, 3)), (Q(1, 3), "eighth", 0, Q(1, 3)), (Q(1, 6), "16th", 0, Q(1, 6)))
-_TRIPLET_STEP = Q(1, 6)
+QUANTIZATIONS = (
+    ("1/4", Q(1)), ("1/8", Q(1, 2)), ("1/8 triplet", Q(1, 3)),
+    ("1/16", Q(1, 4)), ("1/16 triplet", Q(1, 6)), ("1/32", Q(1, 8)),
+)
 
 
 @dataclass(frozen=True)
 class _Meter:
     bar: Fraction
     unit: Fraction  # notation beat in quarters
-    duple: Fraction  # finest straight position kept
+    step: Fraction
     triplets: bool
     compound: bool
 
@@ -123,13 +126,15 @@ class _Meter:
         return self.unit if self.unit >= 1 else self.bar
 
 
-def _meter(grid) -> _Meter:
+def _meter(grid, quantization: Fraction) -> _Meter:
+    if not isinstance(quantization, Fraction) or quantization not in {step for _, step in QUANTIZATIONS}:
+        raise ValueError("Unsupported MusicXML quantization.")
     compound = grid.denominator == 8 and grid.numerator % 3 == 0 and grid.numerator > 3
     unit = Q(3, 2) if compound else min(Q(1), Q(4, grid.denominator))
-    sub = Q(grid.subdivision)
-    straight = sub.numerator == 1 and sub.denominator & (sub.denominator - 1) == 0
-    duple = max(Q(1, 16), min(Q(1, 4), sub) if straight else Q(1, 4))
-    return _Meter(grid.bar_beats, unit, min(duple, unit), unit == 1, compound)
+    triplets = quantization.denominator % 3 == 0
+    if triplets and unit != 1:
+        raise ValueError("Triplet MusicXML quantization requires quarter-note beats.")
+    return _Meter(grid.bar_beats, unit, quantization, triplets, compound)
 
 
 @dataclass
@@ -192,35 +197,23 @@ def _snap(value: Fraction, step: Fraction) -> Fraction:
 
 
 def _regularize(notes: list[_Note], meter: _Meter, ends: bool = True) -> list[_Note]:
-    """Snap each beat's positions to straight or triplet values, whichever the beat already uses."""
-    unit = meter.unit
-    offsets = defaultdict(set)
-    for note in notes:
-        for x in (note.start, note.end) if ends else (note.start,):
-            beat = math.floor(x / unit)
-            if x - beat * unit:
-                offsets[beat].add(x - beat * unit)
-    candidates = [meter.duple] + ([_TRIPLET_STEP] if meter.triplets else [])
-    steps = {}
-    for beat, values in offsets.items():
-        exact = [s for s in candidates if all(v % s == 0 for v in values)]
-        steps[beat] = exact[0] if exact else min(
-            candidates, key=lambda s: sum(abs(v - _snap(v, s)) for v in values),
-        )
-
-    def fix(x: Fraction) -> Fraction:
-        beat = math.floor(x / unit)
-        offset = x - beat * unit
-        return beat * unit + _snap(offset, steps[beat]) if offset else x
-
+    """Snap to the selected export grid without inferring tuplets from releases."""
     out = []
     for note in notes:
-        start = fix(note.start)
-        end = fix(note.end) if ends else note.end
+        start = _snap(note.start, meter.step)
+        end = _snap(note.end, meter.step) if ends else note.end
         if end <= start:
-            end = start + steps.get(math.floor(start / unit), meter.duple)
+            end = start + meter.step
         out.append(_Note(start, end, note.pitch, note.key))
     return out
+
+
+def _close_short_gaps(notes: list[_Note], step: Fraction) -> None:
+    starts = sorted({n.start for n in notes})
+    for note in notes:
+        i = bisect_right(starts, note.start)
+        if i < len(starts) and 0 < starts[i] - note.end < step:
+            note.end = starts[i]
 
 
 def _trim(notes: list[_Note], mono: bool) -> list[_Note]:
@@ -257,7 +250,7 @@ def _drum_voices(notes: list[_Note], meter: _Meter) -> tuple[list[_Note], list[_
 
 
 def _slurs(notes: list[_Note]) -> tuple[set, set]:
-    """Slur each run of touching single notes that change pitch (ties stay ties, rests break runs)."""
+    """Slur original touching single notes; separate same-pitch notes are not ties."""
     by_start = defaultdict(list)
     for note in notes:
         by_start[note.start].append(note)
@@ -275,7 +268,7 @@ def _slurs(notes: list[_Note]) -> tuple[set, set]:
             close()
             continue
         note = group[0]
-        if not (run and run[-1].end == note.start and run[-1].pitch != note.pitch):
+        if not (run and run[-1].end == note.start):
             close()
         run.append(note)
     close()
@@ -429,7 +422,13 @@ def _build_parts(sources, meter: _Meter) -> list[_Part]:
             part.drums = sorted({n.pitch for n in hands + feet})
         else:
             mono = role in MONOPHONIC
-            cleaned = _trim(_regularize(_trim(raw, mono), meter), mono)
+            ordered = sorted(raw, key=lambda n: n.start)
+            single_line = mono or all(a.end <= b.start for a, b in zip(ordered, ordered[1:]))
+            if role != "piano" and single_line:
+                part.slur_starts, part.slur_stops = _slurs(raw)
+            trimmed = _trim(raw, mono)
+            _close_short_gaps(trimmed, meter.step)
+            cleaned = _trim(_regularize(trimmed, meter), mono)
             if role == "piano":
                 part.voices = [
                     _Voice(1, 1, [n for n in cleaned if n.pitch >= PIANO_SPLIT]),
@@ -439,9 +438,6 @@ def _build_parts(sources, meter: _Meter) -> list[_Part]:
                 part.voices = [_Voice(1, 1, cleaned)]
             if role == "vocals" and cleaned and statistics.median(n.pitch for n in cleaned) < LOW_VOICE:
                 part.clefs = (("G", 2, -1),)
-            single_line = mono or all(a.end <= b.start for a, b in zip(cleaned, cleaned[1:]))
-            if role != "piano" and single_line:
-                part.slur_starts, part.slur_stops = _slurs(cleaned)
         parts.append(part)
     return parts
 
@@ -616,9 +612,12 @@ def _notes(measure, piece: _Piece, part: _Part, voice: _Voice, divisions: int, n
                 _sub(element, tag, **attributes)
 
 
-def score_xml(project, tracks=None, include_chords: bool = True) -> str:
+def score_xml(
+    project, tracks=None, include_chords: bool = True, *,
+    quantization: Fraction = Q(1, 4),
+) -> str:
     """MusicXML 4.0 partwise score for the given tracks (default: all with notes)."""
-    grid, meter = project.grid, _meter(project.grid)
+    grid, meter = project.grid, _meter(project.grid, quantization)
     chosen = [t for t in (project.tracks if tracks is None else tracks) if t.role in INSTRUMENTS]
     chosen.sort(key=lambda t: ROLE_ORDER.index(t.role))
     sources = [(t, notes) for t in chosen if (notes := t.notes.resolved())]

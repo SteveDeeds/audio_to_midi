@@ -1,6 +1,7 @@
 """Versioned, atomic project manifests, without backend or GUI dependencies.
 
-Schema 3 stores every Fraction as {numerator, denominator} and chords as
+Schema 4 adds note confidence and a reversible detection level; schema 3 is
+still readable. Every Fraction is stored as {numerator, denominator} and chords as
 lead-sheet segments. Relative media paths
 are relative to the manifest folder; loading returns absolute media paths.
 History is deliberately ephemeral, while edit feedback and revisions are durable.
@@ -18,7 +19,7 @@ from .domain import ChordSegment, Note, NoteStore, Project, Track
 from .timebase import Grid
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class ProjectStorageError(Exception):
@@ -61,11 +62,13 @@ def _note(note: Note) -> dict:
     return {
         "id": note.id, "start": _fraction(note.start), "end": _fraction(note.end),
         "pitch": note.pitch, "velocity": note.velocity, "source": note.source,
+        "confidence": note.confidence,
     }
 
 
-def _read_note(value: object) -> Note:
-    value = _object(value, {"id", "start", "end", "pitch", "velocity", "source"}, "note")
+def _read_note(value: object, schema: int) -> Note:
+    keys = {"id", "start", "end", "pitch", "velocity", "source"}
+    value = _object(value, keys | ({"confidence"} if schema >= 4 else set()), "note")
     return Note(**{**value, "start": _read_fraction(value["start"]),
                    "end": _read_fraction(value["end"])})
 
@@ -135,21 +138,24 @@ def _store(store: NoteStore) -> dict:
         ],
         "onsets": [_fraction(b) for b in store.onsets],
         "revision": store.revision,
+        "detection_level": store.detection_level,
     }
 
 
-def _read_store(value: object) -> NoteStore:
-    value = _object(value, {"generated", "authored", "rejections", "onsets", "revision"}, "note store")
+def _read_store(value: object, schema: int) -> NoteStore:
+    keys = {"generated", "authored", "rejections", "onsets", "revision"}
+    value = _object(value, keys | ({"detection_level"} if schema >= 4 else set()), "note store")
     rejections = []
     for item in _list(value["rejections"], "rejections"):
         item = _object(item, {"start", "end", "pitch"}, "rejection")
         rejections.append((_read_fraction(item["start"]), _read_fraction(item["end"]), item["pitch"]))
     return NoteStore(
-        generated=[_read_note(n) for n in _list(value["generated"], "generated")],
-        authored=[_read_note(n) for n in _list(value["authored"], "authored")],
+        generated=[_read_note(n, schema) for n in _list(value["generated"], "generated")],
+        authored=[_read_note(n, schema) for n in _list(value["authored"], "authored")],
         rejections=rejections,
         onsets=[_read_fraction(b) for b in _list(value["onsets"], "onsets")],
         revision=value["revision"],
+        detection_level=value["detection_level"] if schema >= 4 else 100,
     )
 
 
@@ -279,7 +285,7 @@ def load_project(folder: Path) -> Project:
         raise InvalidProjectError(f"Cannot decode project manifest: {exc}") from exc
     if type(data) is not dict:
         raise InvalidProjectError("manifest must be an object")
-    if type(data.get("schema_version")) is not int or data["schema_version"] != SCHEMA_VERSION:
+    if type(data.get("schema_version")) is not int or data["schema_version"] not in (3, SCHEMA_VERSION):
         raise SchemaVersionError(f"Unsupported project schema: {data.get('schema_version')!r}")
     try:
         data = _object(data, {
@@ -298,7 +304,7 @@ def load_project(folder: Path) -> Project:
                 "notes", "settings", "training", "revision",
             }, "track")
             tracks.append(Track(**{
-                **value, "notes": _read_store(value["notes"]),
+                **value, "notes": _read_store(value["notes"], data["schema_version"]),
                 "audio_path": _loaded_path(value["audio_path"], folder),
             }))
         return Project(

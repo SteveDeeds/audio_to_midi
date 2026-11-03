@@ -20,6 +20,13 @@ from audio_to_midi.timebase import Grid
 from audio_to_midi.__main__ import main
 
 
+class MonoEvidence:
+    def contour(self, a, b, *args):
+        answer = self.block_pitch(a, b, *args)
+        pitch = answer[0][0] if answer is not None else np.nan
+        return np.linspace(a, b, 10, endpoint=False), np.full(10, pitch)
+
+
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -178,7 +185,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNone(backend.provider)
 
     def test_mono_adapter_uses_onset_blocks_not_model_note_boundaries(self):
-        class Mono:
+        class Mono(MonoEvidence):
             def prepare(self, *args, **kwargs):
                 return True
             def onset_times(self, *args):
@@ -194,7 +201,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual([n.end for n in prediction.notes], [F(1), F(2), F(4)])
 
     def test_silent_onset_candidates_are_not_published_as_onsets(self):
-        class Mono:
+        class Mono(MonoEvidence):
             def prepare(self, *args, **kwargs):
                 return True
             def onset_times(self, *args):
@@ -223,7 +230,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(self.track.notes.onsets, [F(0)])
 
     def test_stable_mono_changes_split_bass_but_deleted_onsets_stay_deleted(self):
-        class Mono:
+        class Mono(MonoEvidence):
             def prepare(self, *args, **kwargs):
                 return True
             def onset_times(self, *args):
@@ -250,7 +257,7 @@ class WorkflowTests(unittest.TestCase):
             self.track.notes.onsets.append(F(i, 4))
         before = deepcopy(self.track)
 
-        class Mono:
+        class Mono(MonoEvidence):
             def prepare(self, *args, **kwargs):
                 return True
             def onset_times(self, *args):
@@ -329,7 +336,7 @@ class WorkflowTests(unittest.TestCase):
         sf.write(path, (0.4 * level * tone).astype(np.float32), 8000)
         track = app.add_stem(self.project, path, "vocals")
 
-        class Mono:
+        class Mono(MonoEvidence):
             def prepare(self, *args, **kwargs):
                 return True
             def onset_times(self, *args):
@@ -390,7 +397,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertGreaterEqual(min(hats), 110)
 
     def test_visible_batches_merge_continuation_without_false_restrike(self):
-        class Mono:
+        class Mono(MonoEvidence):
             def prepare(self, *args, **kwargs):
                 return True
             def onset_times(self, *args):
@@ -507,7 +514,58 @@ class WorkflowTests(unittest.TestCase):
             with patch.object(poly_pitch, "_BASIC_PITCH_MODEL", None):
                 notes = poly_pitch.transcribe_notes(np.ones(22050, dtype=np.float32), 22050, "piano", "basic_pitch")
         self.assertEqual(loaded, [self.root / "onnx.model"])
-        self.assertEqual(notes, [(0., .5, 60, .8)])
+        self.assertEqual(notes, [(0., .5, 60, .8, .8)])
+
+    def test_piano_hr_confidence_uses_frames_not_key_velocity(self):
+        import sys
+        from types import ModuleType, SimpleNamespace
+        from core import poly_pitch
+
+        package = ModuleType("piano_transcription_inference")
+        package.PianoTranscription = lambda **kwargs: model
+        package.sample_rate = 16000
+        package.config = SimpleNamespace(frames_per_second=100, begin_note=21)
+        frames = np.zeros((100, 88))
+        frames[:50, 60 - 21] = .99
+        frames[50:, 64 - 21] = .3
+        output = {
+            "output_dict": {"frame_output": frames},
+            "est_note_events": [
+                {"onset_time": 0, "offset_time": .5, "midi_note": 60, "velocity": 20},
+                {"onset_time": .5, "offset_time": 1, "midi_note": 64, "velocity": 120},
+            ],
+        }
+        model = SimpleNamespace(transcribe=lambda *args: output)
+        with patch.dict(sys.modules, {"piano_transcription_inference": package}), \
+                patch.object(poly_pitch, "_PIANO_HR_MODEL", model):
+            events = poly_pitch.transcribe_notes(np.ones(16000), 16000, "piano", "piano_hr")
+        self.assertAlmostEqual(events[0][4], .99)
+        self.assertAlmostEqual(events[1][4], .3)
+        self.assertLess(events[0][3], events[1][3])
+
+    def test_hidden_predictions_retain_onsets_and_export_uses_filter(self):
+        from audio_to_midi.midi import export_musicxml
+        from xml.etree import ElementTree as ET
+        self.track.notes.detection_level = 0
+        result = Prediction(F(0), F(4), (
+            Note("strong", F(0), F(2), 60, confidence=.995),
+            Note("weak", F(2), F(4), 64, confidence=.1),
+        ), (F(0), F(2)))
+        self.assertTrue(app.publish(self.project, app.token(self.project, self.track), result))
+        self.assertEqual(self.track.notes.resolved(), [])
+        self.assertEqual(self.track.notes.onsets, [F(0), F(2)])
+        snapshot = app.token(self.project, self.track)
+        self.track.notes.detection_level = 1
+        self.assertEqual(app.token(self.project, self.track), snapshot)
+        self.assertTrue(app.complete(self.project, self.track))
+        path = self.root / "filtered.mid"
+        export_midi(self.project, path)
+        import mido
+        self.assertEqual([msg.note for msg in mido.MidiFile(path)
+                          if msg.type == "note_on" and msg.velocity], [60])
+        xml_path = self.root / "filtered.musicxml"
+        export_musicxml(self.project, xml_path)
+        self.assertEqual({pitch.text for pitch in ET.parse(xml_path).findall(".//pitch/step")}, {"C"})
 
     def test_cached_polyphony_carries_voice_and_restrike_splits(self):
         from core.poly_pitch import BlockNote
@@ -517,12 +575,13 @@ class WorkflowTests(unittest.TestCase):
             def onset_times(self, *args):
                 return np.array([0, .5, 1])
             def block_notes(self, a, b, *args):
-                return [BlockNote(60, b, .8, a == .5)]
+                return [BlockNote(60, b, .8, a == .5, .9)]
         track = app.add_stem(self.project, self.wav, "piano")
         backend = TrackBackend.create(track, self.project)
         backend.provider = Poly()
         result = backend.predict(track, F(0), F(4), lambda: False)
         self.assertEqual([(n.start, n.end) for n in result.notes], [(F(0), F(2)), (F(2), F(4))])
+        self.assertEqual([n.confidence for n in result.notes], [.9, .9])
 
     def test_profile_import_reuses_compatible_legacy_rows_and_reports_extras(self):
         import json

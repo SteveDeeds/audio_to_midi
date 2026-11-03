@@ -12,7 +12,7 @@ from audio_to_midi.domain import Note
 from audio_to_midi.timebase import Grid
 from audio_to_midi.vocal_settings import VOCAL_MODELS, VocalParameters
 from core.chord_analysis import key_to_scale_pcs
-from core.mono_pitch import track_pitch
+from core.mono_pitch import pitch_agreement, track_pitch
 from core.vocal_boundaries import BoundarySettings, coalesce, energy_retriggers, stable_changes, voice_regions
 
 SR, HOP = 22050, 220
@@ -87,7 +87,8 @@ def grid_notes(
             if candidates:
                 midi = min(candidates, key=lambda p: (abs(p - raw), p))
         velocity = int(np.clip(100 + 1.2 * float(np.median(db[body])), 45, 110))
-        return Note(f"{track_id}:vocal:{a}:{midi}", a, b, midi, velocity)
+        return Note(f"{track_id}:vocal:{a}:{midi}", a, b, midi, velocity,
+                    confidence=pitch_agreement(pitch[body], midi))
 
     notes: list[Note] = []
     half = grid.subdivision / 2

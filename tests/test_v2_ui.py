@@ -1,4 +1,5 @@
 from fractions import Fraction as F
+from copy import deepcopy
 import os
 from pathlib import Path
 import tempfile
@@ -69,6 +70,30 @@ class EditorTests(unittest.TestCase):
             time.sleep(.01)
         self.assertIsNotNone(self.window.timeline.cqt)
 
+    def test_score_export_quantization_default_selection_and_cancel(self):
+        from audio_to_midi.musicxml import QUANTIZATIONS
+
+        for label in ("1/16", "1/32", None):
+            with self.subTest(label=label), \
+                    patch.object(self.window, "_export_scope",
+                                 return_value=([self.track], True, False)), \
+                    patch("audio_to_midi.ui.QInputDialog.getItem",
+                          return_value=(label or "", label is not None)) as choose, \
+                    patch("audio_to_midi.ui.QFileDialog.getSaveFileName",
+                          return_value=(str(self.root / "score.musicxml"), "")) as save, \
+                    patch("audio_to_midi.ui.export_musicxml") as export:
+                self.window._export_score()
+                args = choose.call_args.args
+                self.assertEqual(args[3][args[4]], "1/16")
+                if label is None:
+                    save.assert_not_called()
+                    export.assert_not_called()
+                else:
+                    export.assert_called_once_with(
+                        self.window.project, self.root / "score.musicxml", [self.track],
+                        include_chords=True, quantization=dict(QUANTIZATIONS)[label],
+                    )
+
     def test_edit_undo_redo_rejections_and_training(self):
         self.window._add_note(F(0), 60)
         self.assertEqual(len(self.window._rows), 1)
@@ -83,6 +108,134 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(self.window._rows), 0)
         self.window._undo()
         self.assertEqual(len(self.window._rows), 1)
+
+    def test_confidence_slider_is_reversible_undoable_and_does_not_reanalyze(self):
+        generated = [
+            Note("high", F(0), F(4), 60, confidence=.995),
+            Note("low", F(0), F(4), 64, confidence=.1),
+        ]
+        self.track.notes.generated = generated.copy()
+        self.window._add_note(F(0), 67)
+        self.window._refresh()
+        with patch.object(self.window.service, "predict") as analyze:
+            self.window.confidence_slider.setValue(0)
+            self.assertEqual([n.pitch for n in self.window._rows], [67])
+            self.window.confidence_slider.setValue(1)
+            self.assertEqual([n.pitch for n in self.window._rows], [60, 67])
+            self.window._undo()
+            self.assertEqual(self.window.confidence_slider.value(), 0)
+            self.window._redo()
+            self.assertEqual(self.window.confidence_slider.value(), 1)
+            self.window.confidence_slider.setValue(100)
+            self.assertEqual([n.pitch for n in self.window._rows], [60, 64, 67])
+            analyze.assert_not_called()
+        self.assertEqual(self.track.notes.generated, generated)
+        self.window.confidence_slider.setValue(1)
+        self.window.folder = self.root / "project"
+        self.window._save()
+        from audio_to_midi.storage import load_project
+        self.assertEqual(load_project(self.window.folder).tracks[0].notes.detection_level, 1)
+
+    def test_confidence_slider_is_per_track_and_hidden_for_mix(self):
+        self.window.confidence_slider.setValue(10)
+        piano = add_stem(self.window.project, self.wav, "piano")
+        self.window._sync_tracks()
+        self.window.tracks.setCurrentIndex(self.window.tracks.findData(piano.id))
+        self.assertEqual(self.window.confidence_slider.value(), 100)
+        self.window.tracks.setCurrentIndex(self.window.tracks.findData(self.track.id))
+        self.assertEqual(self.window.confidence_slider.value(), 10)
+        self.window.tracks.setCurrentIndex(self.window.tracks.findData("__mix__"))
+        self.assertTrue(self.window.confidence_panel.isHidden())
+
+    def test_confidence_slider_controls_playback_notes(self):
+        self.track.notes.generated = [
+            Note("high", F(0), F(4), 60, confidence=.995),
+            Note("low", F(0), F(4), 64, confidence=.1),
+        ]
+        with patch.object(self.window, "_player"), \
+                patch("audio_to_midi.ui.render_notes",
+                      return_value=np.zeros(16000, dtype=np.float32)) as render:
+            self.window.confidence_slider.setValue(0)
+            self.window._play()
+            render.assert_not_called()
+            self.window.confidence_slider.setValue(1)
+            self.window._play()
+            self.assertEqual([row[2] for row in render.call_args.args[0]], [60])
+        self.window._stop()
+
+    def test_left_click_confirms_ai_note_preserving_values_and_supporting_undo(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        from audio_to_midi.storage import load_project
+
+        window, timeline = self.window, self.window.timeline
+        proposal = Note("ai", F(0), F(2), 60, 83, confidence=.8)
+        other = Note("other", F(0), F(2), 64, 71, confidence=.7)
+        self.track.notes.generated = [proposal, other]
+        window._refresh()
+        window.resize(1280, 900)
+        window.show()
+        self.app.processEvents()
+        point = QPoint(round(timeline._x(F(1))),
+                       round(timeline._y(60) + timeline._row_height() / 2))
+        QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+        confirmed = timeline.selected
+        self.assertEqual(confirmed.source, "authored")
+        self.assertEqual((confirmed.start, confirmed.end, confirmed.pitch, confirmed.velocity),
+                         (proposal.start, proposal.end, proposal.pitch, proposal.velocity))
+        self.assertEqual(self.track.notes.generated, [proposal, other])
+        self.assertIn(other, window._rows)
+        history = len(window._history[self.track.id])
+        QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+        self.assertEqual(len(window._history[self.track.id]), history)
+        window._undo()
+        self.assertIn(proposal, window._rows)
+        self.assertFalse(self.track.notes.authored)
+        window._redo()
+        window.confidence_slider.setValue(0)
+        self.assertEqual(window._rows, [confirmed])
+        window.folder = self.root / "project"
+        window._save()
+        self.assertEqual(load_project(window.folder).tracks[0].notes.resolved(), [confirmed])
+
+    def test_ai_edge_click_confirms_but_info_does_not(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        from audio_to_midi.dialogs import NoteInfoDialog
+
+        window, timeline = self.window, self.window.timeline
+        proposal = Note("ai", F(0), F(2), 60, confidence=.9)
+        self.track.notes.generated = [proposal]
+        window._refresh()
+        window.resize(1280, 900)
+        window.show()
+        self.app.processEvents()
+        y = round(timeline._y(60) + timeline._row_height() / 2)
+        window.actions["info"].trigger()
+        with patch.object(NoteInfoDialog, "exec", return_value=NoteInfoDialog.DialogCode.Rejected):
+            QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                             QPoint(round(timeline._x(F(1))), y))
+        self.assertFalse(self.track.notes.authored)
+        window.actions["brush"].trigger()
+        QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+                         QPoint(round(timeline._x(F(2))) - 2, y))
+        self.assertEqual([(n.start, n.end, n.source) for n in window._rows],
+                         [(F(0), F(2), "authored")])
+
+    def test_confirming_ai_drum_records_positive_feedback(self):
+        drums = add_stem(self.window.project, self.wav, "drums")
+        self.window._sync_tracks()
+        self.window.tracks.setCurrentIndex(self.window.tracks.findData(drums.id))
+        note = Note("hit", F(0), F(1, 4), 46, 95, confidence=.8)
+        drums.notes.generated = [note]
+        self.window._refresh()
+        self.window._confirm_note(note)
+        self.assertEqual([n.pitch for n in drums.notes.authored], [46])
+        self.assertTrue(any(row["domain"] == "drum" and row["pitch"] == 46 and row["keep"]
+                            for row in drums.training))
+        self.window._undo()
+        self.assertFalse(drums.notes.authored)
+        self.assertFalse(drums.training)
 
     def test_reference_failure_is_visible_and_does_not_cache_a_success(self):
         ident = (str(self.wav), self.wav.stat().st_mtime_ns)
@@ -1397,6 +1550,161 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(self.track.notes.resolved(), [])
         window.actions["brush"].trigger()
         self.assertEqual(timeline.tool, "brush")
+
+    def test_info_right_click_pins_exact_audio_position_in_every_part(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+        from audio_to_midi.beats import Beat
+        from audio_to_midi.timing import BeatSession
+
+        window, timeline = self.window, self.window.timeline
+        window.resize(1280, 900)
+        window.show()
+        self.app.processEvents()
+        window.actions["info"].trigger()
+        for role in ("bass", "drums", "vocals", "piano", "guitar", "other"):
+            with self.subTest(role=role):
+                track = self.track if role == "bass" else add_stem(window.project, self.wav, role)
+                window._sync_tracks()
+                window.tracks.setCurrentIndex(window.tracks.findData(track.id))
+                window.session = BeatSession([Beat(i * .5, .9) for i in range(4)], 120, 2)
+                window._session_changed()
+                pitch = 36 if role == "drums" else 60
+                track.notes.author(F(1), F(2), pitch, 90)
+                window._refresh()
+                before = deepcopy(track.notes)
+                at = QPoint(round(timeline._x(F(6, 5))),
+                            round(timeline._y(pitch) + timeline._row_height() / 2))
+                seconds = timeline._seconds(at.x())
+                self.assertGreater(abs(seconds - .5), .05)
+                menus = []
+                with patch.object(window, "_popup", side_effect=lambda menu, _: menus.append(menu)):
+                    QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
+                self.assertEqual(track.notes, before, "opening Info context must not delete or confirm")
+                actions = {action.text(): action for action in menus[0].actions()}
+                self.assertIn("Note details...", actions)
+                self.assertIn("Delete note", actions)
+                self.assertIn("Downbeat of bar...", actions)
+                next(action for text, action in actions.items() if text.startswith("Downbeat of bar ")).trigger()
+                pin = window.session.pins[0]
+                self.assertAlmostEqual(pin.time, seconds, places=9)
+                self.assertNotAlmostEqual(pin.time, .5, places=2)
+                self.assertEqual(track.notes, before)
+                self.assertEqual(timeline.beats, window._lane_beats())
+                self.assertIn([seconds, 1.0, *pin.mark], window.project.stages["timing"]["beats"]["beats"])
+                bar = pin.mark[0]
+                self.assertAlmostEqual(float(window.project.grid.seconds_to_beat(seconds)), (bar - 1) * 4,
+                                       delta=2e-6)
+                # The persisted shared session retains exact click timing.
+                restored = BeatSession.from_json(window.project.stages["timing"]["beats"], 4, 4)
+                self.assertAlmostEqual(restored.pins[0].time, seconds, places=9)
+
+    def test_info_context_waveform_spectrum_and_empty_roll_do_not_edit_onsets(self):
+        from PySide6.QtCore import QPointF, QPoint, Qt
+        from audio_to_midi.beats import Beat
+        from audio_to_midi.timing import BeatSession
+
+        window, timeline = self.window, self.window.timeline
+        drums = add_stem(window.project, self.wav, "drums")
+        window._sync_tracks()
+        window.tracks.setCurrentIndex(window.tracks.findData(drums.id))
+        window.session = BeatSession([Beat(i * .5, .9) for i in range(4)], 120, 2)
+        window._session_changed()
+        window.actions["info"].trigger()
+        before = deepcopy(drums.notes)
+        for y in (timeline.LANE_TOP + 10, timeline.ROLL_TOP + 10, timeline._rows_top() + 10):
+            x = timeline._x_seconds(.61)
+            event = SimpleNamespace(position=lambda: QPointF(x, y),
+                                    globalPosition=lambda: QPointF(10, 10),
+                                    button=lambda: Qt.MouseButton.RightButton)
+            with patch.object(window, "_popup") as popup:
+                timeline.mousePressEvent(event)
+            texts = [action.text() for action in popup.call_args.args[0].actions()]
+            self.assertIn("Downbeat of bar...", texts)
+            self.assertNotIn("Delete note", texts)
+            self.assertNotIn("Rest for this beat", texts)
+        self.assertEqual(drums.notes, before)
+        # Info's beat selection must not teach an onset boundary.
+        with patch.object(window, "_onset") as onset:
+            timeline.mousePressEvent(SimpleNamespace(
+                position=lambda: QPointF(timeline._x_seconds(.5), timeline.LANE_TOP + 10),
+                globalPosition=lambda: QPointF(10, 10), button=lambda: Qt.MouseButton.LeftButton))
+        onset.assert_not_called()
+        self.assertEqual(timeline.selected_beat, .5)
+        self.assertTrue(window.shortcuts["D"].isEnabled())
+        window._pin_selected()
+        with patch.object(window, "_popup") as popup:
+            window._info_menu(.5, None, QPoint())
+        actions = {a.text(): a for a in popup.call_args.args[0].actions()}
+        self.assertIn("Unpin", actions)
+        self.assertIn("Remove this beat", actions)
+        self.assertIn("Clear all pins", actions)
+        actions["Unpin"].trigger()
+        self.assertEqual(window.session.pins, [])
+        window.actions["brush"].trigger()
+        self.assertEqual(timeline.beats, [])
+        self.assertFalse(window.shortcuts["D"].isEnabled())
+
+    def test_info_context_note_actions_without_detected_beats_and_brush_delete(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        window, timeline = self.window, self.window.timeline
+        window.resize(1280, 900)
+        window.show()
+        self.app.processEvents()
+        window._add_note(F(1), 48)
+        window.actions["info"].trigger()
+        at = QPoint(round(timeline._x(F(3, 2))), round(timeline._y(48) + timeline._row_height() / 2))
+        with patch.object(window, "_popup") as popup:
+            QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
+        actions = {a.text(): a for a in popup.call_args.args[0].actions()}
+        self.assertEqual(len(self.track.notes.resolved()), 1)
+        self.assertFalse(actions["Detect beats first (Edit > Detect tempo, meter, and key)"].isEnabled())
+        with patch.object(window, "_note_info") as info:
+            actions["Note details..."].trigger()
+        info.assert_called_once_with(window._rows[0])
+        actions["Delete note"].trigger()
+        self.assertEqual(self.track.notes.resolved(), [])
+        window._undo()
+        window.actions["brush"].trigger()
+        QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
+        self.assertEqual(self.track.notes.resolved(), [])
+
+    def test_info_exact_pin_cancel_and_invalid_pin_leave_no_new_beat(self):
+        from audio_to_midi.beats import Beat
+        from audio_to_midi.timing import BeatSession
+
+        window = self.window
+        window.session = BeatSession([Beat(i * .5, .9) for i in range(4)], 120, 2)
+        window._session_changed()
+        window._pin(0, 1)
+        before = window.session.to_json()
+        with patch("audio_to_midi.ui.QInputDialog.getInt", return_value=(2, False)):
+            window._pin_at_ask(.61, 2)
+        self.assertEqual(window.session.to_json(), before)
+        with self.assertRaisesRegex(ValueError, "already pinned"):
+            window._pin_at(.61, 1)
+        self.assertEqual(window.session.to_json(), before)
+        self.assertEqual(window.project.stages["timing"]["beats"], before)
+        with patch("audio_to_midi.ui.QInputDialog.getInt", return_value=(2, True)):
+            window._pin_at_ask(.61, 2)
+        self.assertAlmostEqual(window.session.pins[-1].time, .61)
+        with patch.object(window, "_popup") as popup:
+            window._info_menu(.61, None, None)
+        actions = {a.text(): a for a in popup.call_args.args[0].actions()}
+        actions["Remove this beat"].trigger()
+        self.assertEqual(window.session.to_json(), before)
+        with patch.object(window, "_popup") as popup:
+            window._info_menu(.000001, None, None)
+        actions = {a.text(): a for a in popup.call_args.args[0].actions()}
+        self.assertIn("Unpin nearby beat", actions)
+        self.assertIn("Remove nearby beat", actions)
+        actions["Unpin nearby beat"].trigger()
+        with patch("audio_to_midi.ui.QInputDialog.getInt", return_value=(1, True)):
+            actions["Downbeat of bar..."].trigger()
+        self.assertEqual(window.session.pins[0].time, .000001,
+                         "even a subpixel offset must not snap to a nearby beat")
 
     def test_drum_track_shows_adtof_lanes_under_half_spectrum(self):
         from PySide6.QtCore import QPoint, Qt

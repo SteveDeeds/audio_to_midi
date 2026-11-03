@@ -285,6 +285,9 @@ class NoteInfoDialog(QDialog):
         form.addRow("Drum" if drums else "Pitch", self.pitch)
         form.addRow("Velocity", self.velocity)
         form.addRow("Source", QLabel(note.source))
+        form.addRow("Detection evidence", QLabel(
+            "Unknown" if note.confidence is None else f"{note.confidence:.0%}"
+        ))
         layout.addLayout(form)
         box = _buttons(self)
         delete = box.addButton("Delete note", QDialogButtonBox.ButtonRole.DestructiveRole)

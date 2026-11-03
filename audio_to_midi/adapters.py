@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -15,6 +15,7 @@ from audio_to_midi.domain import Note, NoteStore, Project, Track
 from audio_to_midi import velocity
 from core.models import CorrectionModel
 from core import onset_features
+from core.mono_pitch import pitch_agreement
 from audio_to_midi.vocal_settings import VOCAL_MODELS, VocalParameters
 
 
@@ -282,7 +283,10 @@ class TrackBackend:
             for hit, level in zip(hits, levels):
                 beat = max(Fraction(0), grid.snap(grid.seconds_to_beat(hit.time)))
                 if start <= beat < end:
-                    notes.append(self._note(beat, min(end, beat + grid.subdivision), hit.midi, level))
+                    notes.append(replace(
+                        self._note(beat, min(end, beat + grid.subdivision), hit.midi, level),
+                        confidence=float(hit.strength),
+                    ))
             if cancelled():
                 raise Cancelled()
             return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
@@ -354,13 +358,15 @@ class TrackBackend:
                 pitches, release = answer
                 stop = min(b, max(a + grid.subdivision, grid.snap(grid.seconds_to_beat(release))))
                 candidate = self._note(a, stop, pitches[0], self._velocity(pitches[0], ta, release))
+                _, contour = provider.contour(ta, release, self.role, self.model)
+                candidate = replace(candidate, confidence=pitch_agreement(contour, pitches[0]))
                 if a == start and a not in active:
                     previous = next((
                         n for n in track.notes.generated
                         if n.pitch == candidate.pitch and n.end == a
                     ), None)
                     if previous:
-                        candidate = Note(previous.id, a, stop, candidate.pitch, previous.velocity, "generated")
+                        candidate = replace(candidate, id=previous.id, velocity=previous.velocity)
                 notes.append(candidate)
             else:
                 for answer in provider.block_notes(
@@ -373,24 +379,26 @@ class TrackBackend:
                     ), None)
                     if answer.continues and previous:
                         notes.remove(previous)
-                        notes.append(Note(
-                            previous.id, previous.start, stop, previous.pitch,
-                            previous.velocity, previous.source,
-                        ))
+                        confidence = (
+                            min(previous.confidence, answer.confidence)
+                            if previous.confidence is not None and answer.confidence is not None else None
+                        )
+                        notes.append(replace(previous, end=stop, confidence=confidence))
                     else:
                         # piano_hr predicts real key velocities; Basic Pitch's amplitude is closer to confidence.
                         level = (
                             max(1, round(answer.velocity * 127)) if self.model == "piano_hr"
                             else self._velocity(answer.midi, ta, answer.release)
                         )
-                        candidate = self._note(a, stop, answer.midi, level)
+                        candidate = replace(self._note(a, stop, answer.midi, level),
+                                            confidence=answer.confidence)
                         if answer.continues and a == start:
                             previous = next((
                                 n for n in track.notes.generated
                                 if n.pitch == answer.midi and n.end == a
                             ), None)
                             if previous:
-                                candidate = Note(previous.id, a, stop, candidate.pitch, previous.velocity, "generated")
+                                candidate = replace(candidate, id=previous.id, velocity=previous.velocity)
                         notes.append(candidate)
         return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
 

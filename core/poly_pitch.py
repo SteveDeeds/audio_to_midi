@@ -33,6 +33,7 @@ class PolyNote(NamedTuple):
     midi: int
     velocity: float
     struck: bool
+    confidence: float | None = None
 
 
 class BlockNote(NamedTuple):
@@ -40,6 +41,7 @@ class BlockNote(NamedTuple):
     release: float
     velocity: float
     continues: bool
+    confidence: float | None = None
 
 
 def _missing_model(name: str) -> RuntimeError:
@@ -49,8 +51,8 @@ def _missing_model(name: str) -> RuntimeError:
     )
 
 
-def transcribe_notes(y: np.ndarray, sr: int, stem: str, tracker: str) -> list[tuple[float, float, int, float]]:
-    """(onset, end, midi, velocity 0-1) note events for an audio excerpt."""
+def transcribe_notes(y: np.ndarray, sr: int, stem: str, tracker: str) -> list[tuple[float, float, int, float, float]]:
+    """(onset, end, midi, velocity 0-1, confidence 0-1) events for an excerpt."""
     lo, hi = RANGES[stem]["midi"]
     if tracker == "basic_pitch":
         global _BASIC_PITCH_MODEL
@@ -71,11 +73,11 @@ def transcribe_notes(y: np.ndarray, sr: int, stem: str, tracker: str) -> list[tu
                 minimum_frequency=RANGES[stem]["fmin"], maximum_frequency=RANGES[stem]["fmax"],
                 melodia_trick=True,
             )
-        notes = [(float(s), float(e), int(p), float(a)) for s, e, p, a, _ in events]
+        notes = [(float(s), float(e), int(p), float(a), float(a)) for s, e, p, a, _ in events]
     elif tracker == "piano_hr":
         global _PIANO_HR_MODEL
         try:
-            from piano_transcription_inference import PianoTranscription, sample_rate
+            from piano_transcription_inference import PianoTranscription, sample_rate, config
         except ModuleNotFoundError as exc:
             raise _missing_model("piano_transcription_inference") from exc
         if _PIANO_HR_MODEL is None:
@@ -85,10 +87,17 @@ def transcribe_notes(y: np.ndarray, sr: int, stem: str, tracker: str) -> list[tu
                 librosa.resample(y, orig_sr=sr, target_sr=sample_rate),
                 os.path.join(directory, "excerpt.mid"),
             )
-        notes = [
-            (float(e["onset_time"]), float(e["offset_time"]), int(e["midi_note"]), float(e["velocity"]) / 127.0)
-            for e in out["est_note_events"]
-        ]
+        frames = out["output_dict"]["frame_output"]
+        notes = []
+        for event in out["est_note_events"]:
+            onset, end = float(event["onset_time"]), float(event["offset_time"])
+            midi = int(event["midi_note"])
+            a = max(0, int(onset * config.frames_per_second))
+            b = min(len(frames), max(a + 1, int(np.ceil(end * config.frames_per_second))))
+            if b <= a:
+                raise ValueError("Piano-HR note has no corresponding confidence frames.")
+            confidence = float(np.mean(frames[a:b, midi - config.begin_note]))
+            notes.append((onset, end, midi, float(event["velocity"]) / 127.0, confidence))
     else:
         raise ValueError(f"unknown polyphonic tracker {tracker!r}")
     return [n for n in notes if lo <= n[2] <= hi and n[1] > n[0]]
@@ -112,6 +121,7 @@ class PolyTranscriber:
         self._onsets: dict[tuple[str, str], np.ndarray] = {}
         self._struck: dict[tuple[str, str], dict[int, list[tuple[float, float]]]] = {}
         self._runs: dict[tuple[str, str], dict[int, list[tuple[float, float, float]]]] = {}
+        self._evidence: dict[tuple[str, str], dict[int, list[PolyNote]]] = {}
 
     def prepare(
         self, t_start: float, t_end: float, stem: str, tracker: str,
@@ -147,13 +157,15 @@ class PolyTranscriber:
             y = np.asarray(self.audio[int(padded_start * self.sr):int(padded_end * self.sr)], dtype=np.float32)
             events = transcribe_notes(y, self.sr, stem, tracker) if np.any(y) else []
             notes = []
-            for onset, note_end, midi, velocity in events:
+            for event in events:
+                onset, note_end, midi, velocity = event[:4]
+                confidence = event[4]
                 onset, note_end = onset + padded_start, min(note_end + padded_start, padded_end)
                 if a <= onset < b:
-                    notes.append(PolyNote(onset, note_end, midi, velocity, True))
+                    notes.append(PolyNote(onset, note_end, midi, velocity, True, confidence))
                 elif onset < a < note_end:
                     # Sounding from before this batch: activity only, the earlier batch owns the onset.
-                    notes.append(PolyNote(a, note_end, midi, velocity, False))
+                    notes.append(PolyNote(a, note_end, midi, velocity, False, confidence))
             self._chunks[(stem, tracker, (a, b))] = notes
             changed = True
         if changed:
@@ -198,6 +210,7 @@ class PolyTranscriber:
                     merged.append([note.onset, note.end, note.velocity])
             runs[midi] = [tuple(run) for run in merged]
         self._struck[(stem, tracker)] = {m: sorted(v) for m, v in struck.items()}
+        self._evidence[(stem, tracker)] = by_pitch
         self._runs[(stem, tracker)] = runs
         self._onsets[(stem, tracker)] = np.array(sorted(n.onset for n in notes if n.struck), dtype=float)
 
@@ -254,5 +267,11 @@ class PolyTranscriber:
             if release - max(float(t0), run[0]) < need:
                 continue
             velocity = hit[1] if hit is not None else run[2]
-            notes.append(BlockNote(int(midi), release, float(velocity), hit is None))
+            evidence = [
+                n.confidence for n in self._evidence[(stem, tracker)][midi]
+                if n.onset - 1e-6 <= ref < n.end and n.confidence is not None
+                and (hit is None or (n.struck and abs(n.onset - hit[0]) < 1e-6))
+            ]
+            confidence = max(evidence) if evidence else None
+            notes.append(BlockNote(int(midi), release, float(velocity), hit is None, confidence))
         return sorted(notes, key=lambda n: (n.continues, -n.velocity, n.midi))
