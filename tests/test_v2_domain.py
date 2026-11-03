@@ -351,8 +351,8 @@ class NoteTests(unittest.TestCase):
         left, right = NoteStore(), NoteStore()
         left.add_onset(F(1))
         self.assertFalse(right.onsets)
-        a = Track("a", "bass", "", 0, 44100, "mono")
-        b = Track("b", "bass", "", 0, 44100, "mono")
+        a = Track("a", "bass", "", 0, 44100, "piano_hr")
+        b = Track("b", "bass", "", 0, 44100, "piano_hr")
         a.settings["x"] = 1
         a.training.append({"label": "onset"})
         self.assertFalse(b.settings)
@@ -364,7 +364,7 @@ class ProjectTests(unittest.TestCase):
         project = Project.create("Example", Grid())
         other = Project.create("Example", Grid())
         self.assertNotEqual(project.id, other.id)
-        track = Track("bass", "bass", "", 2.0, 44100, "bass__crepe_tiny+onset+key")
+        track = Track("bass", "bass", "", 2.0, 44100, "piano_hr")
         project.tracks.append(track)
         self.assertIs(project.track("bass"), track)
         with self.assertRaises(KeyError):
@@ -376,7 +376,7 @@ class ProjectTests(unittest.TestCase):
             {"training": [{"beat": F(1, 3)}]}, {"training": [1]},
             {"training": [{"bad": float("nan")}]}, {"settings": {1: "bad"}},
         ):
-            values = dict(id="t", role="bass", audio_path="", duration=2, sample_rate=44100, model="mono")
+            values = dict(id="t", role="bass", audio_path="", duration=2, sample_rate=44100, model="piano_hr")
             values.update(kwargs)
             with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
                 Track(**values)
@@ -398,7 +398,7 @@ class StorageTests(unittest.TestCase):
         store.reject(F(2), F(3), None)
         store.add_onset(F(7, 3))
         self.project.tracks.append(Track(
-            "bass", "bass", str(self.media), 4.5, 48000, "mono", notes=store,
+            "bass", "bass", str(self.media), 4.5, 48000, "piano_hr", notes=store,
             settings={"threshold": 0.25, "enabled": True},
             training=[
                 {"kind": "onset", "time": 0.5, "label": True},

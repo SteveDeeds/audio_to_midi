@@ -73,38 +73,10 @@ def clean_key_contour(
     return q
 
 
-def track_pitch(y: np.ndarray, sr: int, stem: str, tracker: str) -> tuple[np.ndarray, np.ndarray]:
-    fmin, fmax = (30.0, 420.0) if stem == "bass" else (70.0, 1100.0)
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=256)[0]
-    rms_times = librosa.times_like(rms, sr=sr, hop_length=256)
-    db = librosa.amplitude_to_db(rms + 1e-9, ref=np.max(rms) + 1e-9)
-    if tracker == "pyin":
-        f0, voiced, _ = librosa.pyin(
-            y, fmin=fmin, fmax=fmax, sr=sr, frame_length=2048, hop_length=256,
-        )
-        times = librosa.times_like(f0, sr=sr, hop_length=256)
-    else:
-        try:
-            import torch
-            import torchcrepe
-        except ModuleNotFoundError as exc:
-            raise RuntimeError(
-                "CREPE requires torchcrepe. Install the app requirements in its Python environment."
-            ) from exc
-        audio = torch.from_numpy(librosa.resample(y, orig_sr=sr, target_sr=16000))[None]
-        with torch.inference_mode():
-            f0_tensor, periodicity = torchcrepe.predict(
-                audio, 16000, hop_length=160, fmin=max(fmin, 32.71), fmax=fmax,
-                model="tiny" if tracker == "crepe_tiny" else "full",
-                decoder=torchcrepe.decode.viterbi, return_periodicity=True,
-                batch_size=1024, device="cpu",
-            )
-            voiced = torchcrepe.filter.median(periodicity, 3)[0].numpy() > 0.35
-            f0 = f0_tensor[0].numpy()
-        times = np.arange(len(f0)) * 0.01
-    voiced = voiced & (np.interp(times, rms_times, db) > -45.0)
-    midi = librosa.hz_to_midi(np.maximum(np.nan_to_num(f0, nan=1.0), 1.0))
-    return times, np.where(voiced, midi, np.nan)
+def track_pitch(y: np.ndarray, sr: int, stem: str, tracker: str, parameters: dict | None = None) -> tuple[np.ndarray, np.ndarray]:
+    from audio_to_midi.model_evidence import pitch_evidence, replay_pitch
+    arrays = pitch_evidence(y, sr, stem, tracker)
+    return replay_pitch(tracker, arrays, parameters or {})
 
 
 class MonoTranscriber:
@@ -132,6 +104,7 @@ class MonoTranscriber:
         self._onsets: dict[str, np.ndarray] = {}
         self._context: tuple[set[int], np.ndarray, np.ndarray] | None = None
         self._context_window: tuple[float, float] | None = None
+        self.decoder_parameters: dict = {}
 
     def _key_context(self, start: float, end: float) -> tuple[set[int], np.ndarray, np.ndarray]:
         if self._context is not None and (
@@ -259,7 +232,10 @@ class MonoTranscriber:
                 times = np.arange(a, b, 0.01)
                 midi = np.full(len(times), np.nan)
             else:
-                times, midi = track_pitch(y, sr, stem, tracker)
+                times, midi = (
+                    track_pitch(y, sr, stem, tracker, self.decoder_parameters)
+                    if self.decoder_parameters else track_pitch(y, sr, stem, tracker)
+                )
                 times = times + padded_start
                 core = (times >= a) & (times < b)
                 times, midi = times[core], midi[core]

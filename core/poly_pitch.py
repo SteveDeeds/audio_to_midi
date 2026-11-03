@@ -51,6 +51,15 @@ def _missing_model(name: str) -> RuntimeError:
     )
 
 
+def piano_frame_confidence(frames: np.ndarray, onset: float, end: float, midi: int,
+                           frames_per_second: float, begin_note: int) -> float:
+    a = max(0, int(onset * frames_per_second))
+    b = min(len(frames), max(a + 1, int(np.ceil(end * frames_per_second))))
+    if b <= a:
+        raise ValueError("Piano-HR note has no corresponding confidence frames.")
+    return float(np.mean(frames[a:b, midi - begin_note]))
+
+
 def transcribe_notes(y: np.ndarray, sr: int, stem: str, tracker: str) -> list[tuple[float, float, int, float, float]]:
     """(onset, end, midi, velocity 0-1, confidence 0-1) events for an excerpt."""
     lo, hi = RANGES[stem]["midi"]
@@ -92,11 +101,8 @@ def transcribe_notes(y: np.ndarray, sr: int, stem: str, tracker: str) -> list[tu
         for event in out["est_note_events"]:
             onset, end = float(event["onset_time"]), float(event["offset_time"])
             midi = int(event["midi_note"])
-            a = max(0, int(onset * config.frames_per_second))
-            b = min(len(frames), max(a + 1, int(np.ceil(end * config.frames_per_second))))
-            if b <= a:
-                raise ValueError("Piano-HR note has no corresponding confidence frames.")
-            confidence = float(np.mean(frames[a:b, midi - config.begin_note]))
+            confidence = piano_frame_confidence(
+                frames, onset, end, midi, config.frames_per_second, config.begin_note)
             notes.append((onset, end, midi, float(event["velocity"]) / 127.0, confidence))
     else:
         raise ValueError(f"unknown polyphonic tracker {tracker!r}")

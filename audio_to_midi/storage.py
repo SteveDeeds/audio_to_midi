@@ -303,6 +303,10 @@ def load_project(folder: Path) -> Project:
                 "id", "role", "audio_path", "duration", "sample_rate", "model",
                 "notes", "settings", "training", "revision",
             }, "track")
+            from audio_to_midi.model_choices import MODELS
+            choices = MODELS.get(value["role"])
+            if choices is None or value["model"] not in (*choices, ""):
+                raise InvalidProjectError(f"Unsupported {value['role']} model: {value['model']}")
             tracks.append(Track(**{
                 **value, "notes": _read_store(value["notes"], data["schema_version"]),
                 "audio_path": _loaded_path(value["audio_path"], folder),

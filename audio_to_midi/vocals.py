@@ -147,16 +147,8 @@ class VocalTranscriber:
         return np.concatenate(times), np.concatenate(pitches)
 
     def _activation(self, audio: np.ndarray) -> np.ndarray:
-        from madmom.audio.signal import Signal
-        from madmom.features.onsets import CNNOnsetProcessor, RNNOnsetProcessor
-
-        if self._processor is None:
-            self._processor = CNNOnsetProcessor() if self.model == "madmom_cnn" else RNNOnsetProcessor(online=False)
-        signal = Signal(librosa.resample(audio, orig_sr=SR, target_sr=44100), sample_rate=44100)
-        result = np.asarray(self._processor(signal)).reshape(-1)
-        if not len(result) or not np.isfinite(result).all():
-            raise RuntimeError("Neural vocal onset model returned empty or non-finite activations.")
-        return result
+        from audio_to_midi.model_evidence import onset_evidence
+        return onset_evidence(audio, SR, "vocals", self.model + "_full")["onset"]
 
     def evidence(self, t0: float, t1: float, cancelled: Callable[[], bool]) -> VocalEvidence:
         a, b = max(0, math.ceil(t0 * self.sr)), min(len(self.audio), math.ceil(t1 * self.sr))

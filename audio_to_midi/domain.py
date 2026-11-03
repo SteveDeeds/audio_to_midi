@@ -14,19 +14,11 @@ from uuid import uuid4
 
 from .timebase import Grid, beat_value, finite_number
 from .vocal_settings import VOCAL_MODELS, VocalParameters
+from .model_choices import MODELS, input_source
 
 
 SUPPORTED_ROLES = frozenset({"drums", "bass", "vocals", "piano", "guitar", "other"})
-SUPPORTED_MODELS = frozenset({
-    "", "crepe_tiny", "crepe_full", "pyin",
-    "standard", "bass", "mono", "poly", "manual", "none", "adtof",
-    "percussive_adtof", "basic_pitch", "piano_hr",
-    "bass__crepe_full+onset+key", "bass__crepe_tiny+onset+key",
-    "vocals__pyin+key", "vocals__crepe_full+key",
-    "piano__basic_pitch", "piano__piano_hr",
-    "guitar__basic_pitch", "guitar__piano_hr",
-    *VOCAL_MODELS,
-})
+SUPPORTED_MODELS = frozenset({"", *(model for models in MODELS.values() for model in models)})
 
 
 def _text(value: object, name: str, *, empty: bool = False) -> None:
@@ -372,6 +364,8 @@ class Track:
             raise ValueError(f"unsupported role: {self.role!r}")
         if not isinstance(self.model, str) or self.model not in SUPPORTED_MODELS:
             raise ValueError(f"unsupported model: {self.model!r}")
+        if self.model and self.model not in MODELS[self.role]:
+            raise ValueError(f"unsupported {self.role} model: {self.model!r}")
         finite_number(self.duration, "duration")
         if self.duration < 0:
             raise ValueError("duration must be nonnegative")
@@ -382,6 +376,7 @@ class Track:
         self.notes.validate()
         if type(self.settings) is not dict or type(self.training) is not list:
             raise ValueError("settings must be a dict and training a list")
+        input_source(self)
         if "vocal_parameters" in self.settings:
             VocalParameters.from_dict(self.settings["vocal_parameters"])
         if "madmom_license_acknowledged" in self.settings and type(self.settings["madmom_license_acknowledged"]) is not bool:

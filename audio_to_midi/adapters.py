@@ -17,16 +17,7 @@ from core.models import CorrectionModel
 from core import onset_features
 from core.mono_pitch import pitch_agreement
 from audio_to_midi.vocal_settings import VOCAL_MODELS, VocalParameters
-
-
-MODELS = {
-    "bass": ("crepe_tiny", "crepe_full"),
-    "vocals": ("pyin", "crepe_full", "crepe_tiny", *VOCAL_MODELS),
-    "piano": ("basic_pitch", "piano_hr"),
-    "guitar": ("basic_pitch", "piano_hr"),
-    "drums": ("adtof",),
-    "other": (),
-}
+from audio_to_midi.model_choices import MODELS, MADMOM_COMBINATIONS, input_source
 
 
 def normalize_key(value: str) -> str:
@@ -84,7 +75,17 @@ class TrackBackend:
         self._cqt_data = None
         self._drum_levels = None
         self._path = track.audio_path
-        license_key = "madmom_license_acknowledged" if track.model in VOCAL_MODELS else "license_acknowledged"
+        self._source = input_source(track)
+        self._inference_path = project.mix_path if self._source == "mix" else track.audio_path
+        if not self._inference_path:
+            raise ValueError("Mix-derived YourMT3+ requires a full mix in this project.")
+        self._decoder_parameters = track.settings.get("decoder_parameters", {})
+        if not isinstance(self._decoder_parameters, dict):
+            raise ValueError("Decoder parameters must be an object.")
+        from audio_to_midi.model_evidence import validate_parameters
+        validate_parameters(self.model, self._decoder_parameters)
+        self.monophonic = self.role == "vocals" or self.model in MADMOM_COMBINATIONS
+        license_key = "madmom_license_acknowledged" if track.model in (*VOCAL_MODELS, *MADMOM_COMBINATIONS) else "license_acknowledged"
         self._license_acknowledged = track.settings.get(license_key, False) is True
         self.features: dict[Fraction, tuple[float, float, float, float]] = {}
         self.attacks: np.ndarray | None = None
@@ -102,7 +103,7 @@ class TrackBackend:
             raise ValueError(f"Unsupported {self.role} model: {self.model}")
         if self.provider is not None:
             return
-        if (self.role == "drums" or self.model == "piano_hr" or self.model in VOCAL_MODELS) and not self._license_acknowledged:
+        if (self.model in ("adtof", "piano_hr", *VOCAL_MODELS, *MADMOM_COMBINATIONS)) and not self._license_acknowledged:
             raise ValueError(
                 "Acknowledge this backend's checkpoint license and possible first-use download "
                 "before transcription (ADTOF/MADMoM onset weights are non-commercial; review piano-HR terms)."
@@ -112,11 +113,17 @@ class TrackBackend:
 
             self.provider = VocalTranscriber(self.audio, self.sr, self.model, normalize_key(self.project_key))
             return
-        if self.role in ("bass", "vocals"):
+        if self.model == "yourmt3":
+            return
+        if self.model in MADMOM_COMBINATIONS:
+            from audio_to_midi.evidence_providers import InstrumentOnsetTranscriber
+            self.provider = InstrumentOnsetTranscriber(self.audio, self.sr, self._path, self._decoder_parameters)
+        elif self.role == "vocals":
             from core.mono_pitch import MonoTranscriber
             from core.chord_analysis import key_to_scale_pcs
 
             provider = MonoTranscriber(self.audio, self.sr, self.track_id)
+            provider.decoder_parameters = self._decoder_parameters
             # Supply explicit project harmony rather than filename-based siblings.
             key = normalize_key(self.project_key or self._detect_project_key())
             scale = key_to_scale_pcs(key)
@@ -137,10 +144,9 @@ class TrackBackend:
             provider._context = scale, harmony_times, harmony
             provider._context_window = None
             self.provider = provider
-        elif self.role in ("piano", "guitar"):
-            from core.poly_pitch import PolyTranscriber
-
-            self.provider = PolyTranscriber(self.audio, self.sr)
+        elif self.role in ("bass", "piano", "guitar"):
+            from audio_to_midi.evidence_providers import EvidencePolyTranscriber
+            self.provider = EvidencePolyTranscriber(self.audio, self.sr, self._path, self._decoder_parameters)
         else:
             from core.adtof_drums import AdtofDrumTranscriber
 
@@ -236,6 +242,7 @@ class TrackBackend:
     def predict(
         self, track: Track, start: Fraction, end: Fraction,
         cancelled: Callable[[], bool],
+        report: Callable[[str], None] = lambda text: None,
     ) -> Prediction:
         if cancelled():
             raise Cancelled()
@@ -246,6 +253,21 @@ class TrackBackend:
         t1 = min(self.duration, grid.beat_to_seconds(end))
         if t1 <= t0:
             raise ValueError("Requested interval has no audio.")
+        if self.model == "yourmt3":
+            from audio_to_midi.model_evidence import file_evidence
+            from audio_to_midi.yourmt3 import select_notes
+            source = "mix" if self._source == "mix" else f"stem:{self.role}"
+            arrays = file_evidence(self._inference_path, source, "yourmt3", cancelled, report)
+            rows = select_notes(arrays, self.role, self._source, self._decoder_parameters)
+            notes = []
+            for a, b, pitch, level, program, drum in rows:
+                beat = max(Fraction(0), grid.snap(grid.seconds_to_beat(float(a))))
+                if start <= beat < end:
+                    stop = min(end, max(beat + grid.subdivision, grid.snap_end(grid.seconds_to_beat(float(b)))))
+                    notes.append(self._note(beat, stop, int(pitch), int(level)))
+            if cancelled():
+                raise Cancelled()
+            return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
         if self.role == "vocals" and self.model in VOCAL_MODELS:
             parameters = VocalParameters.from_dict(track.settings.get("vocal_parameters", {}))
             notes, _ = provider.transcribe(track.id, grid, start, end, parameters,
@@ -261,10 +283,17 @@ class TrackBackend:
             return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
         audio_start = min(end, max(start, grid.snap(grid.seconds_to_beat(t0))))
         if self.role == "drums":
-            provider.prepare()
+            from audio_to_midi.model_evidence import file_evidence, threshold
+            if not provider.ready:
+                arrays = file_evidence(self._path, f"stem:{self.role}", "adtof", cancelled, report)
+                provider.set_activations(arrays["activation"])
             # Replay only the current snapshot so undo also undoes adaptation.
             from core.adtof_drums import AdtofDrumTranscriber
-            fresh = AdtofDrumTranscriber(self._path)
+            defaults = (
+                [threshold(self._decoder_parameters, "onset_threshold", 0)] * 5
+                if "onset_threshold" in self._decoder_parameters else provider._defaults
+            )
+            fresh = AdtofDrumTranscriber(self._path, defaults)
             fresh.set_activations(provider._act)
             self.provider = provider = fresh
             for label in track.training:
@@ -295,7 +324,7 @@ class TrackBackend:
             raise Cancelled()
         if cancelled():
             raise Cancelled()
-        if self.attacks is None or self.role in ("piano", "guitar"):
+        if self.attacks is None or not self.monophonic:
             self.attacks = provider.onset_times(self.role, self.model)
         baseline = {
             max(Fraction(0), grid.snap(grid.seconds_to_beat(float(t))))
@@ -337,7 +366,7 @@ class TrackBackend:
                 active.discard(beat)
         active.update(n.start for n in track.notes.authored if start <= n.start < end)
         # Held changes are an explicit backend policy, not raw f0 boundaries.
-        if self.role in ("bass", "vocals") and track.settings.get("stable_pitch_changes", True):
+        if self.monophonic and track.settings.get("stable_pitch_changes", True):
             active.update(
                 grid.snap(grid.seconds_to_beat(t))
                 for t in provider.pitch_changes(t0, t1, self.role, self.model)
@@ -351,7 +380,7 @@ class TrackBackend:
             if cancelled():
                 raise Cancelled()
             ta, tb = max(t0, grid.beat_to_seconds(a)), min(t1, grid.beat_to_seconds(b))
-            if self.role in ("bass", "vocals"):
+            if self.monophonic:
                 answer = provider.block_pitch(ta, tb, self.role, self.model)
                 if answer is None:
                     continue
@@ -372,7 +401,7 @@ class TrackBackend:
                 for answer in provider.block_notes(
                     ta, tb, self.role, self.model,
                     (grid.beat_to_seconds(a + grid.subdivision) - grid.beat_to_seconds(a)) / 2 + 1e-6,
-                )[:int(track.settings.get("polyphony", 8))]:
+                )[:int(track.settings.get("polyphony", 1 if self.role == "bass" else 8))]:
                     stop = min(b, max(a + grid.subdivision, grid.snap(grid.seconds_to_beat(answer.release))))
                     previous = next((
                         n for n in reversed(notes) if n.pitch == answer.midi and n.end == a

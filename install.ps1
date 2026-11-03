@@ -27,6 +27,13 @@ if ($Models) {
     if ($LASTEXITCODE -ne 0) { throw "Model installation failed; MADMoM requires git and MSVC C++ Build Tools on Windows." }
     & $executable -m pip install --no-deps basic-pitch==0.4.0
     if ($LASTEXITCODE -ne 0) { throw "Basic Pitch ONNX package installation failed." }
+    Push-Location $root
+    try {
+        & $executable -c "from audio_to_midi.provision import ensure; ensure('yourmt3', print)"
+        if ($LASTEXITCODE -ne 0) { throw "YourMT3+ environment/checkpoint installation failed." }
+    } finally {
+        Pop-Location
+    }
 }
 Push-Location $root
 try {

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from audio_to_midi import beats as beat_logic
 from audio_to_midi.adapters import Cancelled, MODELS
+from audio_to_midi.model_choices import MADMOM_COMBINATIONS, MODEL_LABELS
 from audio_to_midi.pipeline import Cancelled as PreparationCancelled
 from audio_to_midi.application import (
     CHORD_MODELS, HARMONY_ROLES, TranscriptionService, add_stem, analyze_harmony, complete, covered,
@@ -134,6 +135,8 @@ class ProjectWindow(QMainWindow):
         self.folder: Path | None = None
         self.service = TranscriptionService()
         self.job: Job | None = None
+        self._yourmt3_jobs: dict[str, Job] = {}
+        self._yourmt3_pending: dict[str, tuple] = {}
         self._job_status = ""
         self.pending = None
         self._installing: set[str] = set()
@@ -306,6 +309,16 @@ class ProjectWindow(QMainWindow):
         self.models.setMinimumWidth(150)
         self.models.currentTextChanged.connect(self._model_changed)
         row.addWidget(self.models)
+        self.model_source = QComboBox()
+        self.model_source.addItem("Stem-derived", "stem")
+        self.model_source.addItem("Full-mix-derived", "mix")
+        self.model_source.setToolTip(
+            "YourMT3+ input provenance. Full-mix output is retained separately and filtered "
+            "by instrument program; it is never silently substituted for stem output. "
+            "YourMT3+ exposes no retained note confidence/logits; velocity is not confidence."
+        )
+        self.model_source.currentIndexChanged.connect(self._model_source_changed)
+        row.addWidget(self.model_source)
         self.vocal_panel = QWidget()
         vocal_layout = QHBoxLayout(self.vocal_panel)
         vocal_layout.setContentsMargins(0, 0, 0, 0)
@@ -473,6 +486,10 @@ class ProjectWindow(QMainWindow):
         self.cancel_button.clicked.connect(self._cancel)
         self.cancel_button.hide()
         self.statusBar().addPermanentWidget(self.cancel_button)
+        self.yourmt3_status = StatusLabel()
+        self.yourmt3_status.setMinimumWidth(260)
+        self.yourmt3_status.hide()
+        self.statusBar().addPermanentWidget(self.yourmt3_status)
 
         self.shortcuts: dict[str, QShortcut] = {}
         for key, slot in (
@@ -582,7 +599,7 @@ class ProjectWindow(QMainWindow):
         )
 
     def _update_actions(self) -> None:
-        has_mix, track, busy = bool(self.project.mix_path), self.active, self.job is not None
+        has_mix, track, busy = bool(self.project.mix_path), self.active, bool(self.job or self._yourmt3_jobs)
         tapping = self.tapping
         self.speed_choice.setEnabled(not tapping)
         transcribable = track is not None and track.role != "other"
@@ -678,18 +695,20 @@ class ProjectWindow(QMainWindow):
         track = self.active
         view = self.view
         if track and MODELS[track.role]:
-            self.models.addItems(MODELS[track.role])
+            for name in MODELS[track.role]:
+                self.models.addItem(MODEL_LABELS.get(name, name), name)
             for index in range(self.models.count()):
                 description = MODEL_DESCRIPTIONS.get(self.models.itemText(index))
                 if description:
                     self.models.setItemData(index, description, Qt.ItemDataRole.ToolTipRole)
-            self.models.setCurrentText(track.model)
+            self.models.setCurrentIndex(self.models.findData(track.model))
         elif view == CHORDS:
             for name, text in CHORD_MODELS.items():
                 self.models.addItem(text, name)
             self.models.setCurrentIndex(self.models.findData(self.chord_model))
         self.models.setEnabled(bool(track and MODELS[track.role]) or view == CHORDS)
         self.models.setToolTip("Chord recognizer used by Edit > Detect chords" if view == CHORDS else "")
+        self._sync_model_source()
         self._sync_vocal_controls()
         self._building = False
         self.timeline.set_role(track.role if track else (MIX if view == MIX else None))
@@ -902,16 +921,44 @@ class ProjectWindow(QMainWindow):
                 self._redetect_with(name)
             return
         if not self._building and self.active and model:
+            model = self.models.currentData() or model
             self._cancel(analysis_only=True)
+            self._cancel_yourmt3(self.active.id)
             self.active.model = model
+            if model != "yourmt3":
+                self.active.settings.pop("inference_source", None)
+            self.active.settings.pop("decoder_parameters", None)
             if model in VOCAL_MODELS:
                 self.active.settings.setdefault("vocal_parameters", asdict(VocalParameters()))
             self.active.revision += 1
             self._sync_vocal_controls()
+            self._sync_model_source()
             self._refresh()
             self._queue_visible()
             if model in VOCAL_MODELS and self.active.settings.get("onset_profile"):
                 self.status.setText("Neural vocal models use direct note/onset feedback; the legacy feature profile remains saved for legacy models.")
+
+    def _sync_model_source(self) -> None:
+        track = self.active
+        enabled = bool(track and track.model == "yourmt3")
+        self.model_source.setVisible(enabled)
+        blocked = self.model_source.blockSignals(True)
+        self.model_source.setCurrentIndex(self.model_source.findData(
+            track.settings.get("inference_source", "stem") if track else "stem"))
+        self.model_source.blockSignals(blocked)
+
+    def _model_source_changed(self) -> None:
+        if self._building or not self.active or self.active.model != "yourmt3":
+            return
+        if self.model_source.currentData() == "mix" and not self.project.mix_path:
+            self._sync_model_source()
+            self.status.setText("Import a full mix before choosing mix-derived YourMT3+.")
+            return
+        self._cancel_yourmt3(self.active.id)
+        self.active.settings["inference_source"] = self.model_source.currentData()
+        self.active.revision += 1
+        self._refresh()
+        self._queue_visible()
 
     def _sync_vocal_controls(self) -> None:
         track = self.active
@@ -1022,8 +1069,69 @@ class ProjectWindow(QMainWindow):
                 self.job.cancelled.set()
             return
         self.pending = None
+        self._cancel_yourmt3()
         if self.job:
             self.job.cancelled.set()
+
+    def _cancel_yourmt3(self, track_id: str | None = None) -> None:
+        if track_id is None:
+            self._yourmt3_pending.clear()
+        else:
+            self._yourmt3_pending.pop(track_id, None)
+        for key, job in self._yourmt3_jobs.items():
+            if track_id is None or key == track_id:
+                job.cancelled.set()
+                self.yourmt3_status.setText("Cancelling YourMT3+...")
+
+    def _run_yourmt3(self, project, track, result_token, start, end) -> None:
+        existing = self._yourmt3_jobs.get(track.id)
+        if existing:
+            if existing.result_token == result_token and not existing.cancelled.is_set():
+                self.yourmt3_status.setText("YourMT3+ is already running for this input.")
+                return
+            existing.cancelled.set()
+            # Retry only after this track's cancelled process has actually stopped.
+            self._yourmt3_pending[track.id] = result_token, start, end
+            return
+        service = TranscriptionService()
+        job = Job(lambda cancelled, report: (
+            result_token, service.predict(project, track, start, end, cancelled, report)), self, reports=True)
+        job.result_token = result_token
+        provenance = "full-mix-derived" if track.settings.get("inference_source") == "mix" else "stem-derived"
+        job.result.connect(lambda value: self._guard(lambda: self._accept_yourmt3(value, provenance)))
+        job.progress.connect(self.yourmt3_status.setText)
+        job.error.connect(lambda text: self.yourmt3_status.setText(f"YourMT3+ failed: {text}"))
+        job.finished.connect(lambda: self._yourmt3_finished(track.id, job))
+        self._yourmt3_jobs[track.id] = job
+        self.yourmt3_status.show()
+        self.yourmt3_status.setText(f"YourMT3+ queued ({provenance}).")
+        job.start()
+        self._update_actions()
+
+    def _retry_yourmt3(self, result_token, start, end) -> None:
+        if self.project.id != result_token.project_id:
+            return
+        track = next((t for t in self.project.tracks if t.id == result_token.track_id), None)
+        if track and token(self.project, track) == result_token:
+            self._run_yourmt3(deepcopy(self.project), deepcopy(track), result_token, start, end)
+
+    def _accept_yourmt3(self, value, provenance) -> None:
+        if publish(self.project, *value):
+            self._refresh()
+            self.yourmt3_status.setText(f"YourMT3+ notes updated ({provenance}).")
+        else:
+            self.yourmt3_status.setText("Discarded stale YourMT3+ result; audio/project/model/edits changed.")
+
+    def _yourmt3_finished(self, track_id, job) -> None:
+        if self._yourmt3_jobs.get(track_id) is job:
+            self._yourmt3_jobs.pop(track_id)
+        if job.cancelled.is_set():
+            self.yourmt3_status.setText("YourMT3+ cancelled; no results applied.")
+        job.deleteLater()
+        self._update_actions()
+        pending = self._yourmt3_pending.pop(track_id, None)
+        if pending:
+            self._retry_yourmt3(*pending)
 
     # -- note analysis ----------------------------------------------------
     def _queue_visible(self) -> None:
@@ -1042,13 +1150,14 @@ class ProjectWindow(QMainWindow):
         model = self.active.model
         if whole and model in VOCAL_MODELS:
             raise ValueError("Neural vocal models only process visible bars. Navigate to another window to analyze it.")
-        license_key = "madmom_license_acknowledged" if model in VOCAL_MODELS else "license_acknowledged"
+        license_key = "madmom_license_acknowledged" if model in (*VOCAL_MODELS, *MADMOM_COMBINATIONS) else "license_acknowledged"
         terms = (
             "ADTOF weights are licensed for non-commercial use only. "
             if model == "adtof" else
             "Review the Piano-HR checkpoint's terms before relying on its output. " if model == "piano_hr" else
             "MADMoM onset weights are CC BY-NC-SA 4.0 (non-commercial). Commercial use needs appropriate permission. "
-            "First installation requires git and, on Windows, MSVC C++ Build Tools. " if model in VOCAL_MODELS else ""
+            "First installation requires git and, on Windows, MSVC C++ Build Tools. "
+            if model in (*VOCAL_MODELS, *MADMOM_COMBINATIONS) else ""
         )
         needs = provision.missing(model)
         if needs:
@@ -1064,11 +1173,13 @@ class ProjectWindow(QMainWindow):
                 return
             self.active.settings[license_key] = True
             self._installing.add(model)
+            install_token = token(self.project, self.active)
 
             def installed(_value, whole=whole):
                 self._installing.discard(model)
                 self.status.setText(f"{provision.LABELS.get(model, model)} is ready.")
-                self._analyze(whole)
+                if self.active and token(self.project, self.active) == install_token:
+                    self._analyze(whole)
 
             def install(cancel, report):
                 try:
@@ -1103,6 +1214,9 @@ class ProjectWindow(QMainWindow):
         ):
             raise ValueError("Neural vocal analysis must stay inside the current visible window.")
         result_token = token(self.project, self.project.track(track_id))
+        if track.model == "yourmt3":
+            self._run_yourmt3(project, track, result_token, start, end)
+            return
         chunk_end = min(end, start + project.grid.bar_beats * 2) if whole else end
 
         def accept(value):
@@ -1598,6 +1712,7 @@ class ProjectWindow(QMainWindow):
                 ) != QMessageBox.StandardButton.Yes:
                     continue
                 replace_stem(self.project, existing, path)
+                self._cancel_yourmt3(existing.id)
                 last = existing
             else:
                 last = add_stem(self.project, path, role)
@@ -2336,7 +2451,7 @@ class ProjectWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._cancel()
         self._stop()
-        if self.job and self.job.isRunning():
+        if (self.job and self.job.isRunning()) or any(j.isRunning() for j in self._yourmt3_jobs.values()):
             self.status.setText("Waiting for the current task to stop; close again when idle.")
             event.ignore()
             return

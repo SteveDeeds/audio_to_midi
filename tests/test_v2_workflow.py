@@ -37,6 +37,8 @@ class WorkflowTests(unittest.TestCase):
         self.project = Project.create("Test", Grid(120, 6, 8, F(1, 6)))
         self.project.key = "C"
         self.track = app.add_stem(self.project, self.wav, "bass")
+        self.track.model = "madmom_cnn_full"
+        self.track.settings["madmom_license_acknowledged"] = True
 
     def test_role_models_and_alignment(self):
         with self.assertRaisesRegex(ValueError, "already exists"):
@@ -251,6 +253,7 @@ class WorkflowTests(unittest.TestCase):
     def test_vocal_held_note_teaches_no_restrikes_without_marker_cleanup(self):
         self.project.grid = Grid(120, 4, 4)
         self.track.role = "vocals"
+        self.track.model = "pyin"
         self.track.notes.author(F(0), F(2), 60)
         for i in range(1, 8):
             app.record_onset(self.track, F(i, 4), True)
@@ -281,6 +284,7 @@ class WorkflowTests(unittest.TestCase):
     def test_vocal_note_labels_preserve_repeated_syllables_and_half_grid_releases(self):
         self.project.grid = Grid(120, 4, 4)
         self.track.role = "vocals"
+        self.track.model = "pyin"
         self.track.notes.author(F(0), F(7, 8), 60)
         self.track.notes.author(F(1), F(2), 60)
         app.record_onset(self.track, F(1, 2), True)
@@ -375,6 +379,8 @@ class WorkflowTests(unittest.TestCase):
 
         class Fake:
             _act = None
+            ready = True
+            _defaults = adtof_drums.DEFAULT_THRESHOLDS
             def __init__(self, *args):
                 pass
             def prepare(self):

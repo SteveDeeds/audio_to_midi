@@ -74,8 +74,13 @@ def compute_activations(audio_44k: np.ndarray) -> np.ndarray:
     processor = create_adtof_processor()
     audio = np.asarray(audio_44k, dtype=np.float32)
     feats = processor.apply_filterbank(processor.compute_stft(audio)).T[None, :, :, None]
-    with torch.inference_mode():
-        return model(torch.from_numpy(np.ascontiguousarray(feats))).numpy()[0]
+    from core.inference_runtime import neural_device
+    with neural_device() as device, torch.inference_mode():
+        model.to(device)
+        try:
+            return model(torch.from_numpy(np.ascontiguousarray(feats)).to(device)).cpu().numpy()[0]
+        finally:
+            model.cpu()
 
 
 def peak_novelty(activations: np.ndarray) -> np.ndarray:
@@ -140,13 +145,14 @@ class DrumHit:
 class AdtofDrumTranscriber:
     """Cache ADTOF activations for one stem and re-pick hits as the user edits."""
 
-    def __init__(self, wav_path: str):
+    def __init__(self, wav_path: str, thresholds=DEFAULT_THRESHOLDS):
         self.wav_path = str(wav_path)
         self._lock = threading.RLock()
         self._act: np.ndarray | None = None
         self._novelty: np.ndarray | None = None
         self._feedback: dict[tuple[float, int], tuple[float, float, bool]] = {}
-        self._thresholds = list(DEFAULT_THRESHOLDS)
+        self._defaults = tuple(thresholds)
+        self._thresholds = list(thresholds)
         self._relabels: list[tuple[int, np.ndarray, int]] = []
         self._keeps: list[tuple[int, np.ndarray]] = []
         self._hits: tuple[DrumHit, ...] | None = None
@@ -243,7 +249,7 @@ class AdtofDrumTranscriber:
                 else:
                     rejected[cls].append(value)
         self._thresholds = [
-            fit_threshold(confirmed[c], rejected[c], DEFAULT_THRESHOLDS[c])
+            fit_threshold(confirmed[c], rejected[c], self._defaults[c])
             for c in range(len(CLASS_NAMES))
         ]
         self._relabels, self._keeps = relabels, keeps

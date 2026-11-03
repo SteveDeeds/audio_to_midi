@@ -34,7 +34,8 @@ def parser() -> argparse.ArgumentParser:
     analyze.add_argument("role")
     analyze.add_argument("--start", type=Fraction, default=Fraction(0))
     analyze.add_argument("--end", type=Fraction)
-    analyze.add_argument("--accept-noncommercial", action="store_true", help="Acknowledge ADTOF non-commercial weight restriction")
+    analyze.add_argument("--source", choices=["stem", "mix"], help="YourMT3+ input provenance; mix output is program-filtered")
+    analyze.add_argument("--accept-noncommercial", action="store_true", help="Acknowledge ADTOF/MADMoM non-commercial weights")
     analyze.add_argument("--accept-checkpoint-terms", action="store_true", help="Acknowledge piano-HR terms and possible checkpoint download")
     commands.add_parser("gui", help="Open the project editor").add_argument("folder", type=Path, nargs="?")
     commands.add_parser("info").add_argument("folder", type=Path)
@@ -171,8 +172,20 @@ def main(argv: list[str] | None = None) -> int:
             save_project(project, args.folder)
         elif args.command == "transcribe":
             track = _track_for_role(project, args.role)
-            if track.role == "drums" and not args.accept_noncommercial:
+            from audio_to_midi.model_choices import MADMOM_COMBINATIONS
+            from audio_to_midi.vocal_settings import VOCAL_MODELS
+            if args.source:
+                if track.model != "yourmt3":
+                    raise ValueError("--source is only supported by YourMT3+.")
+                if args.source == "mix" and not project.mix_path:
+                    raise ValueError("Mix-derived YourMT3+ requires a full mix.")
+                track.settings["inference_source"] = args.source
+            if track.model == "adtof" and not args.accept_noncommercial:
                 raise ValueError("ADTOF weights are non-commercial. Pass --accept-noncommercial to acknowledge.")
+            if track.model in (*VOCAL_MODELS, *MADMOM_COMBINATIONS):
+                if not args.accept_noncommercial:
+                    raise ValueError("MADMoM onset weights are non-commercial. Pass --accept-noncommercial to acknowledge.")
+                track.settings["madmom_license_acknowledged"] = True
             if track.model == "piano_hr" and not args.accept_checkpoint_terms:
                 raise ValueError("Review piano-HR checkpoint terms, then use --accept-checkpoint-terms to allow loading/downloading.")
             if args.accept_noncommercial or args.accept_checkpoint_terms:
@@ -182,7 +195,7 @@ def main(argv: list[str] | None = None) -> int:
             provision.ensure(track.model, progress=print)
             end = args.end if args.end is not None else track_end(project, track)
             result_token = token(project, track)
-            result = TranscriptionService().predict(project, track, args.start, end)
+            result = TranscriptionService().predict(project, track, args.start, end, report=print)
             if not publish(project, result_token, result):
                 raise RuntimeError("Prediction became stale before publication.")
             save_project(project, args.folder)

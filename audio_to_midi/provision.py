@@ -10,6 +10,7 @@ from importlib import invalidate_caches, util
 import os
 from pathlib import Path
 import sys
+import subprocess
 import urllib.request
 
 from audio_to_midi.pipeline import Cancelled, PreparationError, _run_process
@@ -28,6 +29,9 @@ FEATURES: dict[str, list[tuple[str, list[str]]]] = {
     "crepe_full": _CREPE,
     "madmom_cnn": _MADMOM,
     "madmom_brnn": _MADMOM,
+    "madmom_cnn_full": _MADMOM,
+    "madmom_brnn_full": _MADMOM,
+    "yourmt3": [],
     # basic-pitch 0.4.0 declares TensorFlow, which has no Python 3.12 wheel; it runs on ONNX here.
     "basic_pitch": [
         ("onnxruntime", ["onnxruntime>=1.16"]), ("resampy", ["resampy>=0.4,<0.4.3"]),
@@ -45,6 +49,8 @@ LABELS = {
     "crepe_tiny": "CREPE", "crepe_full": "CREPE", "basic_pitch": "Basic Pitch", "piano_hr": "Piano-HR",
     "adtof": "ADTOF", "demucs": "Demucs", "btc": "BTC chord model",
     "madmom_cnn": "MADMoM CNN vocals", "madmom_brnn": "MADMoM BRNN vocals",
+    "madmom_cnn_full": "madmom CNN + CREPE full",
+    "madmom_brnn_full": "madmom offline BRNN + CREPE full", "yourmt3": "YourMT3+",
 }
 PIANO_HR_URL = "https://zenodo.org/record/4034264/files/CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1"
 PIANO_HR_MIN_BYTES = 1.6e8  # the library re-downloads anything smaller
@@ -63,6 +69,17 @@ def _requirements(feature: str) -> list[tuple[str, list[str]]]:
 def missing(feature: str) -> list[str]:
     """What first use of ``feature`` would install or download (empty when ready)."""
     needs = [args[-1] for module, args in _requirements(feature) if not _installed(module)]
+    if feature == "yourmt3":
+        from audio_to_midi.yourmt3 import interpreter, checkpoint
+        result = subprocess.run(
+            [interpreter(), "-c", "from importlib.metadata import version; "
+             "print(version('mt3-infer'), version('transformers'))"],
+            capture_output=True, text=True, timeout=30,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if result.returncode or result.stdout.strip() != "0.2.0 4.45.1":
+            needs.append("isolated mt3-infer==0.2.0 environment")
+        if not checkpoint().is_file():
+            needs.append("YourMT3+ MoE noPS checkpoint (~536 MB)")
     if feature == "piano_hr" and not _checkpoint_ready():
         needs.append("Piano-HR checkpoint (~165 MB)")
     if feature == "btc" and not _btc_ready():
@@ -84,6 +101,27 @@ def ensure(feature: str, progress=None, cancel=None) -> None:
     """Install whatever ``feature`` lacks; no-op when everything is present."""
     report = progress or (lambda text: None)
     label = LABELS.get(feature, feature)
+    if feature == "yourmt3":
+        from audio_to_midi.yourmt3 import (
+            CHECKPOINT_SHA256, CHECKPOINT_URL, ENVIRONMENT, checkpoint, interpreter,
+        )
+        from audio_to_midi.evidence_cache import checksum
+        needs = missing(feature)
+        if any("environment" in n for n in needs):
+            if not os.environ.get("ATM_YOURMT3_PYTHON"):
+                _run_process([sys.executable, "-m", "venv", str(ENVIRONMENT)],
+                             cancel=cancel, progress=report, name="Creating YourMT3+ environment")
+            _run_process([interpreter(), "-m", "pip", "install", "--disable-pip-version-check",
+                          "--progress-bar", "off", "mt3-infer==0.2.0", "transformers==4.45.1"],
+                         cancel=cancel, progress=report, name="Installing YourMT3+")
+        if not checkpoint().is_file():
+            download(CHECKPOINT_URL, checkpoint(), "YourMT3+ checkpoint", report, cancel)
+            if checksum(checkpoint()) != CHECKPOINT_SHA256:
+                checkpoint().unlink(missing_ok=True)
+                raise RuntimeError("YourMT3+ checkpoint checksum mismatch; download rejected.")
+        if missing(feature):
+            raise RuntimeError("YourMT3+ installation did not complete.")
+        return
     for module, args in _requirements(feature):
         if _installed(module):
             continue

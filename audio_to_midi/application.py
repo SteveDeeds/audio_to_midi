@@ -17,6 +17,7 @@ from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.adapters import MODELS, Prediction, TrackBackend, normalize_key
 from audio_to_midi.notation import preferred_key
 from audio_to_midi.vocal_settings import VOCAL_MODELS
+from audio_to_midi.evidence_cache import checksum
 
 
 def add_stem(project: Project, path: Path, role: str) -> Track:
@@ -172,6 +173,7 @@ class TranscriptionService:
     def predict(
         self, project: Project, track: Track, start: Fraction, end: Fraction,
         cancelled: Callable[[], bool] = lambda: False,
+        report: Callable[[str], None] = lambda text: None,
     ) -> Prediction:
         if start < 0 or end <= start or end > track_end(project, track):
             raise ValueError("Invalid transcription interval.")
@@ -179,10 +181,14 @@ class TranscriptionService:
             raise ValueError("Transcription starts must lie on the selected onset grid.")
         backend_key = repr((
             project.id, track.id, media_identity(track.audio_path),
+            checksum(Path(track.audio_path)),
             project.grid, project.key, track.model,
             harmony_identity(project),
+            [(path, checksum(Path(path))) for path, _, _ in harmony_identity(project)],
             track.settings.get("license_acknowledged", False),
             track.settings.get("madmom_license_acknowledged", False),
+            track.settings.get("inference_source", "stem"),
+            track.settings.get("decoder_parameters", {}),
         ))
         cached = self._backends.get(track.id)
         if cached is None or cached[0] != backend_key:
@@ -190,7 +196,7 @@ class TranscriptionService:
             self._backends[track.id] = backend_key, backend
         else:
             backend = cached[1]
-        return backend.predict(track, start, end, cancelled)
+        return backend.predict(track, start, end, cancelled, report)
 
 
 def record_onset(track: Track, beat: Fraction, keep: bool) -> None:

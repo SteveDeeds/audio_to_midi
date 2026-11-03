@@ -31,13 +31,26 @@ use Python 3.12 and run:
 
 The base installation supports the editor, MIDI import/export, the `pyin`
 vocal model, and mix preparation. Everything else installs itself the first
-time you use it: when you pick a model (CREPE, Basic Pitch, Piano-HR, ADTOF) or
+time you use it: when you pick a model (CREPE, Basic Pitch, Piano-HR, ADTOF, YourMT3+) or
 run **Separate stems**, the app asks once, then pip-installs the packages into
 the Python it is running on and downloads the weights to their usual cache. You
 never choose a Python or a model folder. This needs an internet connection the
 first time; the status bar shows progress, and **Cancel** stops it. ADTOF needs
 `git` on PATH. ADTOF drum weights are non-commercial; review the piano-HR
 checkpoint terms before relying on it.
+
+YourMT3+ uses a separate, automatically created environment at
+`~/.audio_to_midi/yourmt3` with the validated `mt3-infer==0.2.0` adapter and
+`transformers==4.45.1` runtime.
+Its MoE multi-track no-pitch-shift checkpoint (the bake-off's YourMT3+ variant)
+is downloaded once to `~/.cache/mt3-infer/yourmt3`. GPU inference is used when
+available, with supported CPU fallback. `ATM_DEVICE=auto|cpu|cuda` controls
+device selection; explicitly requesting unavailable CUDA reports an error.
+App inference/separation workers coordinate exclusive GPU ownership. Faster
+models fall back to CPU while the YourMT3+ worker uses GPU, rather than queueing
+behind it. External programs/benchmark processes do not participate in this lock.
+Advanced deployments can set `ATM_YOURMT3_PYTHON` and
+`ATM_YOURMT3_CHECKPOINT`; checkpoint bytes remain part of cache identity.
 
 The optional `madmom_cnn` and `madmom_brnn` vocal models also install on first
 use. Their onset weights are **CC BY-NC-SA 4.0 (non-commercial)**; the app asks
@@ -66,8 +79,9 @@ workers, and chord-analysis pipeline have been removed. Chord symbols, voicings,
 and template recognition now live in `audio_to_midi.chords`; the shared
 key-to-scale helper remains in `core.chord_analysis`.
 This does not delete or migrate any projects,
-audio, MIDI, profiles, logs, or model caches. Existing project-editor projects
-and preferences keep their current formats and settings location. Compatible
+audio, MIDI, profiles, logs, or model caches. The current project format is
+**schema 4**; schema 3 projects still open with unknown note confidence.
+Older schemas and unsupported model aliases are rejected. Preferences keep their current settings location. Compatible
 onset examples can still be imported from older profiles; legacy session state
 is not converted automatically.
 
@@ -211,12 +225,101 @@ track per role. `other` is harmony context only and produces no notes.
 
 Choose a stem in **Track** and its **Model** next to it:
 
-| Role | Models |
+| Role | Models, in ranked order |
 |---|---|
-| Bass | `crepe_tiny`, `crepe_full` |
-| Vocals | `pyin`, `crepe_full`, `crepe_tiny` |
-| Piano / guitar | `basic_pitch`, `piano_hr` |
-| Drums | `adtof` |
+| Bass | Piano HR; madmom offline BRNN + CREPE full; madmom CNN + CREPE full |
+| Guitar | Basic Pitch; YourMT3+; madmom CNN + CREPE full |
+| Piano | Piano HR; YourMT3+; Basic Pitch |
+| Drums | ADTOF; YourMT3+ |
+| Vocals (unchanged, not bake-off ranked) | `pyin`, `crepe_full`, `crepe_tiny`, `madmom_cnn`, `madmom_brnn` |
+
+MR-MT3 is not offered. Basic Pitch replaces the effectively tied MR-MT3 piano
+choice; drums have only two ranked choices. Bass Piano HR is filtered to MIDI
+28-67. The instrumental madmom combinations use range-limited CREPE-full pitch
+(bass 32.71-420 Hz; guitar 75-1400 Hz) and either CNN onsets or the offline
+bidirectional RNN detector. They do **not** use the vocal syllable pipeline.
+They retain the existing onset-grid editing, feedback and duration policies.
+
+### YourMT3+ background results and provenance
+
+YourMT3+ inference runs in its own worker/subprocess, independent of the
+ordinary analysis lane. Other model results, editing and navigation do not
+wait for it. A separate status field reports queueing, model loading, segment
+progress, decoding, cancellation and failures. Duplicate requests for the same
+track/input are not launched twice. Changing its model or source cancels that
+track's job; changing/opening projects or importing a new mix cancels all jobs.
+Publication tokens reject results after audio, grid, model, source or edits change.
+Esc/Cancel also terminates the inference subprocess, including during loading.
+
+Choose **Stem-derived** or **Full-mix-derived** beside the YourMT3+ selector.
+Both outputs are cached separately; no source is silently substituted.
+Full-mix evidence retains all decoded instruments; piano/guitar track proposals
+select GM program families 0-7/24-31, and drums select drum flags. Stem-derived
+pitched proposals keep all non-drum predictions, including instrument
+misclassifications. The full-mix option is especially useful for piano:
+reviewed mix F1 was 0.810 versus 0.722 on the piano stem. These are historical
+scores, not retuned defaults. Visible-bar analysis publishes only its requested
+interval, even though the reusable inference covers the whole input.
+CLI: `transcribe <project> piano --source mix` (select `yourmt3` on that track first).
+
+### Disposable evidence cache and threshold replay
+
+Inference evidence lives under the app's **`cache/inference/v1`** folder
+(`ATM_CACHE_DIR` overrides the cache root), not in project manifests or benchmark
+evidence directories. Reopening, switching models and changing decoding
+thresholds reuse it. Deleting the cache folder is safe: missing evidence is
+regenerated when needed without cache-missing warnings or dialogs.
+Actual invalid/corrupt entries report an explicit error naming the entry to
+delete; they are not silently discarded or overwritten.
+
+Keys include content hashes, mix/stem role provenance, model/package and
+checkpoint identity, inference parameters and evidence schema version.
+Writes are atomic, arrays are validated/checksummed, and per-key OS locks avoid
+duplicate inference. The two compatible madmom combinations share CREPE-full
+evidence. Preserved evidence includes Basic Pitch onset/frame/contour matrices;
+Piano HR continuous onset/offset/frame/velocity and pedal planes; untouched
+CREPE pitch-bin activations, unmasked F0, periodicity and smoothed periodicity;
+pYIN unmasked F0, voiced flags/probabilities; madmom onset curves; ADTOF class
+activations/novelty; and YourMT3+ decoded note times, pitches, programs,
+velocities and drum flags. Neural vocal windows retain their existing bounds.
+Threshold-dependent grid notes and feedback are replayed separately from
+these inference archives, not treated as reusable neural evidence.
+
+The **AI notes: None -- All** slider filters existing predictions using their
+model-specific evidence scores; it does not change decoder thresholds or rerun
+inference. The existing vocal parameter controls still work. The backend
+`decoder_parameters` API supports native onset/frame thresholds for Basic
+Pitch/Piano HR, onset/voicing thresholds for instrumental madmom, novelty
+thresholds for ADTOF, and voicing thresholds for legacy CREPE/pYIN. These are
+not a shared calibrated confidence scale. Zero does not create every possible
+note: local maxima, frequency ranges, voicing/energy, duration, grid and
+structural decoding policies still apply.
+
+**YourMT3+ does not support faithful confidence replay.** Inspection of the
+validated adapter's `forward`/`decode`, vendored `inference_file`, and
+`t5mod_helper` generation confirms that token logits are reduced to argmax
+IDs and not returned/retained; teacher-forced loss is absent without reference
+tokens. Decode returns MIDI notes/programs/drum flags/velocities, not note
+probabilities. Retaining autoregressive token scores and defining a defensible
+token-to-note confidence would require a materially different interface and
+semantics. Velocity is never used as confidence. Threshold requests for this
+backend are explicitly rejected. The source selector tooltip explains this
+limitation. YourMT3+ notes have unknown confidence: they appear at **All** and
+are hidden at lower slider positions, without treating velocity as confidence.
+
+Validation covers the app's model choices/project schema, worker cancellation
+and stale publication, disk-cache reuse/invalidation/corruption, and native
+threshold replay. Opt-in real-checkpoint smoke tests exercise all 19 exposed
+role/model/source combinations, reopen the project, and forbid neural inference
+while replaying cached evidence (including thresholds 0, 0.8 and 1).
+Run these opt-in tests with both GPU/auto and CPU settings; benchmark scores/references are not
+changed. To repeat the real-model check in a provisioned environment:
+
+```powershell
+$env:ATM_RUN_MODEL_TESTS = "1"
+$env:ATM_DEVICE = "auto" # repeat with "cpu"
+python -m unittest tests.test_models_live
+```
 
 ### Choosing how many AI notes to keep
 
@@ -285,7 +388,8 @@ model predicts piano key velocities itself. Drum velocity is the RMS level at
 each hit in that kit piece's band (kick 30-150 Hz, snare 150 Hz-5 kHz, toms
 60-600 Hz, hi-hat 6-16 kHz, cymbals 4-16 kHz), so a kick and a hi-hat on the
 same beat are measured separately; each piece is scaled to its own loudest
-hits. Notes you draw start at 100.
+hits. YourMT3+ preserves its decoded velocities, without interpreting them as
+confidence. Notes you draw start at 100.
 
 ### Syllable-aware vocals
 
