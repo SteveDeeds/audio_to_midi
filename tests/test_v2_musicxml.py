@@ -50,10 +50,36 @@ class MusicXMLTests(unittest.TestCase):
         self.assertEqual(bass.findtext("score-instrument/instrument-sound"), "pluck.bass.electric")
         self.assertEqual(bass.findtext("midi-instrument/midi-program"), "34")
         drums = root.find("part-list/score-part[@id='P3']")
-        self.assertEqual(drums.findtext("score-instrument/instrument-name"), "Bass Drum")
+        self.assertEqual(drums.findtext("score-instrument/instrument-name"), "Drum Kit")
         self.assertEqual(drums.findtext("score-instrument/instrument-sound"), "drum.group.set")
         self.assertEqual(drums.findtext("midi-instrument/midi-channel"), "10")
         self.assertEqual(drums.findtext("midi-instrument/midi-unpitched"), "37")
+
+    def test_drum_kit_identity_precedes_piece_names_without_changing_hit_mapping(self):
+        for pitches in ((36, 38, 42), (38, 42), (42,)):
+            with self.subTest(pitches=pitches):
+                project = Project.create("Drums", Grid())
+                track = Track("drums", "drums", "", 4, 8000, "")
+                for pitch in pitches:
+                    track.notes.author(F(0), F(1), pitch)
+                project.tracks.append(track)
+                root = ET.fromstring(score_xml(project))
+                instruments = root.findall("part-list/score-part/score-instrument")
+                self.assertEqual(instruments[0].findtext("instrument-name"), "Drum Kit")
+                piece_names = {38: "Snare", 42: "Closed Hi-Hat"}
+                self.assertEqual(
+                    [i.findtext("instrument-name") for i in instruments[1:]],
+                    [piece_names[p] for p in pitches[1:]],
+                )
+                mappings = {
+                    i.get("id"): int(i.findtext("midi-unpitched")) - 1
+                    for i in root.findall("part-list/score-part/midi-instrument")
+                }
+                self.assertCountEqual(
+                    [mappings[n.find("instrument").get("id")]
+                     for n in root.findall(".//note[unpitched]")],
+                    list(pitches),
+                )
 
     def test_one_elapsed_time_average_tempo_without_mutating_project(self):
         project = self.project()

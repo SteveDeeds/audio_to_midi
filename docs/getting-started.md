@@ -605,7 +605,13 @@ The setting is remembered.
   writing a partial file.
 - **File > Export score (MusicXML)...** writes a MuseScore-ready score with
   the transcribed tracks and the chord symbols on the top staff. Bass and drums
-  are named **Electric Bass** and **Drum Kit**. Scores and chord-only lead sheets
+  are named **Electric Bass** and **Drum Kit**. The first drum instrument is also
+  named **Drum Kit** so MuseScore selects full-kit playback rather than a single
+  percussion instrument; individual GM drum pitches are unchanged. MuseScore's
+  own MusicXML re-export can replace that name with **Bass Drum**, causing wrong
+  sounds on reimport. Keep the native `.mscz` file after editing, or use a fresh
+  app export.
+  Scores and chord-only lead sheets
   have one opening tempo: total quarter-note beats divided by elapsed time
   between the first and last timing anchors (or the set BPM without a timing
   map). No later tempo changes are exported, even for playback. MIDI retains

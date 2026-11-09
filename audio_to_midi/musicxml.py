@@ -666,7 +666,9 @@ def score_xml(
         if part.role == "drums":
             for pitch in part.drums:
                 instrument = _sub(score_part, "score-instrument", id=f"{part.id}-I{pitch + 1}")
-                _sub(instrument, "instrument-name", drum_piece(pitch).name)
+                # MuseScore chooses its playback instrument from the first name, even with instrument-sound.
+                name = part.instrument.name if pitch == part.drums[0] else drum_piece(pitch).name
+                _sub(instrument, "instrument-name", name)
                 _sub(instrument, "instrument-sound", part.instrument.sound)
             for pitch in part.drums:
                 midi = _sub(score_part, "midi-instrument", id=f"{part.id}-I{pitch + 1}")
