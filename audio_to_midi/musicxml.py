@@ -43,10 +43,11 @@ INSTRUMENTS = {
     "vocals": Instrument("Voice", "Vo.", "voice.vocals", 54, (("G", 2, 0),)),
     "guitar": Instrument("Guitar", "Gtr.", "pluck.guitar.electric", 28, (("G", 2, -1),), 1),
     "piano": Instrument("Piano", "Pno.", "keyboard.piano", 1, (("G", 2, 0), ("F", 4, 0))),
+    "other": Instrument("Other", "Oth.", "keyboard.piano", 1, (("G", 2, 0),)),
     "bass": Instrument("Electric Bass", "El. Bs.", "pluck.bass.electric", 34, (("F", 4, 0),), 1),
     "drums": Instrument("Drum Kit", "D. Kit", "drum.group.set", 1, (("percussion", None, 0),)),
 }
-ROLE_ORDER = ("vocals", "guitar", "piano", "bass", "drums")
+ROLE_ORDER = ("vocals", "guitar", "piano", "other", "bass", "drums")
 MONOPHONIC = frozenset({"vocals", "bass"})
 PIANO_SPLIT = 60  # middle C and above on the treble staff
 LOW_VOICE = 60  # vocal lines with a lower median pitch use the octave treble clef

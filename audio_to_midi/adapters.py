@@ -71,7 +71,8 @@ class TrackBackend:
         self.duration = len(self.audio) / self.sr
         self.project_key = project.key
         self.provider = None
-        self._feature_data = None
+        self._feature_windows: dict[int, tuple] = {}
+        self._legacy_features = bool(track.settings.get("onset_profile"))
         self._cqt_data = None
         self._drum_levels = None
         self._path = track.audio_path
@@ -97,8 +98,6 @@ class TrackBackend:
         self._other_path = next((t.audio_path for t in project.tracks if t.role == "other"), None)
 
     def _check_provider(self) -> None:
-        if self.role == "other":
-            raise ValueError("Other is harmony context only; it has no MIDI provider.")
         if self.model not in MODELS[self.role]:
             raise ValueError(f"Unsupported {self.role} model: {self.model}")
         if self.provider is not None:
@@ -144,7 +143,7 @@ class TrackBackend:
             provider._context = scale, harmony_times, harmony
             provider._context_window = None
             self.provider = provider
-        elif self.role in ("bass", "piano", "guitar"):
+        elif self.role in ("bass", "piano", "guitar", "other"):
             from audio_to_midi.evidence_providers import EvidencePolyTranscriber
             self.provider = EvidencePolyTranscriber(self.audio, self.sr, self._path, self._decoder_parameters)
         else:
@@ -176,17 +175,26 @@ class TrackBackend:
             return cached
         time = self.grid.beat_to_seconds(beat)
         half = (self.grid.beat_to_seconds(beat + self.grid.subdivision) - time) / 2
-        if self._feature_data is None:
+        # Imported profiles retain the exact whole-stem feature normalization.
+        window = -1 if self._legacy_features else int(
+            max(0.0, min(time, self.duration - 1 / self.sr)) // 4)
+        data = self._feature_windows.get(window)
+        if data is None:
+            first = 0 if window < 0 else max(0, int((window * 4 - 2) * self.sr) // 512 * 512)
+            last = len(self.audio) if window < 0 else min(len(self.audio), int((window * 4 + 6) * self.sr))
+            audio = self.audio[first:last]
+            offset = first / self.sr
             smooth = max(16, int(0.028 * self.sr))
-            envelope = np.convolve(np.abs(self.audio).astype(float), np.ones(smooth) / smooth, mode="same")
+            envelope = np.convolve(np.abs(audio).astype(float), np.ones(smooth) / smooth, mode="same")
             samples = np.arange(0, len(envelope), 512)
             chroma = librosa.feature.chroma_cqt(
-                y=self.audio, sr=self.sr, hop_length=512, bins_per_octave=36,
+                y=audio, sr=self.sr, hop_length=512, bins_per_octave=36,
             )
             cqt_times, magnitude = self._cqt()
-            times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr, hop_length=512)
-            self._feature_data = samples / self.sr, envelope[samples], times, chroma, cqt_times, magnitude
-        env_times, envelope, times, chroma, cqt_times, magnitude = self._feature_data
+            times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr, hop_length=512) + offset
+            data = samples / self.sr + offset, envelope[samples], times, chroma, cqt_times, magnitude
+            self._feature_windows[window] = data
+        env_times, envelope, times, chroma, cqt_times, magnitude = data
         a, b = max(0.0, time - half), min(self.duration, time + half)
         transient = onset_features.transient_intensity(env_times, envelope, a, b)
         delta = onset_features.chroma_delta(times, chroma, time, half * 2)
@@ -320,12 +328,19 @@ class TrackBackend:
                 raise Cancelled()
             return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
 
+        from audio_to_midi.evidence_providers import EvidencePolyTranscriber, InstrumentOnsetTranscriber
+        if isinstance(provider, (EvidencePolyTranscriber, InstrumentOnsetTranscriber)):
+            provider.report = report
         if not provider.prepare(t0, t1, self.role, self.model, should_cancel=cancelled):
             raise Cancelled()
         if cancelled():
             raise Cancelled()
-        if self.attacks is None or not self.monophonic:
-            self.attacks = provider.onset_times(self.role, self.model)
+        self.attacks = provider.onset_times(self.role, self.model)
+        report("Applying learned edits and measuring note dynamics...")
+        legacy_features = bool(track.settings.get("onset_profile"))
+        if legacy_features != self._legacy_features:
+            self.features.clear()
+            self._legacy_features = legacy_features
         baseline = {
             max(Fraction(0), grid.snap(grid.seconds_to_beat(float(t))))
             for t in self.attacks

@@ -40,11 +40,11 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(arrays["activation"].shape, (3, 2))
 
     def test_exact_rankings_no_mrmt3_and_vocals_unchanged(self):
-        self.assertEqual(MODELS["bass"], ("piano_hr", "madmom_brnn_full", "madmom_cnn_full"))
+        self.assertEqual(MODELS["bass"], ("madmom_cnn_full", "piano_hr", "madmom_brnn_full"))
         self.assertEqual(MODELS["guitar"], ("basic_pitch", "yourmt3", "madmom_cnn_full"))
         self.assertEqual(MODELS["piano"], ("piano_hr", "yourmt3", "basic_pitch"))
         self.assertEqual(MODELS["drums"], ("adtof", "yourmt3"))
-        self.assertEqual(MODELS["other"], ())
+        self.assertEqual(MODELS["other"], ("basic_pitch", "yourmt3", "piano_hr"))
         self.assertEqual(MODELS["vocals"], ("pyin", "crepe_full", "crepe_tiny", "madmom_cnn", "madmom_brnn"))
         self.assertFalse(any("mr_mt3" in choices for choices in MODELS.values()))
 
@@ -60,12 +60,147 @@ class EvidenceTests(unittest.TestCase):
         }
         with patch.dict(sys.modules, modules):
             events = replay_poly("basic_pitch", arrays, "piano", {})
+            self.assertEqual(replay_poly("basic_pitch", arrays, "other", {}), events)
         self.assertEqual(events, [(0.0, .5, 60, .81, .81)])
         provider = EvidencePolyTranscriber(np.ones(8000), 8000, self.root / "stem.wav", {})
         with patch("audio_to_midi.evidence_providers.file_evidence", return_value=arrays), \
                 patch("audio_to_midi.evidence_providers.replay_poly", return_value=events):
             provider.prepare(0, 1, "piano", "basic_pitch")
         self.assertAlmostEqual(provider.block_notes(0, .5, "piano", "basic_pitch", .01)[0].confidence, .81)
+
+    def test_instrumental_pitch_and_onsets_are_cropped_cached_and_offset(self):
+        from audio_to_midi.evidence_providers import InstrumentOnsetTranscriber
+
+        sr = 8000
+        provider = InstrumentOnsetTranscriber(np.ones(sr * 220, dtype=np.float32), sr,
+                                             self.root / "bass.wav", {})
+        lengths = []
+
+        def pitch(audio, rate, *args, **kwargs):
+            lengths.append(len(audio) / rate)
+            return {"t": np.arange(len(audio) // 80) / 100}
+
+        modules = {
+            "madmom.features.onsets": SimpleNamespace(
+                OnsetPeakPickingProcessor=lambda **kwargs: lambda activation: np.array([.5])),
+        }
+        with patch("audio_to_midi.evidence_providers.pitch_evidence", side_effect=pitch) as infer, \
+                patch("audio_to_midi.evidence_providers.onset_evidence",
+                      return_value={"onset": np.ones(250)}), \
+                patch("audio_to_midi.evidence_providers.replay_pitch",
+                      side_effect=lambda model, arrays, parameters:
+                      (arrays["t"], np.full(len(arrays["t"]), 40.0))), \
+                patch.dict(sys.modules, modules):
+            provider.prepare(60, 62, "bass", "madmom_brnn_full")
+            provider.prepare(60, 62, "bass", "madmom_brnn_full")
+            self.assertEqual(infer.call_count, 1)
+        self.assertLessEqual(max(lengths), 2.5)
+        self.assertTrue(provider.covers(60, 62, "bass", "madmom_brnn_full"))
+        self.assertFalse(provider.covers(0, 220, "bass", "madmom_brnn_full"))
+        np.testing.assert_allclose(provider.onset_times("bass"), [60.25])
+        times, notes = provider.contour(60, 62, "bass", "madmom_brnn_full")
+        self.assertTrue(np.all((times >= 60) & (times < 62)))
+        np.testing.assert_allclose(notes, 40)
+
+    def test_file_crop_identity_includes_bounds_and_keeps_full_file_cache_separate(self):
+        from audio_to_midi.model_evidence import file_evidence
+
+        wav = self.root / "input.wav"
+        sf.write(wav, np.zeros(8000), 8000)
+        with patch("audio_to_midi.model_evidence.model_identity", return_value={"name": "piano_hr"}), \
+                patch.object(self.cache, "get", return_value=self.arrays) as get:
+            descriptors = []
+            for interval in (None, (0, .5), (.5, 1)):
+                file_evidence(str(wav), "stem:piano", "piano_hr", cache=self.cache, interval=interval)
+                descriptors.append(get.call_args.args[0])
+        self.assertEqual(len({str(self.cache.path(d)) for d in descriptors}), 3)
+        self.assertNotIn("interval_seconds", descriptors[0]["parameters"])
+        self.assertEqual(descriptors[1]["parameters"]["interval_seconds"], [0, .5])
+        for interval in ((-1, 0), (1, 1), (0, float("inf"))):
+            with self.assertRaises(ValueError):
+                file_evidence(str(wav), "stem:piano", "piano_hr", interval=interval)
+
+    def test_piano_inference_reads_only_the_requested_file_crop(self):
+        from contextlib import nullcontext
+        from audio_to_midi.model_evidence import file_evidence
+
+        wav = self.root / "piano.wav"
+        sf.write(wav, np.zeros(8000 * 220), 8000)
+        lengths = []
+
+        class Network:
+            frames_per_second = 100
+
+            def __init__(self, **kwargs):
+                pass
+
+            def transcribe(self, audio, midi_path):
+                lengths.append(len(audio))
+                return {"output_dict": {
+                    name: np.full((200, 88), .5, dtype=np.float32)
+                    for name in ("reg_onset_output", "reg_offset_output", "frame_output", "velocity_output")
+                }}
+
+        with patch.dict(sys.modules, {
+            "piano_transcription_inference": SimpleNamespace(PianoTranscription=Network, sample_rate=8000),
+        }), patch("audio_to_midi.model_evidence.model_identity", return_value={"name": "piano_hr"}), \
+                patch("audio_to_midi.model_evidence.neural_device", return_value=nullcontext("cpu")):
+            arrays = file_evidence(str(wav), "stem:piano", "piano_hr",
+                                   cache=self.cache, interval=(60, 62))
+            file_evidence(str(wav), "stem:piano", "piano_hr", cache=self.cache, interval=(60, 62))
+        self.assertEqual(lengths, [16000])
+        self.assertEqual(len(arrays["t"]), 200)
+        self.assertEqual(arrays["t"][0], 0)
+
+    def test_cpu_pitch_batches_decode_together_and_keep_unmasked_evidence(self):
+        from contextlib import nullcontext
+        import torch
+        from audio_to_midi.model_evidence import pitch_evidence
+
+        def decode(planes, *args, **kwargs):
+            count = planes.shape[-1]
+            planes.zero_()
+            return torch.full((1, count), 110.0), torch.full((1, count), .9)
+
+        batches = [torch.ones(64, 1024), torch.ones(37, 1024)]
+        with patch.dict(os.environ):
+            os.environ.pop("ATM_CREPE_BATCH_SIZE", None)
+            with patch("audio_to_midi.model_evidence.model_identity", return_value={"name": "crepe_full"}), \
+                    patch("audio_to_midi.model_evidence.neural_device", return_value=nullcontext("cpu")), \
+                    patch("torchcrepe.preprocess", return_value=iter(batches)) as preprocess, \
+                    patch("torchcrepe.infer", side_effect=lambda frames, *args:
+                          torch.full((len(frames), 360), .25)) as infer, \
+                    patch("torchcrepe.postprocess", side_effect=decode) as postprocess:
+                arrays = pitch_evidence(np.ones(8000, dtype=np.float32), 8000, "bass", "crepe_full",
+                                        cache=self.cache)
+        self.assertEqual(preprocess.call_args.kwargs["batch_size"], 64)
+        self.assertEqual(infer.call_count, 2)
+        postprocess.assert_called_once()
+        self.assertEqual(arrays["pitch_bin_probabilities"].shape, (101, 360))
+        np.testing.assert_allclose(arrays["pitch_bin_probabilities"], .25)
+        np.testing.assert_allclose(arrays["f0_hz"], 110)
+
+    def test_onset_learning_uses_local_chroma_but_imported_profiles_keep_legacy_features(self):
+        from audio_to_midi.adapters import TrackBackend
+
+        sr = 8000
+        wav = self.root / "bass.wav"
+        sf.write(wav, np.ones(sr * 220) * .1, sr)
+        project = Project.create("Feature windows", Grid())
+        track = app.add_stem(project, wav, "bass")
+        backend = TrackBackend(track, project)
+        times = np.arange(22000) / 100
+        with patch.object(backend, "_cqt", return_value=(times, np.ones((83, len(times))))), \
+                patch("audio_to_midi.adapters.librosa.feature.chroma_cqt",
+                      return_value=np.ones((12, 700))) as chroma:
+            backend._candidate_features(F(120))
+            backend._candidate_features(F(121))
+            self.assertEqual(chroma.call_count, 1)
+            self.assertLessEqual(len(chroma.call_args.kwargs["y"]) / backend.sr, 8.02)
+            backend._legacy_features = True
+            backend.features.clear()
+            backend._candidate_features(F(120))
+            self.assertEqual(len(chroma.call_args.kwargs["y"]), len(backend.audio))
 
     def test_cached_piano_hr_confidence_uses_frames_not_velocity(self):
         from audio_to_midi.model_evidence import replay_poly
@@ -250,6 +385,16 @@ class EvidenceTests(unittest.TestCase):
         self.assertEqual(len(select_notes(notes, "drums", "mix", {})), 1)
         with self.assertRaisesRegex(ValueError, "confidence"):
             select_notes(notes, "piano", "mix", {"onset_threshold": 0})
+
+    def test_yourmt3_other_keeps_residual_pitched_families_for_mix(self):
+        notes = dict(notes=np.array([
+            [0, 1, 60, 90, 0, 0], [0, 1, 62, 90, 7, 0],
+            [0, 1, 64, 90, 24, 0], [0, 1, 40, 90, 39, 0],
+            [0, 1, 67, 90, 48, 0], [0, 1, 69, 90, 80, 0],
+            [0, .1, 36, 90, 0, 1],
+        ], dtype=float))
+        self.assertEqual(select_notes(notes, "other", "mix", {})[:, 2].tolist(), [67, 69])
+        self.assertEqual(len(select_notes(notes, "other", "stem", {})), 6)
 
     def test_invalid_or_unsupported_thresholds_fail_instead_of_silent_defaults(self):
         for value in (-1, 2, float("nan"), True, "0.5"):

@@ -93,5 +93,9 @@ def select_notes(arrays: dict, role: str, source: str, parameters: dict) -> np.n
     if source == "stem":
         return pitched
     programs = {"piano": (0, 7), "guitar": (24, 31), "bass": (32, 39)}
+    if role == "other":
+        return pitched[~np.isin(pitched[:, 4], [
+            program for low, high in programs.values() for program in range(low, high + 1)
+        ])]
     lo, hi = programs[role]
     return pitched[(pitched[:, 4] >= lo) & (pitched[:, 4] <= hi)]

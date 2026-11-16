@@ -41,8 +41,6 @@ class LiveModels(unittest.TestCase):
                         self.fail(f"Replay/reopen attempted inference: {descriptor}")
                     return arrays
                 for role, models in MODELS.items():
-                    if role == "other":
-                        continue
                     track = app.add_stem(project, wav, role)
                     track.settings.update(license_acknowledged=True, madmom_license_acknowledged=True)
                     for model in models:

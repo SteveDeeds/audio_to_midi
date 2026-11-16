@@ -55,6 +55,20 @@ class MusicXMLTests(unittest.TestCase):
         self.assertEqual(drums.findtext("midi-instrument/midi-channel"), "10")
         self.assertEqual(drums.findtext("midi-instrument/midi-unpitched"), "37")
 
+    def test_other_track_exports_as_pitched_score(self):
+        project = Project.create("Other", Grid())
+        track = Track("other", "other", "", 2.0, 8000, "basic_pitch")
+        track.notes.author(F(0), F(1), 60)
+        track.notes.author(F(0), F(1), 64)
+        project.tracks.append(track)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "other.musicxml"
+            export_musicxml(project, path, [track], include_chords=False)
+            root = ET.parse(path).getroot()
+        self.assertEqual(root.findtext("part-list/score-part/part-name"), "Other")
+        self.assertEqual([pitch.findtext("step") for pitch in root.findall(".//note/pitch")],
+                         ["C", "E"])
+
     def test_drum_kit_identity_precedes_piece_names_without_changing_hit_mapping(self):
         for pitches in ((36, 38, 42), (38, 42), (42,)):
             with self.subTest(pitches=pitches):

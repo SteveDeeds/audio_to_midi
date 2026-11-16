@@ -265,25 +265,23 @@ class Timeline(QWidget):
         grid = self.project.grid
         for beat, x in self._grid_lines():
             if beat % grid.bar_beats == 0:
-                painter.setPen(QColor(180, 195, 225, 150))
+                painter.setPen(QColor("#ffffff"))
                 painter.drawText(x + 3, height - 3, f"Bar {int(beat / grid.bar_beats) + 1}")
             elif beat % beat_length(grid) == 0:
-                painter.setPen(QColor(150, 165, 195, 80))
+                painter.setPen(QColor("#b09a82"))
             else:
-                painter.setPen(QColor(120, 135, 165, 35))
+                painter.setPen(QColor("#4c607a"))
             painter.drawLine(x, self.LANE_TOP + 8, x, bottom)
         if self.mode == "mix":
-            self._paint_beats(painter, bottom)
+            self._paint_beats(painter)
         elif self.track is not None:
             for beat in self.onsets:
                 if self.start <= beat <= self.end:
                     x = round(self._x(beat))
                     painter.setPen(QPen(QColor("#f7b554"), 2))
                     painter.drawLine(x, self.LANE_TOP + 4, x, self.ROLL_TOP - 2)
-                    painter.setPen(QPen(QColor(247, 181, 84, 60), 1))
-                    painter.drawLine(x, self.ROLL_TOP, x, bottom)
             if self.tool == "info":
-                self._paint_beats(painter, bottom)
+                self._paint_beats(painter)
             drag = self._drag
             hidden = 0
             for note in self.notes:
@@ -305,12 +303,18 @@ class Timeline(QWidget):
                 painter.drawLine(x, self.LANE_TOP, x, bottom)
 
     def _grid_lines(self):
-        """(beat, x) of each visible grid line."""
-        step = self.project.grid.subdivision
-        beat = self.start
-        while beat < self.end:
+        """(beat, x) of each visible bar, meter beat and selected subdivision."""
+        grid = self.project.grid
+        positions = set()
+        for step in (grid.bar_beats, beat_length(grid), grid.subdivision):
+            beat = (self.start // step) * step
+            if beat < self.start:
+                beat += step
+            while beat < self.end:
+                positions.add(beat)
+                beat += step
+        for beat in sorted(positions):
             yield beat, round(self._x(beat))
-            beat += step
 
     def _paint_lanes(self, painter: QPainter) -> None:
         top, height, width = self._rows_top(), self._row_height(), self.width()
@@ -325,7 +329,7 @@ class Timeline(QWidget):
             painter.setPen(QColor("#20242c"))
             painter.drawText(QRectF(3, y, self.KEYS - 5, height), Qt.AlignmentFlag.AlignVCenter, name)
 
-    def _paint_beats(self, painter: QPainter, bottom: int) -> None:
+    def _paint_beats(self, painter: QPainter) -> None:
         left, right = self.KEYS, self.width()
         for seconds, kind, label in self.beats:
             x = self._x_seconds(seconds)
@@ -335,10 +339,6 @@ class Timeline(QWidget):
             strong = kind in ("downbeat", "pin")
             painter.setPen(QPen(color, 3 if strong else 2))
             painter.drawLine(round(x), self.LANE_TOP + 6, round(x), self.ROLL_TOP - 2)
-            faint = QColor(color)
-            faint.setAlpha(90 if strong else 40)
-            painter.setPen(QPen(faint, 1))
-            painter.drawLine(round(x), self.ROLL_TOP, round(x), bottom)
             if kind == "pin":
                 painter.setBrush(color)
                 painter.drawPolygon(QPolygonF([

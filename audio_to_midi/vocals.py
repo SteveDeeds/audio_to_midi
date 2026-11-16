@@ -130,9 +130,6 @@ class VocalTranscriber:
         self._processor = None
 
     def _pitch(self, audio: np.ndarray, cancelled: Callable[[], bool]) -> tuple[np.ndarray, np.ndarray]:
-        import torch
-
-        torch.set_num_threads(4)
         times, pitches = [], []
         for first in range(0, len(audio), SR * 2):
             check_cancel(cancelled)

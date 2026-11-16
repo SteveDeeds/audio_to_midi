@@ -36,8 +36,6 @@ def _validate_export_path(project: Project, path: Path) -> None:
 
 
 def import_notes(path: Path, project: Project, track: Track) -> int:
-    if track.role == "other":
-        raise ValueError("Other is harmony context only.")
     rows = load_midi_notes(str(path))
     notes = [
         Note(
@@ -88,8 +86,6 @@ def export_midi(
         tick = at
     channels = iter([i for i in range(16) if i != 9])
     for track in project.tracks if tracks is None else tracks:
-        if track.role == "other":
-            continue
         channel = 9 if track.role == "drums" else next(channels)
         _append_track(mid, track.role, track.notes.resolved(), channel)
     if include_chords and project.chords:
@@ -124,7 +120,7 @@ def export_musicxml(
 
     _validate_export_path(project, path)
     chosen = project.tracks if tracks is None else tracks
-    if any(t.role != "other" and t.notes.resolved() for t in chosen):
+    if any(t.notes.resolved() for t in chosen):
         text = musicxml.score_xml(project, chosen, include_chords, quantization=quantization)
     elif include_chords and project.chords:
         from audio_to_midi.chords import musicxml as lead_sheet

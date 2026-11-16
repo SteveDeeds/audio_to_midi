@@ -42,6 +42,7 @@ class EditorTests(unittest.TestCase):
         self.window.auto.setChecked(False)
         self.track = add_stem(self.window.project, self.wav, "bass")
         self.track.settings["license_acknowledged"] = True
+        self.track.settings["madmom_license_acknowledged"] = True
         self.window.project.key = "C"
         self.window._sync_tracks()
         self.addCleanup(self.dispose)
@@ -171,7 +172,7 @@ class EditorTests(unittest.TestCase):
                 patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
                 patch.object(self.window, "_run", side_effect=lambda operation, callback, **kw: callbacks.append(callback)):
             self.window._analyze(False)
-        self.track.model = "madmom_cnn_full"
+        self.track.model = "piano_hr"
         with patch.object(self.window, "_analyze") as analyze:
             callbacks[0](None)
         analyze.assert_not_called()
@@ -428,6 +429,101 @@ class EditorTests(unittest.TestCase):
         self.assertIn("missing model", self.window.status.text())
         self.window._add_note(F(0), 60)
         self.assertEqual(len(self.window._rows), 1)
+
+    def test_previous_at_start_does_not_cancel_visible_analysis(self):
+        self.window.debounce.start()
+        run_id = self.window._analysis_run
+        with patch.object(self.window, "_load_envelope") as load:
+            for _ in range(100):
+                self.window._navigate(-1)
+        self.assertEqual(self.window.timeline.start, F(0))
+        self.assertEqual(self.window._analysis_run, run_id)
+        self.assertTrue(self.window.debounce.isActive())
+        load.assert_not_called()
+
+    def test_rewind_button_stops_playback_and_resets_shared_window(self):
+        from unittest.mock import Mock
+        from audio_to_midi.ui import CHORDS, MIX
+
+        self.window.project.mix_path = str(self.wav)
+        self.window._sync_tracks()
+        button = self.window.tool_buttons["rewind"]
+        self.assertEqual(button.text(), "|<<")
+        self.assertEqual(button.defaultAction(), self.window.actions["rewind"])
+        self.assertEqual(self.window.actions["rewind"].shortcut().toString(), "Home")
+        for view in (self.track.id, MIX, CHORDS):
+            with self.subTest(view=view):
+                self.window.tracks.setCurrentIndex(self.window.tracks.findData(view))
+                self.assertFalse(button.isHidden())
+                self.window._set_window(F(80))
+                self.window._refresh()
+                self.window.preview = Mock()
+                self.window._clock = (time.monotonic(), 40.0, 100.0, 1.0)
+                self.window.timeline.playhead = self.window.chord_view.playhead = 40.0
+                self.window.clock.start()
+                self.window.rebalance.start()
+                with patch.object(self.window, "_play") as play:
+                    button.click()
+                    play.assert_not_called()
+                self.window.preview.stop.assert_called_once()
+                self.assertIsNone(self.window._clock)
+                self.assertIsNone(self.window.timeline.playhead)
+                self.assertIsNone(self.window.chord_view.playhead)
+                self.assertFalse(self.window.clock.isActive())
+                self.assertFalse(self.window.rebalance.isActive())
+                self.assertEqual(self.window.timeline.start, F(0))
+                self.assertEqual(self.window.timeline.end,
+                                 self.window.bars * self.window.project.grid.bar_beats)
+                self.assertEqual(self.window.chord_view.start, F(0))
+                self.assertEqual(self.window.chord_view.end, self.window.timeline.end)
+
+    def test_rapid_navigation_analyzes_only_the_final_window(self):
+        sf.write(self.wav, np.zeros(800000), 8000)
+        self.track.duration = 100
+        self.window._set_window(F(160))
+        with patch.object(self.window, "_load_envelope"), \
+                patch.object(self.window, "_refresh"), \
+                patch.object(self.window, "_analyze") as analyze:
+            self.window.auto.setChecked(True)
+            for _ in range(39):
+                self.window._navigate(-1)
+            self.assertEqual(self.window.timeline.start, F(4))
+            self.assertTrue(self.window.debounce.isActive())
+            analyze.assert_not_called()
+            from PySide6.QtTest import QTest
+
+            deadline = time.monotonic() + 2
+            while not analyze.called and time.monotonic() < deadline:
+                QTest.qWait(20)
+            analyze.assert_called_once_with(False, auto=True)
+        self.window.debounce.stop()
+
+    def test_analysis_queue_keeps_only_the_latest_pending_request(self):
+        entered, release = threading.Event(), threading.Event()
+        calls, results = [], []
+
+        def first(cancelled):
+            entered.set()
+            release.wait(5)
+            return "obsolete"
+
+        self.window._run(first, results.append)
+        try:
+            self.assertTrue(entered.wait(5))
+            for number in range(100):
+                def operation(cancelled, number=number):
+                    calls.append(number)
+                    return number
+
+                self.window._run(operation, results.append)
+            self.assertTrue(self.window.job.cancelled.is_set())
+            self.assertIsNotNone(self.window.pending)
+        finally:
+            release.set()
+            self.wait_idle()
+        self.assertEqual(calls, [99])
+        self.assertEqual(results, [99])
+        self.assertIsNone(self.window.pending)
 
     def test_background_activity_status_clears_when_finished(self):
         self.window._run(lambda cancel: None, lambda value: None, kind="mix",
@@ -734,7 +830,7 @@ class EditorTests(unittest.TestCase):
         self.track.duration = 6
         calls = []
 
-        def predict(project, track, a, b, cancelled):
+        def predict(project, track, a, b, cancelled, report):
             calls.append((a, b))
             return Prediction(a, b, (), ())
 
@@ -746,8 +842,115 @@ class EditorTests(unittest.TestCase):
                 self.app.processEvents()
                 time.sleep(.005)
             self.wait_idle()
-        self.assertEqual(calls, [(F(0), F(8)), (F(8), F(12))])
+        self.assertEqual(calls, [(F(0), F(1)), (F(1), F(4)), (F(4), F(8)), (F(8), F(12))])
         self.assertTrue(complete(self.window.project, self.track))
+
+    def test_visible_notes_publish_before_background_and_visible_chunks_run_first(self):
+        from audio_to_midi.application import complete
+
+        sf.write(self.wav, np.zeros(80000), 8000)
+        self.track.duration = 10
+        self.window._set_window(F(8))
+        calls = []
+        entered, release = threading.Event(), threading.Event()
+
+        def predict(project, track, a, b, cancelled, report):
+            calls.append((a, b))
+            report("Test pitch progress")
+            if len(calls) == 2:
+                entered.set()
+                release.wait(5)
+            return Prediction(a, b, (Note(f"chunk:{a}", a, b, 40),), ())
+
+        with patch.object(self.window.service, "predict", side_effect=predict), \
+                patch("audio_to_midi.provision.missing", return_value=[]):
+            self.window._analyze(True)
+            try:
+                deadline = time.monotonic() + 5
+                while not entered.is_set() and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(.005)
+                self.assertTrue(entered.is_set())
+                self.app.processEvents()
+                self.assertEqual(calls[:2], [(F(8), F(9)), (F(9), F(12))])
+                self.assertTrue(self.window._rows)
+                self.assertEqual(self.window._rows[0].start, F(8))
+                self.assertFalse(complete(self.window.project, self.track))
+                self.assertIn("Visible bass", self.window.status.text())
+                self.assertIn("Test pitch progress", self.window.status.text())
+            finally:
+                release.set()
+            deadline = time.monotonic() + 10
+            while not complete(self.window.project, self.track) and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.005)
+            self.wait_idle()
+        self.assertEqual(calls[2], (F(12), F(16)))
+        self.assertTrue(complete(self.window.project, self.track))
+        self.assertTrue(all(b - a <= F(4) for a, b in calls))
+
+    def test_automatic_analysis_completes_background_but_neural_vocals_stay_visible_only(self):
+        with patch.object(self.window, "_continue_background") as background, \
+                patch.object(self.window, "_analyze_range") as analyze, \
+                patch("audio_to_midi.provision.missing", return_value=[]):
+            self.window._analyze(False, auto=True)
+            background.assert_called_once()
+            analyze.assert_not_called()
+            background.reset_mock()
+            self.use_neural_vocals()
+            self.window._analyze(False, auto=True)
+            background.assert_not_called()
+            self.assertFalse(analyze.call_args.args[4])
+
+    def test_navigation_to_covered_bars_still_resumes_unfinished_background(self):
+        publish(self.window.project, token(self.window.project, self.track),
+                Prediction(F(0), F(2), (), ()))
+        self.window._set_window(F(0))
+        self.window.timeline.end = F(2)
+        self.window.auto.setChecked(True)
+        self.window._queue_visible()
+        self.assertTrue(self.window.debounce.isActive())
+        self.window.auto.trigger()
+        self.assertFalse(self.window.debounce.isActive())
+
+    def test_navigation_preempts_background_and_discards_its_late_result(self):
+        sf.write(self.wav, np.zeros(80000), 8000)
+        self.track.duration = 10
+        self.window._set_window(F(8))
+        publish(self.window.project, token(self.window.project, self.track),
+                Prediction(F(8), F(16), (), ()))
+        entered, release = threading.Event(), threading.Event()
+        calls = []
+
+        def predict(project, track, a, b, cancelled, report):
+            calls.append((a, b))
+            if len(calls) == 1:
+                entered.set()
+                release.wait(5)
+                return Prediction(a, b, (Note("obsolete-background", a, b, 40),), ())
+            return Prediction(a, b, (Note(f"visible:{a}", a, b, 43),), ())
+
+        with patch.object(self.window.service, "predict", side_effect=predict), \
+                patch("audio_to_midi.provision.missing", return_value=[]), \
+                patch.object(self.window, "_load_envelope"):
+            self.window._analyze(True)
+            try:
+                self.assertTrue(entered.wait(5))
+                self.assertEqual(calls[0], (F(4), F(8)))
+                self.window._navigate(1)
+                self.window._analyze(False)
+                self.assertTrue(self.window.job.cancelled.is_set())
+                self.assertIsNotNone(self.window.pending)
+            finally:
+                release.set()
+            deadline = time.monotonic() + 5
+            while len(calls) < 3 and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.005)
+            self.wait_idle()
+        self.assertEqual(calls[1], (F(12), F(13)))
+        self.assertFalse(any(n.id == "obsolete-background" for n in self.track.notes.generated))
+        self.assertTrue(self.window._rows)
 
     def _mix_only(self, seconds=20.0, rate=8000):
         """Turn the fixture into a mix-only project (detection is stubbed)."""
@@ -1928,6 +2131,39 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(stereo), 4000)  # one beat at 120 BPM, 8 kHz
         self.assertGreater(np.abs(stereo[:, 0].astype(float)).max(), 1000)
         self.assertIsNone(window._clock)
+
+    def test_clicking_existing_note_auditions_once_without_editing(self):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        window, timeline = self.window, self.window.timeline
+        self.track.notes.author(F(1), F(2), 60, 83)
+        window._refresh()
+        window.resize(1280, 900)
+        window.show()
+        self.app.processEvents()
+        before = deepcopy(self.track.notes)
+        point = QPoint(round(timeline._x(F(3, 2))),
+                       round(timeline._y(60) + timeline._row_height() / 2))
+        with patch.object(window, "_play") as play:
+            QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+        play.assert_called_once_with(audition=timeline.selected)
+        self.assertEqual(self.track.notes, before)
+
+    def test_other_track_has_models_analysis_and_note_editing(self):
+        other = add_stem(self.window.project, self.wav, "other")
+        self.window._sync_tracks()
+        self.window.tracks.setCurrentIndex(self.window.tracks.findData(other.id))
+        self.assertEqual(self.window.models.currentData(), "basic_pitch")
+        self.assertTrue(self.window.actions["analyze"].isEnabled())
+        self.assertTrue(self.window.actions["analyze_all"].isEnabled())
+        self.assertFalse(self.window.confidence_panel.isHidden())
+        with patch.object(self.window, "_play") as play:
+            self.window._add_note(F(1), 69, F(2))
+        play.assert_called_once()
+        self.assertEqual([(n.start, n.end, n.pitch) for n in other.notes.resolved()],
+                         [(F(1), F(2), 69)])
+        self.assertTrue(self.window.actions["export_xml"].isEnabled())
 
     def test_slow_external_midi_preserves_pitches_and_wall_clock_latency(self):
         from audio_to_midi.preview import midi_schedule

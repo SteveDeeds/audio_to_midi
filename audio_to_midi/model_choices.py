@@ -1,15 +1,15 @@
-"""Reviewed per-stem rankings; vocal and harmony behavior is unchanged."""
+"""Per-stem model choices, with each role's default first."""
 
 from audio_to_midi.vocal_settings import VOCAL_MODELS
 
 MADMOM_COMBINATIONS = ("madmom_brnn_full", "madmom_cnn_full")
 MODELS = {
-    "bass": ("piano_hr", "madmom_brnn_full", "madmom_cnn_full"),
+    "bass": ("madmom_cnn_full", "piano_hr", "madmom_brnn_full"),
     "guitar": ("basic_pitch", "yourmt3", "madmom_cnn_full"),
     "piano": ("piano_hr", "yourmt3", "basic_pitch"),
     "drums": ("adtof", "yourmt3"),
     "vocals": ("pyin", "crepe_full", "crepe_tiny", *VOCAL_MODELS),
-    "other": (),
+    "other": ("basic_pitch", "yourmt3", "piano_hr"),
 }
 MODEL_LABELS = {
     "piano_hr": "Piano HR", "basic_pitch": "Basic Pitch", "yourmt3": "YourMT3+",

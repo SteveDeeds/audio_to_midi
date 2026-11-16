@@ -148,8 +148,6 @@ def publish(project: Project, result_token: ResultToken, prediction: Prediction)
 
 
 def complete(project: Project, track: Track) -> bool:
-    if track.role == "other":
-        return True
     if track.settings.get("imported_midi") and not track.notes.generated:
         return True
     return covered(project, track, Fraction(0), track_end(project, track))
@@ -179,6 +177,7 @@ class TranscriptionService:
             raise ValueError("Invalid transcription interval.")
         if project.grid.snap(start) != start:
             raise ValueError("Transcription starts must lie on the selected onset grid.")
+        report("Preparing audio and inference backend...")
         backend_key = repr((
             project.id, track.id, media_identity(track.audio_path),
             checksum(Path(track.audio_path)),

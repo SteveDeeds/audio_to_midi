@@ -5,9 +5,11 @@ from __future__ import annotations
 from importlib import metadata
 import os
 from pathlib import Path
+import tempfile
 
 import librosa
 import numpy as np
+import soundfile as sf
 
 from audio_to_midi.evidence_cache import EvidenceCache, array_identity, checksum
 from core.inference_runtime import basic_pitch_model, crepe_batch_size, neural_device
@@ -16,9 +18,11 @@ RANGES = {
     "bass": (30.0, 420.0, 28, 67),
     "guitar": (75.0, 1400.0, 38, 88),
     "piano": (27.5, 4200.0, 21, 108),
+    "other": (27.5, 4200.0, 21, 108),
     "vocals": (70.0, 1100.0, 36, 96),
 }
 _BP = None
+CPU_CREPE_BATCH_SIZE = 64
 
 
 def validate_parameters(model: str, parameters: dict) -> None:
@@ -113,16 +117,17 @@ def validate(model: str, arrays: dict) -> None:
 
 
 def pitch_evidence(audio: np.ndarray, sr: int, role: str, model: str, cancelled=lambda: False,
-                   cache: EvidenceCache | None = None) -> dict:
+                   cache: EvidenceCache | None = None, report=lambda text: None) -> dict:
     low, high, _, _ = RANGES[role]
     if model.startswith("crepe"):
         low, high = max(low, 32.71), min(high, 2006.0)
     parameters = dict(fmin=low, fmax=high, preprocessing="mono-unscaled", sr=sr,
                       hop=256 if model == "pyin" else 160, frame=2048,
-                      decoder="pyin-fill-na-none" if model == "pyin" else "viterbi",
+                      decoder="pyin-fill-na-none" if model == "pyin" else "viterbi-window",
                       device_policy="cpu" if model == "pyin" else os.environ.get("ATM_DEVICE", "auto"),
                       periodicity_median=3,
-                      batch_size=crepe_batch_size() if model != "pyin" else None)
+                      batch_size=crepe_batch_size() if model != "pyin" else None,
+                      cpu_batch_limit=CPU_CREPE_BATCH_SIZE if "ATM_CREPE_BATCH_SIZE" not in os.environ else None)
     store = cache or EvidenceCache()
     descriptor = store.descriptor(array_identity(audio, sr), f"stem:{role}", model_identity(model), parameters)
 
@@ -140,24 +145,32 @@ def pitch_evidence(audio: np.ndarray, sr: int, role: str, model: str, cancelled=
             import torch
             import torchcrepe
             y = torch.from_numpy(librosa.resample(audio, orig_sr=sr, target_sr=16000))[None]
-            scores, pitches, periodicities = [], [], []
+            scores = []
             with neural_device(cancelled=cancelled) as device, torch.inference_mode():
+                total_frames = len(y[0]) // 160 + 1
+                completed = 0
+                batch_size = crepe_batch_size()
+                if device == "cpu" and "ATM_CREPE_BATCH_SIZE" not in os.environ:
+                    batch_size = min(batch_size, CPU_CREPE_BATCH_SIZE)
+                report(f"{model.replace('_', ' ').upper()} pitch: 0/{total_frames} frames ({device.upper()}).")
                 for frames in torchcrepe.preprocess(
-                    y, 16000, hop_length=160, batch_size=crepe_batch_size(), device=device, pad=True,
+                    y, 16000, hop_length=160, batch_size=batch_size, device=device, pad=True,
                 ):
                     check_cancel(cancelled)
                     activation = torchcrepe.infer(frames, model.removeprefix("crepe_"), device)
-                    # postprocess masks pitch bins in place; retain the untouched planes first.
                     scores.append(activation.cpu().numpy().copy())
-                    f0, probability = torchcrepe.postprocess(
-                        activation.reshape(1, -1, 360).transpose(1, 2), low, high,
-                        torchcrepe.decode.viterbi, return_periodicity=True)
-                    pitches.append(f0.cpu())
-                    periodicities.append(probability.cpu())
-            f0 = torch.cat(pitches, 1)[0].numpy()
-            periodicity = torch.cat(periodicities, 1)
+                    completed += len(frames)
+                    report(f"CREPE pitch: {min(completed, total_frames)}/{total_frames} frames ({device.upper()}).")
+            check_cancel(cancelled)
+            planes = np.concatenate(scores)
+            # Decode the entire crop together, not each interruptible CPU batch.
+            # postprocess masks bins in place; the saved planes must stay untouched.
+            f0, periodicity = torchcrepe.postprocess(
+                torch.from_numpy(planes.copy()).reshape(1, -1, 360).transpose(1, 2), low, high,
+                torchcrepe.decode.viterbi, return_periodicity=True)
+            f0 = f0[0].numpy()
             arrays = dict(t=np.arange(len(f0)) * .01, f0_hz=f0,
-                          pitch_bin_probabilities=np.concatenate(scores),
+                          pitch_bin_probabilities=planes,
                           periodicity=periodicity[0].numpy(),
                           smoothed_periodicity=torchcrepe.filter.median(periodicity, 3)[0].numpy())
         arrays["db"] = np.interp(arrays["t"], rms_t, db)
@@ -186,8 +199,15 @@ def onset_evidence(audio: np.ndarray, sr: int, role: str, model: str, cancelled=
 
 
 def file_evidence(path: str, source: str, model: str, cancelled=lambda: False,
-                  report=lambda text: None, cache: EvidenceCache | None = None) -> dict:
+                  report=lambda text: None, cache: EvidenceCache | None = None, *,
+                  interval: tuple[float, float] | None = None) -> dict:
+    if interval is not None and (
+        not np.isfinite(interval).all() or interval[0] < 0 or interval[1] <= interval[0]
+    ):
+        raise ValueError("Inference crop must be a finite positive interval.")
     if model == "yourmt3":
+        if interval is not None:
+            raise ValueError("YourMT3+ requires whole-file evidence.")
         from audio_to_midi.yourmt3 import evidence
         return evidence(path, source, cancelled, report, cache)
     store = cache or EvidenceCache()
@@ -198,6 +218,15 @@ def file_evidence(path: str, source: str, model: str, cancelled=lambda: False,
                                        16000 if model == "piano_hr" else 44100,
                                        precision="float32", device_policy="cpu" if model == "basic_pitch"
                                        else os.environ.get("ATM_DEVICE", "auto")))
+    if interval is not None:
+        descriptor["parameters"]["interval_seconds"] = list(interval)
+
+    def load_audio(sample_rate):
+        options = {} if interval is None else dict(offset=interval[0], duration=interval[1] - interval[0])
+        audio, _ = librosa.load(path, sr=sample_rate, mono=True, **options)
+        if not len(audio):
+            raise ValueError("Inference crop has no audio.")
+        return audio
 
     def compute():
         global _BP
@@ -208,11 +237,17 @@ def file_evidence(path: str, source: str, model: str, cancelled=lambda: False,
             from basic_pitch.note_creation import model_frames_to_time
             if _BP is None:
                 _BP = basic_pitch_model()
-            arrays = run_inference(path, _BP)
+            if interval is None:
+                arrays = run_inference(path, _BP)
+            else:
+                with tempfile.TemporaryDirectory(prefix="atm-chunk-") as folder:
+                    crop = Path(folder) / "audio.wav"
+                    sf.write(crop, load_audio(22050), 22050, subtype="FLOAT")
+                    arrays = run_inference(str(crop), _BP)
             arrays["t"] = model_frames_to_time(len(arrays["onset"]))
         elif model == "piano_hr":
             from piano_transcription_inference import PianoTranscription, sample_rate
-            audio, _ = librosa.load(path, sr=sample_rate, mono=True)
+            audio = load_audio(sample_rate)
             with neural_device(cancelled=cancelled) as device:
                 network = PianoTranscription(device=device, checkpoint_path=None)
                 output = network.transcribe(audio, None)["output_dict"]
@@ -222,7 +257,7 @@ def file_evidence(path: str, source: str, model: str, cancelled=lambda: False,
                 del network
         elif model == "adtof":
             from core.adtof_drums import compute_activations, peak_novelty, FPS
-            audio, _ = librosa.load(path, sr=44100, mono=True)
+            audio = load_audio(44100)
             activation = compute_activations(audio)
             arrays = dict(t=np.arange(len(activation)) / FPS, activation=activation,
                           novelty=peak_novelty(activation))

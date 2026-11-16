@@ -309,6 +309,7 @@ def load_project(folder: Path) -> Project:
                 raise InvalidProjectError(f"Unsupported {value['role']} model: {value['model']}")
             tracks.append(Track(**{
                 **value, "notes": _read_store(value["notes"], data["schema_version"]),
+                "model": choices[0] if value["role"] == "other" and not value["model"] else value["model"],
                 "audio_path": _loaded_path(value["audio_path"], folder),
             }))
         return Project(

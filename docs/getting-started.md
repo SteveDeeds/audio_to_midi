@@ -219,7 +219,7 @@ Either:
   file name, and you can change it.
 
 The roles are `bass`, `vocals`, `piano`, `guitar`, `drums`, and `other`; one
-track per role. `other` is harmony context only and produces no notes.
+track per role. All roles support transcription. `other` also supplies harmony context.
 
 ## 5. Transcribe and correct notes
 
@@ -227,10 +227,11 @@ Choose a stem in **Track** and its **Model** next to it:
 
 | Role | Models, in ranked order |
 |---|---|
-| Bass | Piano HR; madmom offline BRNN + CREPE full; madmom CNN + CREPE full |
+| Bass | madmom CNN + CREPE full; Piano HR; madmom offline BRNN + CREPE full |
 | Guitar | Basic Pitch; YourMT3+; madmom CNN + CREPE full |
 | Piano | Piano HR; YourMT3+; Basic Pitch |
 | Drums | ADTOF; YourMT3+ |
+| Other | Basic Pitch; YourMT3+; Piano HR |
 | Vocals (unchanged, not bake-off ranked) | `pyin`, `crepe_full`, `crepe_tiny`, `madmom_cnn`, `madmom_brnn` |
 
 MR-MT3 is not offered. Basic Pitch replaces the effectively tied MR-MT3 piano
@@ -276,7 +277,11 @@ Keys include content hashes, mix/stem role provenance, model/package and
 checkpoint identity, inference parameters and evidence schema version.
 Writes are atomic, arrays are validated/checksummed, and per-key OS locks avoid
 duplicate inference. The two compatible madmom combinations share CREPE-full
-evidence. Preserved evidence includes Basic Pitch onset/frame/contour matrices;
+evidence for matching audio crops. Instrumental CREPE/madmom, Basic Pitch and
+Piano HR inference now use bounded crops with overlapping context;
+file-based crop keys also include their time bounds, separate from older
+whole-file archives. Completed crops survive navigation and can be reused after
+reopening a project. Preserved evidence includes Basic Pitch onset/frame/contour matrices;
 Piano HR continuous onset/offset/frame/velocity and pedal planes; untouched
 CREPE pitch-bin activations, unmasked F0, periodicity and smoothed periodicity;
 pYIN unmasked F0, voiced flags/probabilities; madmom onset curves; ADTOF class
@@ -346,9 +351,28 @@ versions cannot read new saves.
 ### Running detection
 
 With **Model > Reanalyze after edits** checked (the default), the visible bars
-are analyzed automatically. **Model > Analyze visible bars** and
-**Analyze whole track** run it on demand; **Cancel analysis** (Esc, or the
-button in the status bar) stops it.
+are analyzed first, then nearby undisplayed bars and the rest of the active
+track in the background. **Model > Analyze visible bars** only processes the
+displayed range; **Analyze whole track** also starts with the visible range.
+The first visible chunk is one meter beat, then chunks finish the current bar
+and continue one bar at a time. Notes appear after each completed chunk rather
+than waiting for the song. Status messages identify visible/background work,
+the bar, track coverage and CREPE frame progress/device. Initial model loading
+and note-dynamics preparation can take longer than later chunks on a CPU.
+
+**Cancel analysis** (Esc, or the button in the status bar) stops it. Unchecking
+**Reanalyze after edits** stops automatic analysis and its background continuation.
+Neural syllable-aware vocal models remain visible-only, with their existing
+window semantics; they no longer impose a process-wide four-thread PyTorch cap.
+CREPE uses small interruptible CPU frame batches, then decodes the full crop
+together to preserve pitch continuity. `ATM_CREPE_BATCH_SIZE` overrides the
+batch size if explicit tuning is needed; the model capacity is unchanged.
+YourMT3+ retains its separate whole-file worker. ADTOF keeps its shared
+whole-stem evidence and drum-velocity normalization, but publishes requested
+chunks separately after that evidence is ready.
+Learned onset features use padded local chroma windows; imported legacy onset
+profiles retain their whole-stem features for compatibility. Harmonic note
+velocity still uses the same whole-stem loudness reference.
 Background activity messages clear when the task finishes or stops after cancellation.
 Errors and result summaries remain visible.
 Status messages stay on one line without resizing the piano roll; hover over
@@ -356,13 +380,26 @@ the status text to read the full message, including any original line breaks.
 
 **Navigate** with **Previous** / **Next** (Left / Right arrow, or PgUp / PgDn);
 each step scrolls half a screen. The label between them
-shows the visible bars. **Zoom out (-)** / **Zoom in (+)** next to them (also
+shows the visible bars. **|<<** beside Play (also **Home** or **View > Rewind to start**)
+stops playback and returns to bar 1.
+Holding an arrow key does not queue every bar: automatic analysis waits for
+navigation to settle, cancels obsolete work, and keeps at most one pending
+request in the ordinary analysis lane, replacing older requests with the latest.
+Holding Left at bar 1 leaves that window's analysis running.
+YourMT3+ uses its separate lane with at most one pending retry per track;
+unchanged input is not queued again.
+**Zoom out (-)** / **Zoom in (+)** next to the navigation buttons (also
 Ctrl + mouse wheel, View > Zoom, Ctrl+- / Ctrl+=) show 1, 2, 4, 8 or 16 bars per
 screen; the readout beside the buttons shows the current setting. **Up / Down arrows**
 shift the piano-roll view up / down one octave without transposing notes, stopping
 at MIDI pitches 0 and 127. The plain mouse wheel scrolls pitch; **Ctrl + Shift + wheel**
 zooms pitch (not in the drums view). **Grid** sets the editing step (1/4 to 1/32, including
 triplets).
+
+Vertical roll lines come only from the musical grid: white bar lines, muted
+orange-gray beat lines, and darker blue-gray subdivision lines set by **Grid**.
+Onset and detected-beat markers stay in the upper lane without adding or
+recoloring lines through the roll.
 
 The piano roll shows the stem's spectrogram behind the notes: a sustained
 pitch is a bright horizontal band. Brightness is measured against the loudest

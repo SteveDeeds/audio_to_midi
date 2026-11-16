@@ -2,6 +2,7 @@ import contextlib
 from copy import deepcopy
 from fractions import Fraction as F
 import io
+import json
 from pathlib import Path
 import tempfile
 import unittest
@@ -44,8 +45,12 @@ class WorkflowTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "already exists"):
             app.add_stem(self.project, self.wav, "bass")
         other = app.add_stem(self.project, self.wav, "other")
-        self.assertEqual(other.model, "")
-        self.assertTrue(app.complete(self.project, other))
+        self.assertEqual(other.model, "basic_pitch")
+        self.assertFalse(app.complete(self.project, other))
+        backend = TrackBackend.create(other, self.project)
+        backend._check_provider()
+        from audio_to_midi.evidence_providers import EvidencePolyTranscriber
+        self.assertIsInstance(backend.provider, EvidencePolyTranscriber)
         sf.write(self.root / "short.wav", np.zeros(8000), 8000)
         with self.assertRaisesRegex(ValueError, "duration differs"):
             app.add_stem(self.project, self.root / "short.wav", "vocals")
@@ -126,11 +131,30 @@ class WorkflowTests(unittest.TestCase):
         drums_only = self.root / "drums.mid"
         export_midi(self.project, drums_only, tracks=[drum], include_chords=False)
         self.assertEqual({m.channel for t in mido.MidiFile(drums_only).tracks for m in t if m.type == "note_on"}, {9})
-        self.assertEqual(len(midi.tracks), 3)
+        self.assertEqual(len(midi.tracks), 4)
         events = [(m.type, m.time) for m in midi.tracks[1] if m.type in ("note_on", "note_off")]
         self.assertEqual(events, [("note_on", 0), ("note_off", 320), ("note_on", 0), ("note_off", 320)])
         self.assertFalse(any(m.type == "pitchwheel" for track in midi.tracks for m in track))
-        self.assertTrue(app.complete(self.project, other))
+        self.assertFalse(app.complete(self.project, other))
+
+    def test_other_midi_import_export_and_legacy_empty_model_migration(self):
+        other = app.add_stem(self.project, self.wav, "other")
+        other.notes.author(F(0), F(1), 72, 81)
+        path = self.root / "other.mid"
+        export_midi(self.project, path, [other], include_chords=False)
+        notes = [message for lane in mido.MidiFile(path).tracks for message in lane
+                 if message.type == "note_on"]
+        self.assertEqual([(n.note, n.velocity, n.channel) for n in notes], [(72, 81, 0)])
+        other.notes = NoteStore()
+        self.assertEqual(import_notes(path, self.project, other), 1)
+        self.assertEqual(other.notes.resolved()[0].pitch, 72)
+        folder = self.root / "project"
+        save_project(self.project, folder)
+        manifest = folder / "project.json"
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+        next(t for t in data["tracks"] if t["role"] == "other")["model"] = ""
+        manifest.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(load_project(folder).track(other.id).model, "basic_pitch")
 
     def test_midi_tempo_map_follows_pinned_anchors(self):
         self.project.grid = Grid(anchors=((0.5, F(0)), (2.5, F(4)), (3.5, F(8))))
