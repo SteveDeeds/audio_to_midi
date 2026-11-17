@@ -18,6 +18,7 @@ song can appear in both batches.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -25,9 +26,99 @@ import sys
 import pretty_midi
 import soundfile as sf
 
+from core.midi_export import load_midi_notes
 from experimental.benchmark.prepare import CLIPS, _plain
 
 ROLES = ("bass", "drums", "piano", "guitar")
+FAMILY_ROUTING_POLICY = "whole-family-energy-v1"
+
+
+def balanced_index(root: Path) -> list[dict]:
+    """Read the balanced batch without touching legacy clips or learned caches."""
+    split = json.loads((root / "splits.json").read_text(encoding="utf-8"))["composition_to_split"]
+    pairs = json.loads((root / "pairs.json").read_text(encoding="utf-8"))
+    routed_pairs = json.loads((root / "training_pairs.json").read_text(encoding="utf-8"))
+    routed = {(pair["composition_id"], pair["stem"]): pair for pair in routed_pairs}
+    if len(routed) != len(routed_pairs):
+        raise ValueError("Repeated routed stem targets in the balanced batch")
+    by_song: dict[str, list[dict]] = {}
+    for pair in pairs:
+        by_song.setdefault(pair["composition_id"], []).append(pair)
+    if set(by_song) != set(split):
+        raise ValueError("Balanced batch and split composition IDs differ")
+    groups: dict[str, str] = {}
+    records = []
+    for song, items in sorted(by_song.items()):
+        assigned_split = split[song]
+        if assigned_split not in ("train", "validation", "test"):
+            raise ValueError(f"{song}: invalid split {assigned_split}")
+        source_groups = {pair["source_group"] for pair in items}
+        if len(source_groups) != 1:
+            raise ValueError(f"{song}: inconsistent source groups")
+        group = source_groups.pop()
+        if groups.setdefault(group, assigned_split) != assigned_split:
+            raise ValueError(f"Source group {group} leaks across splits")
+        directory = root / song
+        route = json.loads((directory / "stem-routing.json").read_text(encoding="utf-8"))
+        if route.get("routing_policy") != FAMILY_ROUTING_POLICY:
+            raise ValueError(f"{song}: reroute the batch using whole-family routing first")
+        destinations = route["family_destinations"]
+        families = {pair["instrument"] for pair in items}
+        if set(destinations) != families:
+            raise ValueError(f"{song}: family routing does not cover the family labels")
+        for note in route["notes"]:
+            if destinations[note["family"]] != note["primary_stem"]:
+                raise ValueError(f"{song}: an instrument family is split across stems")
+        notes, audio, flagged, legacy_flags = {}, {}, {}, {}
+        for pair in items:
+            role = pair["instrument"]
+            if role not in ROLES or role in notes:
+                raise ValueError(f"{song}: unknown or repeated family {role}")
+            notes[role] = sorted(
+                [start, end, pitch, velocity]
+                for start, end, pitch, velocity, _ in load_midi_notes(str(root / pair["midi"]))
+            )
+            audio[role] = str((root / pair["clean_audio"]).resolve())
+            flagged[role] = bool(routed[(song, destinations[role])]["flagged"])
+            legacy_flags[role] = bool(pair["flagged"])
+        other_families = sorted(name for name, stem in destinations.items() if stem == "other")
+        other = routed.get((song, "other"))
+        if bool(other_families) != (other is not None):
+            raise ValueError(f"{song}: other-stem targets disagree with family routing")
+        if "drums" in other_families:
+            raise ValueError(f"{song}: mixed percussion in other requires a separate drum-class target")
+        notes["other"] = []
+        flagged["other"] = False
+        if other is not None:
+            notes["other"] = sorted(
+                [start, end, pitch, velocity]
+                for start, end, pitch, velocity, _ in load_midi_notes(str(root / other["midi"]))
+            )
+            if len(notes["other"]) != other["note_count"]:
+                raise ValueError(f"{song}: other-stem MIDI note count differs from the routed index")
+            if other_families != sorted(other["instrument_families"]):
+                raise ValueError(f"{song}: other-stem instrument families disagree with routing")
+            flagged["other"] = bool(other["flagged"])
+        stems = {name: str((directory / "stems" / f"{name}.wav").resolve())
+                 for name in ("bass", "drums", "piano", "guitar", "other", "vocals")}
+        mix = directory / "mix.wav"
+        for path in [str(mix), *audio.values(), *stems.values()]:
+            if not Path(path).is_file():
+                raise FileNotFoundError(path)
+        records.append({
+            "clip": "balanced_" + hashlib.sha256(song.encode()).hexdigest()[:20],
+            "composition_id": song, "source_group": group,
+            "source_composition_id": items[0]["source_composition_id"],
+            "split": assigned_split, "duration": sf.info(mix).duration,
+            "notes": notes, "family_destinations": destinations, "flagged": flagged,
+            "legacy_family_flagged": legacy_flags,
+            "other_families": other_families,
+            "audio": {"mix": str(mix.resolve()), "stems": stems, "clean": audio},
+            "routing_policy": FAMILY_ROUTING_POLICY,
+        })
+    if len({record["clip"] for record in records}) != len(records):
+        raise ValueError("Balanced clip IDs collided")
+    return records
 
 
 def quarter_anchors(pm: pretty_midi.PrettyMIDI, seconds: float) -> list[list]:

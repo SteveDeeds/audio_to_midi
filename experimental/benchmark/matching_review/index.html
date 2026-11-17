@@ -1,0 +1,124 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>MIDI-to-stem matching pilot</title>
+  <style>
+    body { font: 16px system-ui; margin: 24px auto; max-width: 1250px; padding: 0 16px; background: #101823; color: #edf2fa; }
+    select, button, input, textarea { font: inherit; margin: 4px; padding: 6px; }
+    button { cursor: pointer; }
+    a { color: #8bbcff; }
+    .warning { background: #3b2c19; padding: 12px; border-radius: 6px; }
+    .panel { background: #1a2635; padding: 16px; margin: 16px 0; border-radius: 6px; }
+    #error { color: #ffaaa5; white-space: pre-wrap; }
+    #notes { max-height: 290px; overflow: auto; }
+    table { border-collapse: collapse; width: 100%; font-size: 14px; }
+    th, td { padding: 7px; text-align: left; border-bottom: 1px solid #405064; }
+    tr.selected { background: #344c69; }
+    #notes tbody tr { cursor: pointer; }
+    canvas { width: 100%; height: 220px; background: #0b121a; }
+    .players { display: grid; grid-template-columns: repeat(auto-fit,minmax(275px,1fr)); gap: 12px; }
+    audio { width: 100%; }
+    label { display: inline-block; }
+    #saveState { min-height: 24px; }
+    .save-banner { position: sticky; top: 0; z-index: 5; padding: 12px; background: #24354b; border: 2px solid #6b819d; }
+    [data-state="saved"] { border-color: #83c692; color: #b6efc1; }
+    [data-state="unsaved"], [data-state="error"] { border-color: #f0ad65; color: #ffd1a0; }
+    textarea { display: block; width: calc(100% - 24px); box-sizing: border-box; }
+  </style>
+</head>
+<body>
+  <h1>MIDI-to-stem matching pilot</h1>
+  <div class="save-banner">
+    <div id="saveBanner" role="status" aria-live="polite">No new save confirmed in this session.</div>
+    <div id="connectionStatus" role="status">Checking connection...</div>
+    <button id="refreshSaved">Reconnect / refresh saved data</button>
+  </div>
+  <p class="warning">Training sources only. Scores are spectral-fit heuristics, not probabilities.
+    Clean references can contain overlapping notes. Suggestions are <strong>never training labels</strong>.
+    Confirm only the notes you can actually hear; multiple stems or no audible destination are allowed.
+    Composition/arrangement rights remain unresolved.</p>
+  <p id="summary">Loading existing audio evidence...</p>
+  <div class="panel">
+    <h2>What to listen for</h2>
+    <ol>
+      <li>Click <strong>Click + isolated note</strong>. You hear only the selected note on the right, with metronome clicks slightly left for timing.</li>
+      <li>Click <strong>Click + stem A</strong>, then B. Change their selectors to check all six stems. Find that same pitch and attack, not just the instrument part.</li>
+      <li>Check the stems where that specific note is audible, then click <strong>Save exact-note review</strong>. More than one stem is allowed.
+        Wait for the green <strong>Saved</strong> timestamp. There is no separate acknowledgement checkbox.</li>
+      <li>If the clean reference is too quiet or you cannot distinguish the note, choose <strong>Uncertain / mask</strong>. Do not mark it absent.</li>
+    </ol>
+    <p>The isolated cue is re-rendered with the original SoundFont, channel controls, pitch and velocity, then made audible at a fixed peak level.
+      It is a listening aid, not recovered clean audio or a training target. The older clean-family player still contains other notes.
+      Use headphones for low bass notes.</p>
+  </div>
+  <p id="error" role="alert"></p>
+  <div class="panel">
+    <label>Song <select id="song" aria-label="Song"></select></label>
+    <label>Family <select id="family" aria-label="Family">
+      <option value="all">All</option><option>bass</option><option>drums</option><option>piano</option><option>guitar</option>
+    </select></label>
+    <label>Queue <select id="queue" aria-label="Review queue">
+      <option value="sample" selected>Starting sample (2 per family)</option>
+      <option value="all">All notes</option><option value="suspect">Needs attention</option>
+      <option value="unreviewed">Unreviewed</option><option value="reviewed">Reviewed</option>
+      <option value="recheck">Earlier decisions: recheck exact note</option>
+      <option value="drafts">Unsaved drafts</option>
+    </select></label>
+    <button id="previous">Previous</button><button id="next">Next</button>
+    <p>The starting sample selects harder and clearer examples for each family, not a random accuracy benchmark.
+      Review these first, then expand to all notes as needed.</p>
+    <p id="queueCount"></p>
+    <div id="notes"><table><thead><tr><th>Time</th><th>Family / pitch</th><th>Old stem</th><th>Suggestions</th><th>Review</th></tr></thead><tbody></tbody></table></div>
+  </div>
+  <div class="panel">
+    <h2 id="noteTitle">Select a note</h2>
+    <p id="noteDetails"></p>
+    <p id="reasons"></p>
+    <canvas id="roll" width="1200" height="220" aria-label="Original MIDI piano roll with selected note highlighted"></canvas>
+    <p>Original MIDI timing/pitch shown. Red = selected note; other colors = source families. Offsets are not measured acoustic releases.</p>
+    <h3>Listen with a timing click</h3>
+    <label>Click level <input id="clickLevel" type="range" min="0" max="100" value="35" aria-label="Click level"></label>
+    <button id="contextCue">Click + isolated note</button>
+    <button id="contextA">Click + stem A</button>
+    <button id="contextB">Click + stem B</button>
+    <button id="contextStop">Stop context</button>
+    <p id="contextStatus" role="status">Both comparisons use the same MIDI-timed click: tick on the downbeat, toc on the other beats. Click slightly left; note/stem slightly right.</p>
+    <p>The cue contains exactly one MIDI attack, with a release tail; it does not reproduce whole-voice compression.
+      Clicks follow the original tempo and meter, without snapping the selected note to a beat.
+      Context playback changes only audition gain/pan; clicks are listening aids, not training audio.</p>
+    <div class="players">
+      <div><strong>Mix</strong><audio id="mix" controls preload="metadata"></audio></div>
+      <div><strong>Clean family reference (may include other notes)</strong><audio id="clean" controls preload="metadata"></audio></div>
+      <div><label>Stem A <select id="stemA" aria-label="Stem A"></select></label><audio id="a" controls preload="metadata"></audio></div>
+      <div><label>Stem B <select id="stemB" aria-label="Stem B"></select></label><audio id="b" controls preload="metadata"></audio></div>
+    </div>
+    <p>Playback uses original gains; no independent normalization. Listen to one source at a time to avoid summing audio.</p>
+    <button id="playMix">Replay mix passage</button><button id="playClean">Replay clean reference</button>
+    <button id="playA">Replay A passage</button><button id="playB">Replay B passage</button>
+    <button id="stop">Stop</button>
+    <button id="restoreSound">Restore player sound</button>
+    <p id="playbackStatus" role="status"></p>
+    <table id="evidence"><thead><tr><th>Stem</th><th>Score</th><th>Similarity</th><th>Retention estimate</th><th>Fit residual</th><th>Canned onset/pitch evidence</th></tr></thead><tbody></tbody></table>
+  </div>
+  <div class="panel">
+    <h2>Audible destinations for this note</h2>
+    <p>Check every stem where this specific note is audible. If unclear, mark uncertain rather than guessing.</p>
+    <div id="destinations"></div>
+    <button id="confirm">Save exact-note review</button>
+    <button id="absent">Save: note absent from all stems</button>
+    <button id="uncertain">Save: uncertain / mask</button>
+    <button id="clear">Undo review (keep comment)</button>
+    <p>Saving a review confirms you judged the highlighted note, not merely the whole instrument part.</p>
+    <label for="noteComment">Comment for this note</label>
+    <textarea id="noteComment" rows="4" maxlength="4000" placeholder="What did you hear? Missing note, uncertain pitch, leakage, playback issue..."></textarea>
+    <button id="saveComment">Save comment only</button>
+    <p>Save exact-note review also saves your comment. A comment alone does not confirm a training label.
+      Unsaved edits are kept as browser drafts, not counted as saved reviews.</p>
+    <button id="download">Download decisions</button>
+    <p id="saveState" role="status">Decisions save to the pilot's reviews.json, not the original dataset.</p>
+  </div>
+  <script src="review.js"></script>
+</body>
+</html>

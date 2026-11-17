@@ -1,5 +1,19 @@
 # Vocal audio-to-MIDI experiment
 
+## Branch and worktree separation
+
+Keep application work on `main` and benchmark research on
+`experiment/correction-heads`, using separate worktrees. On this machine,
+`audio_to_midi-main` is the application worktree and `audio_to_midi` is the
+experimental worktree.
+
+Update each branch with `git pull --ff-only` from its own worktree. To bring
+application updates into the experiments, first commit the research changes
+(excluding environments, datasets and generated outputs), then run
+`git merge main` from the experimental worktree after updating `main`.
+Do not merge the entire experimental branch back into `main`; promote only
+reviewed application changes with their focused tests.
+
 ## Interactive parameter GUI
 
 From the repository root:
