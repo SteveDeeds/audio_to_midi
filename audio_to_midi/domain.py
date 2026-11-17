@@ -14,19 +14,11 @@ from uuid import uuid4
 
 from .timebase import Grid, beat_value, finite_number
 from .vocal_settings import VOCAL_MODELS, VocalParameters
+from .model_choices import MODELS, input_source
 
 
 SUPPORTED_ROLES = frozenset({"drums", "bass", "vocals", "piano", "guitar", "other"})
-SUPPORTED_MODELS = frozenset({
-    "", "crepe_tiny", "crepe_full", "pyin",
-    "standard", "bass", "mono", "poly", "manual", "none", "adtof",
-    "percussive_adtof", "basic_pitch", "piano_hr",
-    "bass__crepe_full+onset+key", "bass__crepe_tiny+onset+key",
-    "vocals__pyin+key", "vocals__crepe_full+key",
-    "piano__basic_pitch", "piano__piano_hr",
-    "guitar__basic_pitch", "guitar__piano_hr",
-    *VOCAL_MODELS,
-})
+SUPPORTED_MODELS = frozenset({"", *(model for models in MODELS.values() for model in models)})
 
 
 def _text(value: object, name: str, *, empty: bool = False) -> None:
@@ -72,6 +64,7 @@ class Note:
     pitch: int
     velocity: int = 100
     source: str = "generated"
+    confidence: float | None = None
 
     def __post_init__(self) -> None:
         _text(self.id, "note id")
@@ -79,6 +72,10 @@ class Note:
         _integer(self.pitch, "pitch", 0, 127)
         _integer(self.velocity, "velocity", 1, 127)
         _text(self.source, "source")
+        if self.confidence is not None:
+            finite_number(self.confidence, "note confidence")
+            if not 0 <= self.confidence <= 1:
+                raise ValueError("note confidence must be within 0..1")
 
 
 def _cut(note: Note, start: Fraction, end: Fraction) -> list[Note]:
@@ -104,7 +101,11 @@ def _coalesced(notes: list[Note]) -> list[Note]:
             previous = result[-1]
             if ((previous.id, previous.pitch, previous.velocity, previous.source)
                     == (n.id, n.pitch, n.velocity, n.source) and n.start <= previous.end):
-                result[-1] = replace(previous, end=max(previous.end, n.end))
+                confidence = (
+                    min(previous.confidence, n.confidence)
+                    if previous.confidence is not None and n.confidence is not None else None
+                )
+                result[-1] = replace(previous, end=max(previous.end, n.end), confidence=confidence)
                 continue
         result.append(n)
     return _ordered(result)
@@ -125,6 +126,7 @@ class NoteStore:
     rejections: list[tuple[Fraction, Fraction, int | None]] = field(default_factory=list)
     onsets: list[Fraction] = field(default_factory=list)
     revision: int = 0
+    detection_level: int = 100
     _undo: list[_Edit] = field(default_factory=list, init=False, repr=False, compare=False)
     _redo: list[_Edit] = field(default_factory=list, init=False, repr=False, compare=False)
 
@@ -138,6 +140,7 @@ class NoteStore:
 
     def validate(self) -> None:
         _integer(self.revision, "note revision", 0)
+        _integer(self.detection_level, "detection level", 0, 100)
         for name in ("generated", "authored", "rejections", "onsets"):
             if type(getattr(self, name)) is not list:
                 raise ValueError(f"{name} must be a list")
@@ -157,7 +160,13 @@ class NoteStore:
 
     def resolved(self) -> list[Note]:
         result = list(self.authored)
-        proposals = _coalesced(self.generated)
+        proposals = [
+            n for n in _coalesced(self.generated)
+            if self.detection_level == 100 or (
+                self.detection_level > 0 and n.confidence is not None
+                and n.confidence >= 1 - self.detection_level / 100
+            )
+        ]
         by_pitch: dict[int, list[Note]] = {}
         for note in proposals:
             by_pitch.setdefault(note.pitch, []).append(note)
@@ -355,6 +364,8 @@ class Track:
             raise ValueError(f"unsupported role: {self.role!r}")
         if not isinstance(self.model, str) or self.model not in SUPPORTED_MODELS:
             raise ValueError(f"unsupported model: {self.model!r}")
+        if self.model and self.model not in MODELS[self.role]:
+            raise ValueError(f"unsupported {self.role} model: {self.model!r}")
         finite_number(self.duration, "duration")
         if self.duration < 0:
             raise ValueError("duration must be nonnegative")
@@ -365,6 +376,7 @@ class Track:
         self.notes.validate()
         if type(self.settings) is not dict or type(self.training) is not list:
             raise ValueError("settings must be a dict and training a list")
+        input_source(self)
         if "vocal_parameters" in self.settings:
             VocalParameters.from_dict(self.settings["vocal_parameters"])
         if "madmom_license_acknowledged" in self.settings and type(self.settings["madmom_license_acknowledged"]) is not bool:

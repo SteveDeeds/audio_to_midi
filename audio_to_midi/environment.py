@@ -17,6 +17,7 @@ OPTIONAL_PACKAGES = {
     "onnxruntime": "onnxruntime", "mir_eval": "mir_eval", "resampy": "resampy",
     "scikit-learn": "sklearn", "piano-transcription-inference": "piano_transcription_inference",
     "adtof-pytorch": "adtof_pytorch", "demucs": "demucs", "madmom": "madmom",
+    "mt3-infer": "mt3_infer",
 }
 PIANO_HR_CHECKPOINT = Path.home() / "piano_transcription_inference_data" / "note_F1=0.9677_pedal_F1=0.9186.pth"
 

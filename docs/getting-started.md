@@ -31,13 +31,26 @@ use Python 3.12 and run:
 
 The base installation supports the editor, MIDI import/export, the `pyin`
 vocal model, and mix preparation. Everything else installs itself the first
-time you use it: when you pick a model (CREPE, Basic Pitch, Piano-HR, ADTOF) or
+time you use it: when you pick a model (CREPE, Basic Pitch, Piano-HR, ADTOF, YourMT3+) or
 run **Separate stems**, the app asks once, then pip-installs the packages into
 the Python it is running on and downloads the weights to their usual cache. You
 never choose a Python or a model folder. This needs an internet connection the
 first time; the status bar shows progress, and **Cancel** stops it. ADTOF needs
 `git` on PATH. ADTOF drum weights are non-commercial; review the piano-HR
 checkpoint terms before relying on it.
+
+YourMT3+ uses a separate, automatically created environment at
+`~/.audio_to_midi/yourmt3` with the validated `mt3-infer==0.2.0` adapter and
+`transformers==4.45.1` runtime.
+Its MoE multi-track no-pitch-shift checkpoint (the bake-off's YourMT3+ variant)
+is downloaded once to `~/.cache/mt3-infer/yourmt3`. GPU inference is used when
+available, with supported CPU fallback. `ATM_DEVICE=auto|cpu|cuda` controls
+device selection; explicitly requesting unavailable CUDA reports an error.
+App inference/separation workers coordinate exclusive GPU ownership. Faster
+models fall back to CPU while the YourMT3+ worker uses GPU, rather than queueing
+behind it. External programs/benchmark processes do not participate in this lock.
+Advanced deployments can set `ATM_YOURMT3_PYTHON` and
+`ATM_YOURMT3_CHECKPOINT`; checkpoint bytes remain part of cache identity.
 
 The optional `madmom_cnn` and `madmom_brnn` vocal models also install on first
 use. Their onset weights are **CC BY-NC-SA 4.0 (non-commercial)**; the app asks
@@ -66,8 +79,9 @@ workers, and chord-analysis pipeline have been removed. Chord symbols, voicings,
 and template recognition now live in `audio_to_midi.chords`; the shared
 key-to-scale helper remains in `core.chord_analysis`.
 This does not delete or migrate any projects,
-audio, MIDI, profiles, logs, or model caches. Existing project-editor projects
-and preferences keep their current formats and settings location. Compatible
+audio, MIDI, profiles, logs, or model caches. The current project format is
+**schema 4**; schema 3 projects still open with unknown note confidence.
+Older schemas and unsupported model aliases are rejected. Preferences keep their current settings location. Compatible
 onset examples can still be imported from older profiles; legacy session state
 is not converted automatically.
 
@@ -149,6 +163,17 @@ app which beats are downbeats, and it counts every other beat from them.
 - Exported MIDI carries the tempo map as tempo changes, so it lines up with
   the original recording in a DAW.
 
+You can also count bars while listening to **any stem** (drums, bass, vocals,
+or another part). Choose that track and **Info (I)** to see the same colored
+beat markers over its audio and notes. Right-click in the waveform,
+spectrogram, or note lanes for the timing menu. A pin uses **exactly where you
+right-clicked**, not the nearest detected beat or the note's start; click the
+attack you hear or see. If there is no beat there, choosing a downbeat adds
+and pins one. Pins are shared by all tracks and the Mix view, not per-stem.
+Left-click a beat in the upper lane to select it for **D** / **U**.
+Near a beat marker, *Unpin nearby beat* and *Remove nearby beat* let you
+manage that marker; downbeat pinning still uses the exact click position.
+
 **Tap downbeats instead.** Check **Edit > Tap downbeats**. The mix plays from
 the current window, and you press **Space** on the "one" of every bar. Your
 taps appear as markers on the initial keypress; holding Space does not add
@@ -194,23 +219,160 @@ Either:
   file name, and you can change it.
 
 The roles are `bass`, `vocals`, `piano`, `guitar`, `drums`, and `other`; one
-track per role. `other` is harmony context only and produces no notes.
+track per role. All roles support transcription. `other` also supplies harmony context.
 
 ## 5. Transcribe and correct notes
 
 Choose a stem in **Track** and its **Model** next to it:
 
-| Role | Models |
+| Role | Models, in ranked order |
 |---|---|
-| Bass | `crepe_tiny`, `crepe_full` |
-| Vocals | `pyin`, `crepe_full`, `crepe_tiny` |
-| Piano / guitar | `basic_pitch`, `piano_hr` |
-| Drums | `adtof` |
+| Bass | madmom CNN + CREPE full; Piano HR; madmom offline BRNN + CREPE full |
+| Guitar | Basic Pitch; YourMT3+; madmom CNN + CREPE full |
+| Piano | Piano HR; YourMT3+; Basic Pitch |
+| Drums | ADTOF; YourMT3+ |
+| Other | Basic Pitch; YourMT3+; Piano HR |
+| Vocals (unchanged, not bake-off ranked) | `pyin`, `crepe_full`, `crepe_tiny`, `madmom_cnn`, `madmom_brnn` |
+
+MR-MT3 is not offered. Basic Pitch replaces the effectively tied MR-MT3 piano
+choice; drums have only two ranked choices. Bass Piano HR is filtered to MIDI
+28-67. The instrumental madmom combinations use range-limited CREPE-full pitch
+(bass 32.71-420 Hz; guitar 75-1400 Hz) and either CNN onsets or the offline
+bidirectional RNN detector. They do **not** use the vocal syllable pipeline.
+They retain the existing onset-grid editing, feedback and duration policies.
+
+### YourMT3+ background results and provenance
+
+YourMT3+ inference runs in its own worker/subprocess, independent of the
+ordinary analysis lane. Other model results, editing and navigation do not
+wait for it. A separate status field reports queueing, model loading, segment
+progress, decoding, cancellation and failures. Duplicate requests for the same
+track/input are not launched twice. Changing its model or source cancels that
+track's job; changing/opening projects or importing a new mix cancels all jobs.
+Publication tokens reject results after audio, grid, model, source or edits change.
+Esc/Cancel also terminates the inference subprocess, including during loading.
+
+Choose **Stem-derived** or **Full-mix-derived** beside the YourMT3+ selector.
+Both outputs are cached separately; no source is silently substituted.
+Full-mix evidence retains all decoded instruments; piano/guitar track proposals
+select GM program families 0-7/24-31, and drums select drum flags. Stem-derived
+pitched proposals keep all non-drum predictions, including instrument
+misclassifications. The full-mix option is especially useful for piano:
+reviewed mix F1 was 0.810 versus 0.722 on the piano stem. These are historical
+scores, not retuned defaults. Visible-bar analysis publishes only its requested
+interval, even though the reusable inference covers the whole input.
+CLI: `transcribe <project> piano --source mix` (select `yourmt3` on that track first).
+
+### Disposable evidence cache and threshold replay
+
+Inference evidence lives under the app's **`cache/inference/v1`** folder
+(`ATM_CACHE_DIR` overrides the cache root), not in project manifests or benchmark
+evidence directories. Reopening, switching models and changing decoding
+thresholds reuse it. Deleting the cache folder is safe: missing evidence is
+regenerated when needed without cache-missing warnings or dialogs.
+Actual invalid/corrupt entries report an explicit error naming the entry to
+delete; they are not silently discarded or overwritten.
+
+Keys include content hashes, mix/stem role provenance, model/package and
+checkpoint identity, inference parameters and evidence schema version.
+Writes are atomic, arrays are validated/checksummed, and per-key OS locks avoid
+duplicate inference. The two compatible madmom combinations share CREPE-full
+evidence for matching audio crops. Instrumental CREPE/madmom, Basic Pitch and
+Piano HR inference now use bounded crops with overlapping context;
+file-based crop keys also include their time bounds, separate from older
+whole-file archives. Completed crops survive navigation and can be reused after
+reopening a project. Preserved evidence includes Basic Pitch onset/frame/contour matrices;
+Piano HR continuous onset/offset/frame/velocity and pedal planes; untouched
+CREPE pitch-bin activations, unmasked F0, periodicity and smoothed periodicity;
+pYIN unmasked F0, voiced flags/probabilities; madmom onset curves; ADTOF class
+activations/novelty; and YourMT3+ decoded note times, pitches, programs,
+velocities and drum flags. Neural vocal windows retain their existing bounds.
+Threshold-dependent grid notes and feedback are replayed separately from
+these inference archives, not treated as reusable neural evidence.
+
+The **AI notes: None -- All** slider filters existing predictions using their
+model-specific evidence scores; it does not change decoder thresholds or rerun
+inference. The existing vocal parameter controls still work. The backend
+`decoder_parameters` API supports native onset/frame thresholds for Basic
+Pitch/Piano HR, onset/voicing thresholds for instrumental madmom, novelty
+thresholds for ADTOF, and voicing thresholds for legacy CREPE/pYIN. These are
+not a shared calibrated confidence scale. Zero does not create every possible
+note: local maxima, frequency ranges, voicing/energy, duration, grid and
+structural decoding policies still apply.
+
+**YourMT3+ does not support faithful confidence replay.** Inspection of the
+validated adapter's `forward`/`decode`, vendored `inference_file`, and
+`t5mod_helper` generation confirms that token logits are reduced to argmax
+IDs and not returned/retained; teacher-forced loss is absent without reference
+tokens. Decode returns MIDI notes/programs/drum flags/velocities, not note
+probabilities. Retaining autoregressive token scores and defining a defensible
+token-to-note confidence would require a materially different interface and
+semantics. Velocity is never used as confidence. Threshold requests for this
+backend are explicitly rejected. The source selector tooltip explains this
+limitation. YourMT3+ notes have unknown confidence: they appear at **All** and
+are hidden at lower slider positions, without treating velocity as confidence.
+
+Validation covers the app's model choices/project schema, worker cancellation
+and stale publication, disk-cache reuse/invalidation/corruption, and native
+threshold replay. Opt-in real-checkpoint smoke tests exercise all 19 exposed
+role/model/source combinations, reopen the project, and forbid neural inference
+while replaying cached evidence (including thresholds 0, 0.8 and 1).
+Run these opt-in tests with both GPU/auto and CPU settings; benchmark scores/references are not
+changed. To repeat the real-model check in a provisioned environment:
+
+```powershell
+$env:ATM_RUN_MODEL_TESTS = "1"
+$env:ATM_DEVICE = "auto" # repeat with "cpu"
+python -m unittest tests.test_models_live
+```
+
+### Choosing how many AI notes to keep
+
+Each instrument track has an **AI notes: None -- All** slider. At the far left,
+all AI-generated notes are hidden so you can start from scratch; move slightly
+right to keep only notes with the strongest detection evidence. At the far
+right, all notes returned by the detector are included, even low-confidence
+ones. Manual edits and imported MIDI remain visible at every position.
+
+The filter applies to the whole track, playback, MIDI, and MusicXML export.
+It does not delete predictions, train the model, or rerun detection. Moving it
+back restores filtered notes, except notes you explicitly deleted. The position
+is saved per track and supports Undo/Redo.
+
+Evidence scores are model-specific, not calibrated probabilities: Basic Pitch
+uses its note activation, Piano-HR uses pitch-frame activation (not key velocity),
+drums use hit strength, and monophonic models use pitch-frame agreement.
+Older saved detections have unknown scores and appear only at **All**; analyze
+again to obtain scores. **All** includes the detector's returned candidates,
+not notes excluded by its internal decoder thresholds or pitch range.
+New saves use project schema 4; schema 3 projects still open, but older app
+versions cannot read new saves.
+
+### Running detection
 
 With **Model > Reanalyze after edits** checked (the default), the visible bars
-are analyzed automatically. **Model > Analyze visible bars** and
-**Analyze whole track** run it on demand; **Cancel analysis** (Esc, or the
-button in the status bar) stops it.
+are analyzed first, then nearby undisplayed bars and the rest of the active
+track in the background. **Model > Analyze visible bars** only processes the
+displayed range; **Analyze whole track** also starts with the visible range.
+The first visible chunk is one meter beat, then chunks finish the current bar
+and continue one bar at a time. Notes appear after each completed chunk rather
+than waiting for the song. Status messages identify visible/background work,
+the bar, track coverage and CREPE frame progress/device. Initial model loading
+and note-dynamics preparation can take longer than later chunks on a CPU.
+
+**Cancel analysis** (Esc, or the button in the status bar) stops it. Unchecking
+**Reanalyze after edits** stops automatic analysis and its background continuation.
+Neural syllable-aware vocal models remain visible-only, with their existing
+window semantics; they no longer impose a process-wide four-thread PyTorch cap.
+CREPE uses small interruptible CPU frame batches, then decodes the full crop
+together to preserve pitch continuity. `ATM_CREPE_BATCH_SIZE` overrides the
+batch size if explicit tuning is needed; the model capacity is unchanged.
+YourMT3+ retains its separate whole-file worker. ADTOF keeps its shared
+whole-stem evidence and drum-velocity normalization, but publishes requested
+chunks separately after that evidence is ready.
+Learned onset features use padded local chroma windows; imported legacy onset
+profiles retain their whole-stem features for compatibility. Harmonic note
+velocity still uses the same whole-stem loudness reference.
 Background activity messages clear when the task finishes or stops after cancellation.
 Errors and result summaries remain visible.
 Status messages stay on one line without resizing the piano roll; hover over
@@ -218,13 +380,26 @@ the status text to read the full message, including any original line breaks.
 
 **Navigate** with **Previous** / **Next** (Left / Right arrow, or PgUp / PgDn);
 each step scrolls half a screen. The label between them
-shows the visible bars. **Zoom out (-)** / **Zoom in (+)** next to them (also
+shows the visible bars. **|<<** beside Play (also **Home** or **View > Rewind to start**)
+stops playback and returns to bar 1.
+Holding an arrow key does not queue every bar: automatic analysis waits for
+navigation to settle, cancels obsolete work, and keeps at most one pending
+request in the ordinary analysis lane, replacing older requests with the latest.
+Holding Left at bar 1 leaves that window's analysis running.
+YourMT3+ uses its separate lane with at most one pending retry per track;
+unchanged input is not queued again.
+**Zoom out (-)** / **Zoom in (+)** next to the navigation buttons (also
 Ctrl + mouse wheel, View > Zoom, Ctrl+- / Ctrl+=) show 1, 2, 4, 8 or 16 bars per
 screen; the readout beside the buttons shows the current setting. **Up / Down arrows**
 shift the piano-roll view up / down one octave without transposing notes, stopping
 at MIDI pitches 0 and 127. The plain mouse wheel scrolls pitch; **Ctrl + Shift + wheel**
 zooms pitch (not in the drums view). **Grid** sets the editing step (1/4 to 1/32, including
 triplets).
+
+Vertical roll lines come only from the musical grid: white bar lines, muted
+orange-gray beat lines, and darker blue-gray subdivision lines set by **Grid**.
+Onset and detected-beat markers stay in the upper lane without adding or
+recoloring lines through the roll.
 
 The piano roll shows the stem's spectrogram behind the notes: a sustained
 pitch is a bright horizontal band. Brightness is measured against the loudest
@@ -235,6 +410,13 @@ same way, on a 40 dB log scale so weaker chord tones still show. Blue notes are 
 are yours. **Hover over a note** to see its name, the bar and beat it starts
 on, its length and velocity.
 
+**Left-click a blue note with the Brush tool to confirm it.** It turns green,
+keeping its pitch, timing, and velocity, and stays visible even with **AI notes**
+set to **None**. Confirmation is saved and supports Undo/Redo; clicking a green
+note just selects it. A click on the release edge also confirms; dragging the
+edge still resizes. The Info tool continues to open the note dialog without
+confirming merely by opening it.
+
 Velocity comes from how loud the note is in its stem: the power at the note's
 pitch and its first harmonics over the note's first 200 ms, compared with the
 loudest notes of the whole stem (General MIDI curve, so 12 dB quieter is about
@@ -243,7 +425,8 @@ model predicts piano key velocities itself. Drum velocity is the RMS level at
 each hit in that kit piece's band (kick 30-150 Hz, snare 150 Hz-5 kHz, toms
 60-600 Hz, hi-hat 6-16 kHz, cymbals 4-16 kHz), so a kick and a hi-hat on the
 same beat are measured separately; each piece is scaled to its own loudest
-hits. Notes you draw start at 100.
+hits. YourMT3+ preserves its decoded velocities, without interpreting them as
+confidence. Notes you draw start at 100.
 
 ### Syllable-aware vocals
 
@@ -315,9 +498,14 @@ marker once a note actually starts there.
 - **Info (I)**: click a note to open a small editor with its bar, beat, length
   in beats, pitch and velocity, plus **Delete note**. Beats accept `2 1/2`,
   `5/2` or `2.5`; pitches accept `Eb4` or `63`. Clicking empty space does
-  nothing, so you can inspect notes without adding any. Right-click still
-  deletes. Starts must fit the selected grid; note ends can use half-grid
-  intervals, just like dragging.
+  nothing, so you can inspect notes without adding any. **Right-click** opens
+  a context menu instead of immediately deleting: on a note it includes
+  **Note details...** and **Delete note**, plus shared beat/downbeat controls
+  at the exact clicked audio position. Empty space offers the timing controls
+  too. Detect beats first to enable timing actions. The upper lane shows
+  counted beats and pins alongside note onsets without editing onset boundaries;
+  switch to **Brush (B)** to add or remove onsets. Starts must fit the selected
+  grid; note ends can use half-grid intervals, just like dragging.
 
 **Drums** have their own view: the spectrogram fills the top half, and below it
 are ADTOF's five lanes - Cymbal, Hi-hat, Tom, Snare and Kick - instead of piano
@@ -454,11 +642,26 @@ The setting is remembered.
   writing a partial file.
 - **File > Export score (MusicXML)...** writes a MuseScore-ready score with
   the transcribed tracks and the chord symbols on the top staff. Bass and drums
-  are named **Electric Bass** and **Drum Kit**. Scores and chord-only lead sheets
+  are named **Electric Bass** and **Drum Kit**. The first drum instrument is also
+  named **Drum Kit** so MuseScore selects full-kit playback rather than a single
+  percussion instrument; individual GM drum pitches are unchanged. MuseScore's
+  own MusicXML re-export can replace that name with **Bass Drum**, causing wrong
+  sounds on reimport. Keep the native `.mscz` file after editing, or use a fresh
+  app export.
+  Scores and chord-only lead sheets
   have one opening tempo: total quarter-note beats divided by elapsed time
   between the first and last timing anchors (or the set BPM without a timing
   map). No later tempo changes are exported, even for playback. MIDI retains
   the original tempo map to stay aligned with the audio.
+  Score export asks for **Quantization**, defaulting to **1/16** notes independently
+  of the editor grid. Triplets are only used when explicitly selected (available
+  in meters with quarter-note notation beats). Gaps shorter than the selected
+  quantization are omitted as ordinary articulation, without a slur. Originally
+  touching notes receive a slur; rests at least one quantization step long remain.
+  These changes affect only the exported score, not project notes or MIDI.
+  For command-line score export, use `--quantization` in quarter-note units:
+  `1/4` means sixteenths (default), `1/8` means thirty-seconds, and `1/6`
+  means sixteenth triplets.
 
 ## Troubleshooting
 

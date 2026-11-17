@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 import hashlib
@@ -17,6 +17,7 @@ from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.adapters import MODELS, Prediction, TrackBackend, normalize_key
 from audio_to_midi.notation import preferred_key
 from audio_to_midi.vocal_settings import VOCAL_MODELS
+from audio_to_midi.evidence_cache import checksum
 
 
 def add_stem(project: Project, path: Path, role: str) -> Track:
@@ -126,7 +127,8 @@ def publish(project: Project, result_token: ResultToken, prediction: Prediction)
     track.notes.replace_generated(prediction.start, prediction.end, list(prediction.notes))
     track.notes.onsets = sorted(
         {b for b in track.notes.onsets if not prediction.start <= b < prediction.end}
-        | {n.start for n in track.notes.resolved() if prediction.start <= n.start < prediction.end}
+        | {n.start for n in replace(track.notes, detection_level=100).resolved()
+           if prediction.start <= n.start < prediction.end}
     )
     coverage = track.settings.get("coverage", []) if (
         track.settings.get("coverage_identity") == result_token.identity
@@ -146,8 +148,6 @@ def publish(project: Project, result_token: ResultToken, prediction: Prediction)
 
 
 def complete(project: Project, track: Track) -> bool:
-    if track.role == "other":
-        return True
     if track.settings.get("imported_midi") and not track.notes.generated:
         return True
     return covered(project, track, Fraction(0), track_end(project, track))
@@ -171,17 +171,23 @@ class TranscriptionService:
     def predict(
         self, project: Project, track: Track, start: Fraction, end: Fraction,
         cancelled: Callable[[], bool] = lambda: False,
+        report: Callable[[str], None] = lambda text: None,
     ) -> Prediction:
         if start < 0 or end <= start or end > track_end(project, track):
             raise ValueError("Invalid transcription interval.")
         if project.grid.snap(start) != start:
             raise ValueError("Transcription starts must lie on the selected onset grid.")
+        report("Preparing audio and inference backend...")
         backend_key = repr((
             project.id, track.id, media_identity(track.audio_path),
+            checksum(Path(track.audio_path)),
             project.grid, project.key, track.model,
             harmony_identity(project),
+            [(path, checksum(Path(path))) for path, _, _ in harmony_identity(project)],
             track.settings.get("license_acknowledged", False),
             track.settings.get("madmom_license_acknowledged", False),
+            track.settings.get("inference_source", "stem"),
+            track.settings.get("decoder_parameters", {}),
         ))
         cached = self._backends.get(track.id)
         if cached is None or cached[0] != backend_key:
@@ -189,7 +195,7 @@ class TranscriptionService:
             self._backends[track.id] = backend_key, backend
         else:
             backend = cached[1]
-        return backend.predict(track, start, end, cancelled)
+        return backend.predict(track, start, end, cancelled, report)
 
 
 def record_onset(track: Track, beat: Fraction, keep: bool) -> None:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from fractions import Fraction
 from pathlib import Path
 
@@ -15,17 +15,9 @@ from audio_to_midi.domain import Note, NoteStore, Project, Track
 from audio_to_midi import velocity
 from core.models import CorrectionModel
 from core import onset_features
+from core.mono_pitch import pitch_agreement
 from audio_to_midi.vocal_settings import VOCAL_MODELS, VocalParameters
-
-
-MODELS = {
-    "bass": ("crepe_tiny", "crepe_full"),
-    "vocals": ("pyin", "crepe_full", "crepe_tiny", *VOCAL_MODELS),
-    "piano": ("basic_pitch", "piano_hr"),
-    "guitar": ("basic_pitch", "piano_hr"),
-    "drums": ("adtof",),
-    "other": (),
-}
+from audio_to_midi.model_choices import MODELS, MADMOM_COMBINATIONS, input_source
 
 
 def normalize_key(value: str) -> str:
@@ -79,11 +71,22 @@ class TrackBackend:
         self.duration = len(self.audio) / self.sr
         self.project_key = project.key
         self.provider = None
-        self._feature_data = None
+        self._feature_windows: dict[int, tuple] = {}
+        self._legacy_features = bool(track.settings.get("onset_profile"))
         self._cqt_data = None
         self._drum_levels = None
         self._path = track.audio_path
-        license_key = "madmom_license_acknowledged" if track.model in VOCAL_MODELS else "license_acknowledged"
+        self._source = input_source(track)
+        self._inference_path = project.mix_path if self._source == "mix" else track.audio_path
+        if not self._inference_path:
+            raise ValueError("Mix-derived YourMT3+ requires a full mix in this project.")
+        self._decoder_parameters = track.settings.get("decoder_parameters", {})
+        if not isinstance(self._decoder_parameters, dict):
+            raise ValueError("Decoder parameters must be an object.")
+        from audio_to_midi.model_evidence import validate_parameters
+        validate_parameters(self.model, self._decoder_parameters)
+        self.monophonic = self.role == "vocals" or self.model in MADMOM_COMBINATIONS
+        license_key = "madmom_license_acknowledged" if track.model in (*VOCAL_MODELS, *MADMOM_COMBINATIONS) else "license_acknowledged"
         self._license_acknowledged = track.settings.get(license_key, False) is True
         self.features: dict[Fraction, tuple[float, float, float, float]] = {}
         self.attacks: np.ndarray | None = None
@@ -95,13 +98,11 @@ class TrackBackend:
         self._other_path = next((t.audio_path for t in project.tracks if t.role == "other"), None)
 
     def _check_provider(self) -> None:
-        if self.role == "other":
-            raise ValueError("Other is harmony context only; it has no MIDI provider.")
         if self.model not in MODELS[self.role]:
             raise ValueError(f"Unsupported {self.role} model: {self.model}")
         if self.provider is not None:
             return
-        if (self.role == "drums" or self.model == "piano_hr" or self.model in VOCAL_MODELS) and not self._license_acknowledged:
+        if (self.model in ("adtof", "piano_hr", *VOCAL_MODELS, *MADMOM_COMBINATIONS)) and not self._license_acknowledged:
             raise ValueError(
                 "Acknowledge this backend's checkpoint license and possible first-use download "
                 "before transcription (ADTOF/MADMoM onset weights are non-commercial; review piano-HR terms)."
@@ -111,11 +112,17 @@ class TrackBackend:
 
             self.provider = VocalTranscriber(self.audio, self.sr, self.model, normalize_key(self.project_key))
             return
-        if self.role in ("bass", "vocals"):
+        if self.model == "yourmt3":
+            return
+        if self.model in MADMOM_COMBINATIONS:
+            from audio_to_midi.evidence_providers import InstrumentOnsetTranscriber
+            self.provider = InstrumentOnsetTranscriber(self.audio, self.sr, self._path, self._decoder_parameters)
+        elif self.role == "vocals":
             from core.mono_pitch import MonoTranscriber
             from core.chord_analysis import key_to_scale_pcs
 
             provider = MonoTranscriber(self.audio, self.sr, self.track_id)
+            provider.decoder_parameters = self._decoder_parameters
             # Supply explicit project harmony rather than filename-based siblings.
             key = normalize_key(self.project_key or self._detect_project_key())
             scale = key_to_scale_pcs(key)
@@ -136,10 +143,9 @@ class TrackBackend:
             provider._context = scale, harmony_times, harmony
             provider._context_window = None
             self.provider = provider
-        elif self.role in ("piano", "guitar"):
-            from core.poly_pitch import PolyTranscriber
-
-            self.provider = PolyTranscriber(self.audio, self.sr)
+        elif self.role in ("bass", "piano", "guitar", "other"):
+            from audio_to_midi.evidence_providers import EvidencePolyTranscriber
+            self.provider = EvidencePolyTranscriber(self.audio, self.sr, self._path, self._decoder_parameters)
         else:
             from core.adtof_drums import AdtofDrumTranscriber
 
@@ -169,17 +175,26 @@ class TrackBackend:
             return cached
         time = self.grid.beat_to_seconds(beat)
         half = (self.grid.beat_to_seconds(beat + self.grid.subdivision) - time) / 2
-        if self._feature_data is None:
+        # Imported profiles retain the exact whole-stem feature normalization.
+        window = -1 if self._legacy_features else int(
+            max(0.0, min(time, self.duration - 1 / self.sr)) // 4)
+        data = self._feature_windows.get(window)
+        if data is None:
+            first = 0 if window < 0 else max(0, int((window * 4 - 2) * self.sr) // 512 * 512)
+            last = len(self.audio) if window < 0 else min(len(self.audio), int((window * 4 + 6) * self.sr))
+            audio = self.audio[first:last]
+            offset = first / self.sr
             smooth = max(16, int(0.028 * self.sr))
-            envelope = np.convolve(np.abs(self.audio).astype(float), np.ones(smooth) / smooth, mode="same")
+            envelope = np.convolve(np.abs(audio).astype(float), np.ones(smooth) / smooth, mode="same")
             samples = np.arange(0, len(envelope), 512)
             chroma = librosa.feature.chroma_cqt(
-                y=self.audio, sr=self.sr, hop_length=512, bins_per_octave=36,
+                y=audio, sr=self.sr, hop_length=512, bins_per_octave=36,
             )
             cqt_times, magnitude = self._cqt()
-            times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr, hop_length=512)
-            self._feature_data = samples / self.sr, envelope[samples], times, chroma, cqt_times, magnitude
-        env_times, envelope, times, chroma, cqt_times, magnitude = self._feature_data
+            times = librosa.frames_to_time(np.arange(chroma.shape[1]), sr=self.sr, hop_length=512) + offset
+            data = samples / self.sr + offset, envelope[samples], times, chroma, cqt_times, magnitude
+            self._feature_windows[window] = data
+        env_times, envelope, times, chroma, cqt_times, magnitude = data
         a, b = max(0.0, time - half), min(self.duration, time + half)
         transient = onset_features.transient_intensity(env_times, envelope, a, b)
         delta = onset_features.chroma_delta(times, chroma, time, half * 2)
@@ -235,6 +250,7 @@ class TrackBackend:
     def predict(
         self, track: Track, start: Fraction, end: Fraction,
         cancelled: Callable[[], bool],
+        report: Callable[[str], None] = lambda text: None,
     ) -> Prediction:
         if cancelled():
             raise Cancelled()
@@ -245,6 +261,21 @@ class TrackBackend:
         t1 = min(self.duration, grid.beat_to_seconds(end))
         if t1 <= t0:
             raise ValueError("Requested interval has no audio.")
+        if self.model == "yourmt3":
+            from audio_to_midi.model_evidence import file_evidence
+            from audio_to_midi.yourmt3 import select_notes
+            source = "mix" if self._source == "mix" else f"stem:{self.role}"
+            arrays = file_evidence(self._inference_path, source, "yourmt3", cancelled, report)
+            rows = select_notes(arrays, self.role, self._source, self._decoder_parameters)
+            notes = []
+            for a, b, pitch, level, program, drum in rows:
+                beat = max(Fraction(0), grid.snap(grid.seconds_to_beat(float(a))))
+                if start <= beat < end:
+                    stop = min(end, max(beat + grid.subdivision, grid.snap_end(grid.seconds_to_beat(float(b)))))
+                    notes.append(self._note(beat, stop, int(pitch), int(level)))
+            if cancelled():
+                raise Cancelled()
+            return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
         if self.role == "vocals" and self.model in VOCAL_MODELS:
             parameters = VocalParameters.from_dict(track.settings.get("vocal_parameters", {}))
             notes, _ = provider.transcribe(track.id, grid, start, end, parameters,
@@ -260,10 +291,17 @@ class TrackBackend:
             return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
         audio_start = min(end, max(start, grid.snap(grid.seconds_to_beat(t0))))
         if self.role == "drums":
-            provider.prepare()
+            from audio_to_midi.model_evidence import file_evidence, threshold
+            if not provider.ready:
+                arrays = file_evidence(self._path, f"stem:{self.role}", "adtof", cancelled, report)
+                provider.set_activations(arrays["activation"])
             # Replay only the current snapshot so undo also undoes adaptation.
             from core.adtof_drums import AdtofDrumTranscriber
-            fresh = AdtofDrumTranscriber(self._path)
+            defaults = (
+                [threshold(self._decoder_parameters, "onset_threshold", 0)] * 5
+                if "onset_threshold" in self._decoder_parameters else provider._defaults
+            )
+            fresh = AdtofDrumTranscriber(self._path, defaults)
             fresh.set_activations(provider._act)
             self.provider = provider = fresh
             for label in track.training:
@@ -282,17 +320,27 @@ class TrackBackend:
             for hit, level in zip(hits, levels):
                 beat = max(Fraction(0), grid.snap(grid.seconds_to_beat(hit.time)))
                 if start <= beat < end:
-                    notes.append(self._note(beat, min(end, beat + grid.subdivision), hit.midi, level))
+                    notes.append(replace(
+                        self._note(beat, min(end, beat + grid.subdivision), hit.midi, level),
+                        confidence=float(hit.strength),
+                    ))
             if cancelled():
                 raise Cancelled()
             return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
 
+        from audio_to_midi.evidence_providers import EvidencePolyTranscriber, InstrumentOnsetTranscriber
+        if isinstance(provider, (EvidencePolyTranscriber, InstrumentOnsetTranscriber)):
+            provider.report = report
         if not provider.prepare(t0, t1, self.role, self.model, should_cancel=cancelled):
             raise Cancelled()
         if cancelled():
             raise Cancelled()
-        if self.attacks is None or self.role in ("piano", "guitar"):
-            self.attacks = provider.onset_times(self.role, self.model)
+        self.attacks = provider.onset_times(self.role, self.model)
+        report("Applying learned edits and measuring note dynamics...")
+        legacy_features = bool(track.settings.get("onset_profile"))
+        if legacy_features != self._legacy_features:
+            self.features.clear()
+            self._legacy_features = legacy_features
         baseline = {
             max(Fraction(0), grid.snap(grid.seconds_to_beat(float(t))))
             for t in self.attacks
@@ -333,7 +381,7 @@ class TrackBackend:
                 active.discard(beat)
         active.update(n.start for n in track.notes.authored if start <= n.start < end)
         # Held changes are an explicit backend policy, not raw f0 boundaries.
-        if self.role in ("bass", "vocals") and track.settings.get("stable_pitch_changes", True):
+        if self.monophonic and track.settings.get("stable_pitch_changes", True):
             active.update(
                 grid.snap(grid.seconds_to_beat(t))
                 for t in provider.pitch_changes(t0, t1, self.role, self.model)
@@ -347,50 +395,54 @@ class TrackBackend:
             if cancelled():
                 raise Cancelled()
             ta, tb = max(t0, grid.beat_to_seconds(a)), min(t1, grid.beat_to_seconds(b))
-            if self.role in ("bass", "vocals"):
+            if self.monophonic:
                 answer = provider.block_pitch(ta, tb, self.role, self.model)
                 if answer is None:
                     continue
                 pitches, release = answer
                 stop = min(b, max(a + grid.subdivision, grid.snap(grid.seconds_to_beat(release))))
                 candidate = self._note(a, stop, pitches[0], self._velocity(pitches[0], ta, release))
+                _, contour = provider.contour(ta, release, self.role, self.model)
+                candidate = replace(candidate, confidence=pitch_agreement(contour, pitches[0]))
                 if a == start and a not in active:
                     previous = next((
                         n for n in track.notes.generated
                         if n.pitch == candidate.pitch and n.end == a
                     ), None)
                     if previous:
-                        candidate = Note(previous.id, a, stop, candidate.pitch, previous.velocity, "generated")
+                        candidate = replace(candidate, id=previous.id, velocity=previous.velocity)
                 notes.append(candidate)
             else:
                 for answer in provider.block_notes(
                     ta, tb, self.role, self.model,
                     (grid.beat_to_seconds(a + grid.subdivision) - grid.beat_to_seconds(a)) / 2 + 1e-6,
-                )[:int(track.settings.get("polyphony", 8))]:
+                )[:int(track.settings.get("polyphony", 1 if self.role == "bass" else 8))]:
                     stop = min(b, max(a + grid.subdivision, grid.snap(grid.seconds_to_beat(answer.release))))
                     previous = next((
                         n for n in reversed(notes) if n.pitch == answer.midi and n.end == a
                     ), None)
                     if answer.continues and previous:
                         notes.remove(previous)
-                        notes.append(Note(
-                            previous.id, previous.start, stop, previous.pitch,
-                            previous.velocity, previous.source,
-                        ))
+                        confidence = (
+                            min(previous.confidence, answer.confidence)
+                            if previous.confidence is not None and answer.confidence is not None else None
+                        )
+                        notes.append(replace(previous, end=stop, confidence=confidence))
                     else:
                         # piano_hr predicts real key velocities; Basic Pitch's amplitude is closer to confidence.
                         level = (
                             max(1, round(answer.velocity * 127)) if self.model == "piano_hr"
                             else self._velocity(answer.midi, ta, answer.release)
                         )
-                        candidate = self._note(a, stop, answer.midi, level)
+                        candidate = replace(self._note(a, stop, answer.midi, level),
+                                            confidence=answer.confidence)
                         if answer.continues and a == start:
                             previous = next((
                                 n for n in track.notes.generated
                                 if n.pitch == answer.midi and n.end == a
                             ), None)
                             if previous:
-                                candidate = Note(previous.id, a, stop, candidate.pitch, previous.velocity, "generated")
+                                candidate = replace(candidate, id=previous.id, velocity=previous.velocity)
                         notes.append(candidate)
         return Prediction(start, end, tuple(notes), tuple(sorted({n.start for n in notes})))
 

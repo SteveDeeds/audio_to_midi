@@ -46,9 +46,9 @@ def main(argv: list[str]) -> int:
             shown[0] = percent
             print(f"Separating stems: {percent}%", flush=True)
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Separating stems on {device.upper()}; a full song takes a few minutes...", flush=True)
-    with torch.no_grad():
+    from core.inference_runtime import neural_device
+    with neural_device() as device, torch.no_grad():
+        print(f"Separating stems on {device.upper()}; a full song takes a few minutes...", flush=True)
         sources = apply_model(model, ((wav - mean) / std)[None], device=device, split=True, overlap=0.25,
                               progress=False, callback=callback)[0]
     sources = sources * std + mean

@@ -23,6 +23,7 @@ input/
 *.mid
 *.musicxml
 Firm Foundation (He Won't)/
+cache/
 
 # Benchmark tools, datasets and rendered audio
 /tools/

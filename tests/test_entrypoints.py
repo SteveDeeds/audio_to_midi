@@ -2,10 +2,12 @@ import os
 import runpy
 import subprocess
 import sys
+from fractions import Fraction
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 from audio_to_midi.__main__ import main, parser
 
@@ -24,6 +26,33 @@ class EntryPointTests(unittest.TestCase):
         self.assertIn("Audio to MIDI", help_text)
         self.assertNotIn("preview", help_text)
         self.assertNotIn("legacy", help_text)
+
+    def test_score_export_quantization_defaults_and_override(self):
+        self.assertEqual(parser().parse_args(["export", "project", "score.musicxml"]).quantization,
+                         Fraction(1, 4))
+        self.assertEqual(parser().parse_args([
+            "export", "project", "score.musicxml", "--quantization", "1/6",
+        ]).quantization, Fraction(1, 6))
+
+    def test_command_line_score_export_applies_selected_quantization(self):
+        from audio_to_midi.domain import Project, Track
+        from audio_to_midi.timebase import Grid
+
+        project = Project.create("CLI", Grid())
+        track = Track("vocals", "vocals", "", 4, 8000, "")
+        track.notes.author(Fraction(0), Fraction(3, 8), 60)
+        track.notes.author(Fraction(1, 2), Fraction(1), 62)
+        project.tracks.append(track)
+        with tempfile.TemporaryDirectory() as directory, \
+                patch("audio_to_midi.storage.load_project", return_value=project), \
+                patch("audio_to_midi.application.complete", return_value=True):
+            path = Path(directory) / "score.musicxml"
+            self.assertEqual(main([
+                "export", directory, str(path), "--role", "vocals", "--quantization", "1/8",
+            ]), 0)
+            root = ET.parse(path).getroot()
+            self.assertEqual(root.findtext(".//note[rest]/type"), "32nd")
+            self.assertFalse(root.findall(".//slur"))
 
     def test_no_command_opens_project_editor(self):
         with (

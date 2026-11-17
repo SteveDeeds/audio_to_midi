@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 
 from audio_to_midi import beats as beat_logic
 from audio_to_midi.adapters import Cancelled, MODELS
+from audio_to_midi.model_choices import MADMOM_COMBINATIONS, MODEL_LABELS
 from audio_to_midi.pipeline import Cancelled as PreparationCancelled
 from audio_to_midi.application import (
     CHORD_MODELS, HARMONY_ROLES, TranscriptionService, add_stem, analyze_harmony, complete, covered,
@@ -35,6 +36,7 @@ from audio_to_midi.chord_view import ChordView
 from audio_to_midi.dialogs import NoteInfoDialog, PlaybackSettingsDialog, TappingCalibrationDialog, TimingDialog
 from audio_to_midi.domain import Note, Project, Track
 from audio_to_midi.midi import export_midi, export_musicxml, import_notes
+from audio_to_midi.musicxml import QUANTIZATIONS
 from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, parse_number, position,
 )
@@ -133,11 +135,14 @@ class ProjectWindow(QMainWindow):
         self.folder: Path | None = None
         self.service = TranscriptionService()
         self.job: Job | None = None
+        self._yourmt3_jobs: dict[str, Job] = {}
+        self._yourmt3_pending: dict[str, tuple] = {}
         self._job_status = ""
         self.pending = None
         self._installing: set[str] = set()
         self._declined_installs: set[str] = set()
         self._analysis_run = 0
+        self._analysis_first = True
         self.preview = None
         self.settings = QSettings("audio_to_midi", "v2")
         self.sound_device = self.settings.value("preview/output", "") or None
@@ -252,12 +257,13 @@ class ProjectWindow(QMainWindow):
         self._act(view, "zoom_in", "Zoom &in", lambda: self._zoom(-1), "Ctrl+=")
         self._act(view, "zoom_out", "Zoom &out", lambda: self._zoom(1), "Ctrl+-")
         view.addSeparator()
+        self._act(view, "rewind", "&Rewind to start", self._rewind, "Home")
         self._act(view, "play", "&Play / stop (Space)", self._play_toggle)
         self._act(view, "metronome", "&Metronome click", lambda checked: None, checkable=True)
         view.addSeparator()
         tools = QActionGroup(self)
         for name, text, key in (("brush", "&Brush tool (add, resize, delete notes)", "B"),
-                                ("info", "&Info tool (click a note to edit it)", "I")):
+                                ("info", "&Info tool (note details and timing menu)", "I")):
             action = self._act(view, name, text, lambda checked, n=name: self._set_tool(n) if checked else None,
                                key, checkable=True)
             tools.addAction(action)
@@ -266,7 +272,8 @@ class ProjectWindow(QMainWindow):
         model = bar.addMenu("&Model")
         self._act(model, "analyze", "Analyze &visible bars", lambda: self._analyze(False))
         self._act(model, "analyze_all", "Analyze &whole track", lambda: self._analyze(True))
-        self.auto = self._act(model, "auto", "&Reanalyze after edits", lambda checked: self._queue_visible(),
+        self.auto = self._act(model, "auto", "&Reanalyze after edits",
+                               lambda checked: self._queue_visible() if checked else self._cancel(analysis_only=True),
                               checkable=True)
         self.auto.setChecked(True)
         model.addSeparator()
@@ -305,6 +312,16 @@ class ProjectWindow(QMainWindow):
         self.models.setMinimumWidth(150)
         self.models.currentTextChanged.connect(self._model_changed)
         row.addWidget(self.models)
+        self.model_source = QComboBox()
+        self.model_source.addItem("Stem-derived", "stem")
+        self.model_source.addItem("Full-mix-derived", "mix")
+        self.model_source.setToolTip(
+            "YourMT3+ input provenance. Full-mix output is retained separately and filtered "
+            "by instrument program; it is never silently substituted for stem output. "
+            "YourMT3+ exposes no retained note confidence/logits; velocity is not confidence."
+        )
+        self.model_source.currentIndexChanged.connect(self._model_source_changed)
+        row.addWidget(self.model_source)
         self.vocal_panel = QWidget()
         vocal_layout = QHBoxLayout(self.vocal_panel)
         vocal_layout.setContentsMargins(0, 0, 0, 0)
@@ -335,6 +352,33 @@ class ProjectWindow(QMainWindow):
         self.stages = QLabel()
         self.stages.setToolTip("Workflow: import the mix, count bars, then stems.")
         row.addWidget(self.stages)
+        root.addLayout(row)
+
+        row = QHBoxLayout()
+        self.confidence_panel = QWidget()
+        confidence_layout = QHBoxLayout(self.confidence_panel)
+        confidence_layout.setContentsMargins(0, 0, 0, 0)
+        confidence_layout.addWidget(QLabel("AI notes: None"))
+        self.confidence_slider = QSlider(Qt.Orientation.Horizontal)
+        self.confidence_slider.setObjectName("detection_confidence")
+        self.confidence_slider.setRange(0, 100)
+        self.confidence_slider.setValue(100)
+        self.confidence_slider.setTracking(False)
+        self.confidence_slider.setMinimumWidth(160)
+        self.confidence_slider.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.confidence_slider.setToolTip(
+            "Left: no AI notes. Just right of left: strongest evidence only. "
+            "Right: all detected notes, including low or unknown confidence. "
+            "Manual/imported notes are kept. This affects playback and export, "
+            "without deleting predictions or rerunning the model."
+        )
+        self.confidence_slider.valueChanged.connect(lambda _: self._guard(self._confidence_changed))
+        confidence_layout.addWidget(self.confidence_slider)
+        confidence_layout.addWidget(QLabel("All"))
+        self.confidence_label = QLabel()
+        confidence_layout.addWidget(self.confidence_label)
+        row.addWidget(self.confidence_panel)
+        row.addStretch(1)
         root.addLayout(row)
 
         row = QHBoxLayout()
@@ -409,6 +453,13 @@ class ProjectWindow(QMainWindow):
             "Downbeat tapping always plays at 100%.")
         self.speed_choice.currentIndexChanged.connect(lambda: self._guard(self._speed_changed))
         row.addWidget(self.speed_choice)
+        rewind = QToolButton()
+        rewind.setDefaultAction(self.actions["rewind"])
+        rewind.setText("|<<")
+        rewind.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        rewind.setToolTip("Rewind to start (Home): stop playback and return to bar 1.")
+        self.tool_buttons["rewind"] = rewind
+        row.addWidget(rewind)
         for text, slot in (("Play", self._play), ("Stop", self._stop)):
             button = QPushButton(text)
             button.clicked.connect(lambda checked=False, f=slot: self._guard(f))
@@ -424,7 +475,12 @@ class ProjectWindow(QMainWindow):
         self.timeline.note_removed.connect(lambda note: self._guard(lambda: self._remove_note(note)))
         self.timeline.note_resized.connect(lambda note, end: self._guard(lambda: self._resize_note(note, end)))
         self.timeline.note_selected.connect(self._select_note)
+        self.timeline.note_selected.connect(lambda note: self._audition(note.start, note.pitch))
+        self.timeline.note_confirmed.connect(lambda note: self._guard(lambda: self._confirm_note(note)))
         self.timeline.note_info_requested.connect(lambda note, at: self._guard(lambda: self._note_info(note)))
+        self.timeline.info_context_requested.connect(
+            lambda seconds, note, at: self._guard(lambda: self._info_menu(seconds, note, at))
+        )
         self.timeline.beat_clicked.connect(lambda s, right, at: self._guard(lambda: self._beat_clicked(s, right, at)))
         self.timeline.context_requested.connect(lambda b, p, at: self._guard(lambda: self._roll_menu(b, at)))
         self.timeline.zoom_requested.connect(lambda steps: self._guard(lambda: self._zoom(-steps)))
@@ -441,6 +497,10 @@ class ProjectWindow(QMainWindow):
         self.cancel_button.clicked.connect(self._cancel)
         self.cancel_button.hide()
         self.statusBar().addPermanentWidget(self.cancel_button)
+        self.yourmt3_status = StatusLabel()
+        self.yourmt3_status.setMinimumWidth(260)
+        self.yourmt3_status.hide()
+        self.statusBar().addPermanentWidget(self.yourmt3_status)
 
         self.shortcuts: dict[str, QShortcut] = {}
         for key, slot in (
@@ -484,10 +544,20 @@ class ProjectWindow(QMainWindow):
             if n.end > self.timeline.start and n.start < self.timeline.end
         ] if track else []
         self.timeline.notes = self._rows
+        self.confidence_panel.setVisible(track is not None)
+        self.confidence_slider.blockSignals(True)
+        self.confidence_slider.setValue(track.notes.detection_level if track else 100)
+        self.confidence_slider.blockSignals(False)
+        level = self.confidence_slider.value()
+        self.confidence_label.setText(
+            "No AI notes" if level == 0 else "All detections" if level == 100
+            else f"Evidence >= {100 - level}%"
+        )
         if self.timeline.selected not in self._rows:
             self.timeline.selected = None
-        self.timeline.beats = self._lane_beats() if view == MIX else []
-        self.timeline.taps = list(self.taps) if view == MIX else []
+        show_beats = view == MIX or (track is not None and self.timeline.tool == "info")
+        self.timeline.beats = self._lane_beats() if show_beats else []
+        self.timeline.taps = list(self.taps) if show_beats else []
         self.timeline.update()
         self.chord_view.start, self.chord_view.end = self.timeline.start, self.timeline.end
         self.chord_view.update()
@@ -540,10 +610,10 @@ class ProjectWindow(QMainWindow):
         )
 
     def _update_actions(self) -> None:
-        has_mix, track, busy = bool(self.project.mix_path), self.active, self.job is not None
+        has_mix, track, busy = bool(self.project.mix_path), self.active, bool(self.job or self._yourmt3_jobs)
         tapping = self.tapping
         self.speed_choice.setEnabled(not tapping)
-        transcribable = track is not None and track.role != "other"
+        transcribable = track is not None
         rules = {
             "import_stems": (has_mix, "Import a mix first."),
             "import_midi": (track is not None, "Choose a track first."),
@@ -551,7 +621,7 @@ class ProjectWindow(QMainWindow):
             "export": (bool(self.project.tracks or self.project.chords), "Nothing to export yet."),
             "export_xml": (
                 bool(self.project.chords) or any(
-                    t.role != "other" and (t.notes.generated or t.notes.authored) for t in self.project.tracks
+                    (t.notes.generated or t.notes.authored) for t in self.project.tracks
                 ),
                 "Transcribe a track or detect chords first.",
             ),
@@ -586,7 +656,9 @@ class ProjectWindow(QMainWindow):
             action.setEnabled(bool(ok))
             action.setToolTip("" if ok else why)
         for key in ("D", "U"):
-            self.shortcuts[key].setEnabled(self.view == MIX)
+            self.shortcuts[key].setEnabled(
+                self.view == MIX or (self.view == "track" and self.timeline.tool == "info")
+            )
         self.cancel_button.setVisible(busy)
 
     # -- beat lane ----------------------------------------------------------
@@ -634,26 +706,28 @@ class ProjectWindow(QMainWindow):
         track = self.active
         view = self.view
         if track and MODELS[track.role]:
-            self.models.addItems(MODELS[track.role])
+            for name in MODELS[track.role]:
+                self.models.addItem(MODEL_LABELS.get(name, name), name)
             for index in range(self.models.count()):
                 description = MODEL_DESCRIPTIONS.get(self.models.itemText(index))
                 if description:
                     self.models.setItemData(index, description, Qt.ItemDataRole.ToolTipRole)
-            self.models.setCurrentText(track.model)
+            self.models.setCurrentIndex(self.models.findData(track.model))
         elif view == CHORDS:
             for name, text in CHORD_MODELS.items():
                 self.models.addItem(text, name)
             self.models.setCurrentIndex(self.models.findData(self.chord_model))
         self.models.setEnabled(bool(track and MODELS[track.role]) or view == CHORDS)
         self.models.setToolTip("Chord recognizer used by Edit > Detect chords" if view == CHORDS else "")
+        self._sync_model_source()
         self._sync_vocal_controls()
         self._building = False
         self.timeline.set_role(track.role if track else (MIX if view == MIX else None))
         self.timeline.selected = None
         self.timeline.selected_beat = None
         self.pages.setCurrentIndex(1 if view == CHORDS else 0)
-        for button in self.tool_buttons.values():
-            button.setVisible(view == "track")
+        for name, button in self.tool_buttons.items():
+            button.setVisible(name == "rewind" or view == "track")
         self._load_envelope()
         if view == CHORDS:
             self._load_mix_data()
@@ -663,7 +737,7 @@ class ProjectWindow(QMainWindow):
     def _set_tool(self, name: str) -> None:
         self.timeline.tool = name
         self.timeline.unsetCursor()
-        self.timeline.update()
+        self._refresh()
 
     def _audio_path(self) -> str | None:
         track = self.active
@@ -858,16 +932,44 @@ class ProjectWindow(QMainWindow):
                 self._redetect_with(name)
             return
         if not self._building and self.active and model:
+            model = self.models.currentData() or model
             self._cancel(analysis_only=True)
+            self._cancel_yourmt3(self.active.id)
             self.active.model = model
+            if model != "yourmt3":
+                self.active.settings.pop("inference_source", None)
+            self.active.settings.pop("decoder_parameters", None)
             if model in VOCAL_MODELS:
                 self.active.settings.setdefault("vocal_parameters", asdict(VocalParameters()))
             self.active.revision += 1
             self._sync_vocal_controls()
+            self._sync_model_source()
             self._refresh()
             self._queue_visible()
             if model in VOCAL_MODELS and self.active.settings.get("onset_profile"):
                 self.status.setText("Neural vocal models use direct note/onset feedback; the legacy feature profile remains saved for legacy models.")
+
+    def _sync_model_source(self) -> None:
+        track = self.active
+        enabled = bool(track and track.model == "yourmt3")
+        self.model_source.setVisible(enabled)
+        blocked = self.model_source.blockSignals(True)
+        self.model_source.setCurrentIndex(self.model_source.findData(
+            track.settings.get("inference_source", "stem") if track else "stem"))
+        self.model_source.blockSignals(blocked)
+
+    def _model_source_changed(self) -> None:
+        if self._building or not self.active or self.active.model != "yourmt3":
+            return
+        if self.model_source.currentData() == "mix" and not self.project.mix_path:
+            self._sync_model_source()
+            self.status.setText("Import a full mix before choosing mix-derived YourMT3+.")
+            return
+        self._cancel_yourmt3(self.active.id)
+        self.active.settings["inference_source"] = self.model_source.currentData()
+        self.active.revision += 1
+        self._refresh()
+        self._queue_visible()
 
     def _sync_vocal_controls(self) -> None:
         track = self.active
@@ -898,8 +1000,19 @@ class ProjectWindow(QMainWindow):
 
     def _navigate(self, direction: int) -> None:
         """Scroll half a screen so the previous view's edge stays in sight."""
+        start = max(Fraction(0), self.timeline.start + (self.timeline.end - self.timeline.start) / 2 * direction)
+        if start == self.timeline.start:
+            return
         self._cancel(analysis_only=True)
-        self._set_window(self.timeline.start + (self.timeline.end - self.timeline.start) / 2 * direction)
+        self._set_window(start)
+        self._load_envelope()
+        self._refresh()
+        self._queue_visible()
+
+    def _rewind(self) -> None:
+        self._stop()
+        self._cancel(analysis_only=True)
+        self._set_window(Fraction(0))
         self._load_envelope()
         self._refresh()
         self._queue_visible()
@@ -970,6 +1083,7 @@ class ProjectWindow(QMainWindow):
 
     def _cancel(self, analysis_only: bool = False) -> None:
         self._analysis_run += 1
+        self._analysis_first = True
         self.debounce.stop()
         if analysis_only:
             if self.pending and self.pending[2] == "analysis":
@@ -978,33 +1092,98 @@ class ProjectWindow(QMainWindow):
                 self.job.cancelled.set()
             return
         self.pending = None
+        self._cancel_yourmt3()
         if self.job:
             self.job.cancelled.set()
+
+    def _cancel_yourmt3(self, track_id: str | None = None) -> None:
+        if track_id is None:
+            self._yourmt3_pending.clear()
+        else:
+            self._yourmt3_pending.pop(track_id, None)
+        for key, job in self._yourmt3_jobs.items():
+            if track_id is None or key == track_id:
+                job.cancelled.set()
+                self.yourmt3_status.setText("Cancelling YourMT3+...")
+
+    def _run_yourmt3(self, project, track, result_token, start, end) -> None:
+        existing = self._yourmt3_jobs.get(track.id)
+        if existing:
+            if existing.result_token == result_token and not existing.cancelled.is_set():
+                self.yourmt3_status.setText("YourMT3+ is already running for this input.")
+                return
+            existing.cancelled.set()
+            # Retry only after this track's cancelled process has actually stopped.
+            self._yourmt3_pending[track.id] = result_token, start, end
+            return
+        service = TranscriptionService()
+        job = Job(lambda cancelled, report: (
+            result_token, service.predict(project, track, start, end, cancelled, report)), self, reports=True)
+        job.result_token = result_token
+        provenance = "full-mix-derived" if track.settings.get("inference_source") == "mix" else "stem-derived"
+        job.result.connect(lambda value: self._guard(lambda: self._accept_yourmt3(value, provenance)))
+        job.progress.connect(self.yourmt3_status.setText)
+        job.error.connect(lambda text: self.yourmt3_status.setText(f"YourMT3+ failed: {text}"))
+        job.finished.connect(lambda: self._yourmt3_finished(track.id, job))
+        self._yourmt3_jobs[track.id] = job
+        self.yourmt3_status.show()
+        self.yourmt3_status.setText(f"YourMT3+ queued ({provenance}).")
+        job.start()
+        self._update_actions()
+
+    def _retry_yourmt3(self, result_token, start, end) -> None:
+        if self.project.id != result_token.project_id:
+            return
+        track = next((t for t in self.project.tracks if t.id == result_token.track_id), None)
+        if track and token(self.project, track) == result_token:
+            self._run_yourmt3(deepcopy(self.project), deepcopy(track), result_token, start, end)
+
+    def _accept_yourmt3(self, value, provenance) -> None:
+        if publish(self.project, *value):
+            self._refresh()
+            self.yourmt3_status.setText(f"YourMT3+ notes updated ({provenance}).")
+        else:
+            self.yourmt3_status.setText("Discarded stale YourMT3+ result; audio/project/model/edits changed.")
+
+    def _yourmt3_finished(self, track_id, job) -> None:
+        if self._yourmt3_jobs.get(track_id) is job:
+            self._yourmt3_jobs.pop(track_id)
+        if job.cancelled.is_set():
+            self.yourmt3_status.setText("YourMT3+ cancelled; no results applied.")
+        job.deleteLater()
+        self._update_actions()
+        pending = self._yourmt3_pending.pop(track_id, None)
+        if pending:
+            self._retry_yourmt3(*pending)
 
     # -- note analysis ----------------------------------------------------
     def _queue_visible(self) -> None:
         track = self.active
-        if not self.auto.isChecked() or track is None or track.role == "other":
+        if not self.auto.isChecked() or track is None:
             return
         end = min(self.timeline.end, track_end(self.project, track))
-        if self.timeline.start < end and not covered(self.project, track, self.timeline.start, end):
+        needs_visible = self.timeline.start < end and not covered(
+            self.project, track, self.timeline.start, end)
+        needs_background = track.model not in (*VOCAL_MODELS, "yourmt3") and not complete(self.project, track)
+        if needs_visible or needs_background:
             self.debounce.start()
 
     def _analyze(self, whole: bool, auto: bool = False) -> None:
-        if not self.active or self.active.role == "other":
+        if not self.active:
             raise ValueError("Choose a transcribable stem.")
         from audio_to_midi import provision
 
         model = self.active.model
         if whole and model in VOCAL_MODELS:
             raise ValueError("Neural vocal models only process visible bars. Navigate to another window to analyze it.")
-        license_key = "madmom_license_acknowledged" if model in VOCAL_MODELS else "license_acknowledged"
+        license_key = "madmom_license_acknowledged" if model in (*VOCAL_MODELS, *MADMOM_COMBINATIONS) else "license_acknowledged"
         terms = (
             "ADTOF weights are licensed for non-commercial use only. "
             if model == "adtof" else
             "Review the Piano-HR checkpoint's terms before relying on its output. " if model == "piano_hr" else
             "MADMoM onset weights are CC BY-NC-SA 4.0 (non-commercial). Commercial use needs appropriate permission. "
-            "First installation requires git and, on Windows, MSVC C++ Build Tools. " if model in VOCAL_MODELS else ""
+            "First installation requires git and, on Windows, MSVC C++ Build Tools. "
+            if model in (*VOCAL_MODELS, *MADMOM_COMBINATIONS) else ""
         )
         needs = provision.missing(model)
         if needs:
@@ -1020,11 +1199,13 @@ class ProjectWindow(QMainWindow):
                 return
             self.active.settings[license_key] = True
             self._installing.add(model)
+            install_token = token(self.project, self.active)
 
             def installed(_value, whole=whole):
                 self._installing.discard(model)
                 self.status.setText(f"{provision.LABELS.get(model, model)} is ready.")
-                self._analyze(whole)
+                if self.active and token(self.project, self.active) == install_token:
+                    self._analyze(whole)
 
             def install(cancel, report):
                 try:
@@ -1042,13 +1223,54 @@ class ProjectWindow(QMainWindow):
         self._cancel(analysis_only=True)
         run_id = self._analysis_run
         track_id = self.active.id
-        start = Fraction(0) if whole else self.timeline.start
-        end = track_end(self.project, self.active) if whole else min(self.timeline.end, track_end(self.project, self.active))
+        background = whole or (auto and model not in (*VOCAL_MODELS, "yourmt3"))
+        end = track_end(self.project, self.active) if background else min(
+            self.timeline.end, track_end(self.project, self.active))
+        start = self.timeline.start if self.timeline.start < end else Fraction(0) if background else self.timeline.start
         if end <= start:
             raise ValueError("No audio in this window.")
-        self._analyze_range(track_id, start, end, run_id, whole)
+        if background and model != "yourmt3":
+            self._continue_background(track_id, end, run_id)
+        else:
+            self._analyze_range(track_id, start, end, run_id, whole)
 
-    def _analyze_range(self, track_id: str, start: Fraction, end: Fraction, run_id: int, whole: bool) -> None:
+    def _continue_background(self, track_id: str, end: Fraction, run_id: int) -> None:
+        if run_id != self._analysis_run:
+            return
+        track = self.project.track(track_id)
+        result_token = token(self.project, track)
+        intervals = [
+            (Fraction(a), Fraction(b)) for a, b in track.settings.get("coverage", [])
+        ] if track.settings.get("coverage_identity") == result_token.identity else []
+        bar = self.project.grid.bar_beats
+        chunks = []
+        start = Fraction(0)
+        while start < end:
+            stop = min(end, start + bar)
+            cursor = start
+            missing = []
+            for a, b in sorted(intervals):
+                if a > cursor:
+                    missing.append((cursor, min(a, stop)))
+                cursor = max(cursor, b)
+                if cursor >= stop:
+                    break
+            if cursor < stop:
+                missing.append((cursor, stop))
+            for a, b in missing:
+                if a < b:
+                    visible = a < self.timeline.end and self.timeline.start < b
+                    distance = max(Fraction(0), self.timeline.start - b, a - self.timeline.end)
+                    chunks.append((not visible, distance, a, b))
+            start = stop
+        if chunks:
+            _, _, start, stop = min(chunks)
+            self._analyze_range(track_id, start, end, run_id, True, chunk_limit=stop)
+        else:
+            self.status.setText("Track analysis complete.")
+
+    def _analyze_range(self, track_id: str, start: Fraction, end: Fraction, run_id: int, whole: bool,
+                       *, chunk_limit: Fraction | None = None) -> None:
         if run_id != self._analysis_run:
             return
         project = deepcopy(self.project)
@@ -1059,21 +1281,48 @@ class ProjectWindow(QMainWindow):
         ):
             raise ValueError("Neural vocal analysis must stay inside the current visible window.")
         result_token = token(self.project, self.project.track(track_id))
-        chunk_end = min(end, start + project.grid.bar_beats * 2) if whole else end
+        if track.model == "yourmt3":
+            self._run_yourmt3(project, track, result_token, start, end)
+            return
+        bar = project.grid.bar_beats
+        chunk_end = end if track.model in VOCAL_MODELS else min(end, (start // bar + 1) * bar)
+        if chunk_limit is not None:
+            chunk_end = min(chunk_end, chunk_limit)
+        visible = start < self.timeline.end and self.timeline.start < chunk_end
+        if self._analysis_first and visible and track.model not in VOCAL_MODELS:
+            chunk_end = min(chunk_end, start + beat_length(project.grid))
+        self._analysis_first = False
+        first_bar = bar_and_beat(project.grid, start)[0]
+        last_bar = bar_and_beat(project.grid, max(start, chunk_end - project.grid.subdivision))[0]
+        label = f"{'Visible' if visible else 'Background'} {track.role}: bar {first_bar}"
+        if last_bar != first_bar:
+            label += f"-{last_bar}"
+        if whole:
+            coverage = track.settings.get("coverage", []) if (
+                track.settings.get("coverage_identity") == result_token.identity
+            ) else []
+            analyzed = sum((Fraction(b) - Fraction(a) for a, b in coverage), Fraction(0))
+            label += f" ({min(1.0, float(analyzed / end)):.0%} of track analyzed)"
 
         def accept(value):
             if run_id != self._analysis_run:
                 return
-            self._publish(value)
-            if chunk_end < end:
-                QTimer.singleShot(0, lambda: self._analyze_range(track_id, chunk_end, end, run_id, whole))
+            if not self._publish(value):
+                return
+            if whole:
+                QTimer.singleShot(0, lambda: self._guard(
+                    lambda: self._continue_background(track_id, end, run_id)))
+            elif chunk_end < end:
+                QTimer.singleShot(0, lambda: self._guard(
+                    lambda: self._analyze_range(track_id, chunk_end, end, run_id, whole)))
 
         self._run(
-            lambda cancelled: (result_token, self.service.predict(project, track, start, chunk_end, cancelled)),
-            accept,
+            lambda cancelled, report: (
+                result_token, self.service.predict(project, track, start, chunk_end, cancelled, report)),
+            accept, message=label, reports=True,
         )
 
-    def _publish(self, value) -> None:
+    def _publish(self, value) -> bool:
         result_token, prediction = value
         track = next((t for t in self.project.tracks if t.id == result_token.track_id), None)
         if track and track.model in VOCAL_MODELS and (
@@ -1081,12 +1330,14 @@ class ProjectWindow(QMainWindow):
             prediction.start < self.timeline.start or prediction.end > self.timeline.end
         ):
             self.status.setText("Discarded inference outside the current visible window; no hidden notes changed.")
-            return
+            return False
         if publish(self.project, result_token, prediction):
             self._refresh()
             self.status.setText("Notes updated.")
+            return True
         else:
             self.status.setText("Discarded stale inference; edits/project changed.")
+            return False
 
     # -- undo -------------------------------------------------------------
     def _history_key(self) -> str:
@@ -1105,7 +1356,7 @@ class ProjectWindow(QMainWindow):
     def _edit_state(track: Track) -> tuple:
         return deepcopy((
             track.notes.authored, track.notes.rejections, track.notes.onsets,
-            track.training, track.settings.get("imported_midi"),
+            track.training, track.settings.get("imported_midi"), track.notes.detection_level,
         ))
 
     def _checkpoint(self, key: str | None = None) -> None:
@@ -1129,11 +1380,12 @@ class ProjectWindow(QMainWindow):
             self._refresh()
             return
         track = self.project.track(key)
-        authored, rejections, onsets, training, imported = state
+        authored, rejections, onsets, training, imported, detection_level = state
         track.notes.authored = authored
         track.notes.rejections = rejections
         track.notes.onsets = onsets
         track.training = training
+        track.notes.detection_level = detection_level
         if imported is None:
             track.settings.pop("imported_midi", None)
         else:
@@ -1154,8 +1406,19 @@ class ProjectWindow(QMainWindow):
         self._queue_visible()
 
     # -- note editing -----------------------------------------------------
+    def _confidence_changed(self) -> None:
+        if self._building or self.active is None:
+            return
+        level = self.confidence_slider.value()
+        if level == self.active.notes.detection_level:
+            return
+        self._checkpoint()
+        self.active.notes.detection_level = level
+        self._stop()
+        self._refresh()
+
     def _require_transcribable(self) -> Track:
-        if not self.active or self.active.role == "other":
+        if not self.active:
             raise ValueError("Choose a transcribable stem.")
         return self.active
 
@@ -1197,7 +1460,7 @@ class ProjectWindow(QMainWindow):
         self._audition(beat, pitch)
 
     def _audition(self, start: Fraction, pitch: int) -> None:
-        """Play a just-added note's stretch of the stem together with its synth so a wrong pitch is audible."""
+        """Play a note's stretch of the stem together with its synth so a wrong pitch is audible."""
         note = next((n for n in self._rows if n.start == start and n.pitch == pitch), None)
         if note is None:
             return
@@ -1216,6 +1479,21 @@ class ProjectWindow(QMainWindow):
     def _select_note(self, note) -> None:
         self.timeline.selected = note
         self.timeline.update()
+
+    def _confirm_note(self, note: Note) -> None:
+        track = self._require_transcribable()
+        if note not in self._rows:
+            raise ValueError("The note changed before it could be confirmed; try again.")
+        if note.source != "generated":
+            self._select_note(note)
+            return
+        self._checkpoint()
+        confirmed = track.notes.author(note.start, note.end, note.pitch, note.velocity)
+        record_onset(track, note.start, True)
+        if track.role == "drums":
+            record_drum(track, self.project, note.start, note.end, note.pitch, True)
+        self._edited(track)
+        self._select_note(confirmed)
 
     def _select_at(self, start: Fraction, pitch: int) -> None:
         match = next((n for n in self._rows if n.start == start and n.pitch == pitch), None)
@@ -1291,6 +1569,18 @@ class ProjectWindow(QMainWindow):
 
     def _popup(self, menu: QMenu, at) -> None:
         menu.exec(at or QCursor.pos())
+
+    def _info_menu(self, seconds: float, note, at) -> None:
+        menu = QMenu(self)
+        if note is not None:
+            menu.addAction("Note details...", lambda: self._guard(lambda: self._note_info(note)))
+            menu.addAction("Delete note", lambda: self._guard(lambda: self._remove_note(note)))
+            menu.addSeparator()
+        if self.session is None:
+            menu.addAction("Detect beats first (Edit > Detect tempo, meter, and key)").setEnabled(False)
+        else:
+            self._beat_menu(menu, seconds, tolerance=0.0, pin_here=True)
+        self._popup(menu, at)
 
     def _roll_menu(self, beat: Fraction, at) -> None:
         """Right-click on an empty part of the roll."""
@@ -1515,6 +1805,7 @@ class ProjectWindow(QMainWindow):
                 ) != QMessageBox.StandardButton.Yes:
                     continue
                 replace_stem(self.project, existing, path)
+                self._cancel_yourmt3(existing.id)
                 last = existing
             else:
                 last = add_stem(self.project, path, role)
@@ -1554,7 +1845,7 @@ class ProjectWindow(QMainWindow):
 
     def _export_scope(self, title: str, kind: str) -> tuple[list[Track], bool, bool] | None:
         """Ask which tracks to export: (tracks, include chords, partial), or None if cancelled."""
-        choices = ["All tracks + chords"] + [t.role for t in self.project.tracks if t.role != "other"]
+        choices = ["All tracks + chords"] + [t.role for t in self.project.tracks]
         if self.project.chords:
             choices.append("chords")
         scope, accepted = QInputDialog.getItem(self, title, "Track(s)", choices, editable=False)
@@ -1592,12 +1883,23 @@ class ProjectWindow(QMainWindow):
         if chosen is None:
             return
         selected, include_chords, partial = chosen
+        grid = self.project.grid
+        quarter_beats = grid.denominator <= 4
+        choices = [label for label, _ in QUANTIZATIONS if quarter_beats or "triplet" not in label]
+        quantization, accepted = QInputDialog.getItem(
+            self, "Export score", "Quantization", choices, choices.index("1/16"), editable=False,
+        )
+        if not accepted:
+            return
         path, _ = QFileDialog.getSaveFileName(
             self, "Export score", f"{self.project.name}.musicxml",
             "MusicXML (*.musicxml *.xml);;Compressed MusicXML (*.mxl)",
         )
         if path:
-            export_musicxml(self.project, Path(path), selected, include_chords=include_chords)
+            export_musicxml(
+                self.project, Path(path), selected, include_chords=include_chords,
+                quantization=dict(QUANTIZATIONS)[quantization],
+            )
             self.status.setText(f"{'PARTIAL' if partial else 'Complete'} score exported: {path}")
 
     def _profile(self) -> None:
@@ -1701,7 +2003,7 @@ class ProjectWindow(QMainWindow):
         self._load_envelope()
         self._refresh()
 
-    # -- beats in the Mix view -------------------------------------------------
+    # -- shared beat timing ----------------------------------------------------
     def _require_session(self) -> BeatSession:
         if self.session is None:
             raise ValueError("Detect beats first (Edit > Detect tempo, meter, and key).")
@@ -1728,10 +2030,19 @@ class ProjectWindow(QMainWindow):
             if index >= 0:
                 mark = session.mark_of(index)
                 where = f"bar {mark[0]} beat {format_number(mark[1])}" if mark else "not counted"
+                actions = ("D: pin as downbeat, U: unpin, Delete: remove." if self.view == MIX else
+                           "D: pin as downbeat, U: unpin; right-click for beat actions.")
                 self.status.setText(f"Beat at {session.beats[index].time:.3f} s ({where}). "
-                                    "D: pin as downbeat, U: unpin, Delete: remove.")
+                                    + actions)
             return
         menu = QMenu(self)
+        self._beat_menu(menu, seconds, tolerance=BEAT_TOLERANCE)
+        self._popup(menu, at)
+
+    def _beat_menu(self, menu: QMenu, seconds: float, *, tolerance: float, pin_here: bool = False) -> None:
+        session = self._require_session()
+        index = session.nearest(seconds, tolerance)
+        self._select_beat(index)
         if index >= 0:
             guess = session.guess_bar(index)
             menu.addAction(f"Downbeat of bar {guess}", lambda: self._guard(lambda: self._pin(index, guess)))
@@ -1740,11 +2051,42 @@ class ProjectWindow(QMainWindow):
                 menu.addAction("Unpin", lambda: self._guard(lambda: self._unpin(index)))
             menu.addAction("Remove this beat", lambda: self._guard(lambda: self._remove_beat(index)))
         else:
+            if pin_here:
+                bar, beat = bar_and_beat(self.project.grid, self.project.grid.seconds_to_beat(seconds))
+                guess = bar if beat == 1 else bar + 1
+                menu.addAction(f"Downbeat of bar {guess}",
+                               lambda: self._guard(lambda: self._pin_at(seconds, guess)))
+                menu.addAction("Downbeat of bar...",
+                               lambda: self._guard(lambda: self._pin_at_ask(seconds, guess)))
             menu.addAction("Add a beat here", lambda: self._guard(lambda: self._add_beat(seconds)))
+            if pin_here:
+                nearby = session.nearest(seconds, BEAT_TOLERANCE)
+                if nearby >= 0:
+                    menu.addSeparator()
+                    if session.beats[nearby].mark:
+                        menu.addAction("Unpin nearby beat", lambda: self._guard(lambda: self._unpin(nearby)))
+                    menu.addAction("Remove nearby beat", lambda: self._guard(lambda: self._remove_beat(nearby)))
         if session.pins:
             menu.addSeparator()
             menu.addAction("Clear all pins", lambda: self._guard(self._clear_pins))
-        self._popup(menu, at)
+
+    def _pin_at(self, seconds: float, bar: int) -> None:
+        """Add and pin an exact audio position without leaving a beat behind on failure."""
+        session = self._require_session()
+        index = session.add_beat(seconds)
+        try:
+            session.pin(index, bar)
+        except ValueError:
+            session.remove_beat(index)
+            raise
+        self._select_beat(index)
+        self._session_changed()
+        self.status.setText(session.summary())
+
+    def _pin_at_ask(self, seconds: float, guess: int) -> None:
+        bar, ok = QInputDialog.getInt(self, "Pin downbeat", "Bar number", guess, -999, 9999)
+        if ok:
+            self._pin_at(seconds, bar)
 
     def _pin(self, index: int, bar: int, beat: int = 1) -> None:
         self._require_session().pin(index, bar, beat)
@@ -2202,7 +2544,7 @@ class ProjectWindow(QMainWindow):
     def closeEvent(self, event) -> None:
         self._cancel()
         self._stop()
-        if self.job and self.job.isRunning():
+        if (self.job and self.job.isRunning()) or any(j.isRunning() for j in self._yourmt3_jobs.values()):
             self.status.setText("Waiting for the current task to stop; close again when idle.")
             event.ignore()
             return

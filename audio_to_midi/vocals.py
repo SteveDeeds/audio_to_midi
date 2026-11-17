@@ -12,7 +12,7 @@ from audio_to_midi.domain import Note
 from audio_to_midi.timebase import Grid
 from audio_to_midi.vocal_settings import VOCAL_MODELS, VocalParameters
 from core.chord_analysis import key_to_scale_pcs
-from core.mono_pitch import track_pitch
+from core.mono_pitch import pitch_agreement, track_pitch
 from core.vocal_boundaries import BoundarySettings, coalesce, energy_retriggers, stable_changes, voice_regions
 
 SR, HOP = 22050, 220
@@ -87,7 +87,8 @@ def grid_notes(
             if candidates:
                 midi = min(candidates, key=lambda p: (abs(p - raw), p))
         velocity = int(np.clip(100 + 1.2 * float(np.median(db[body])), 45, 110))
-        return Note(f"{track_id}:vocal:{a}:{midi}", a, b, midi, velocity)
+        return Note(f"{track_id}:vocal:{a}:{midi}", a, b, midi, velocity,
+                    confidence=pitch_agreement(pitch[body], midi))
 
     notes: list[Note] = []
     half = grid.subdivision / 2
@@ -129,9 +130,6 @@ class VocalTranscriber:
         self._processor = None
 
     def _pitch(self, audio: np.ndarray, cancelled: Callable[[], bool]) -> tuple[np.ndarray, np.ndarray]:
-        import torch
-
-        torch.set_num_threads(4)
         times, pitches = [], []
         for first in range(0, len(audio), SR * 2):
             check_cancel(cancelled)
@@ -146,16 +144,8 @@ class VocalTranscriber:
         return np.concatenate(times), np.concatenate(pitches)
 
     def _activation(self, audio: np.ndarray) -> np.ndarray:
-        from madmom.audio.signal import Signal
-        from madmom.features.onsets import CNNOnsetProcessor, RNNOnsetProcessor
-
-        if self._processor is None:
-            self._processor = CNNOnsetProcessor() if self.model == "madmom_cnn" else RNNOnsetProcessor(online=False)
-        signal = Signal(librosa.resample(audio, orig_sr=SR, target_sr=44100), sample_rate=44100)
-        result = np.asarray(self._processor(signal)).reshape(-1)
-        if not len(result) or not np.isfinite(result).all():
-            raise RuntimeError("Neural vocal onset model returned empty or non-finite activations.")
-        return result
+        from audio_to_midi.model_evidence import onset_evidence
+        return onset_evidence(audio, SR, "vocals", self.model + "_full")["onset"]
 
     def evidence(self, t0: float, t1: float, cancelled: Callable[[], bool]) -> VocalEvidence:
         a, b = max(0, math.ceil(t0 * self.sr)), min(len(self.audio), math.ceil(t1 * self.sr))

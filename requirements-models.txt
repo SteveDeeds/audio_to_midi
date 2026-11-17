@@ -12,3 +12,4 @@ scikit-learn>=1.3
 adtof-pytorch @ git+https://github.com/xavriley/ADTOF-pytorch@85c192e78f716ea0b111cc8a5ee4a8f6a3a4f8a9
 # Separately: python -m pip install --no-deps basic-pitch==0.4.0
 # Its TensorFlow metadata is incompatible with Python 3.12; this app uses ONNX only.
+# YourMT3+ uses mt3-infer==0.2.0 in its own provisioned environment, not this interpreter.
