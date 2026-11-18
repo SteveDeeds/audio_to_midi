@@ -130,6 +130,8 @@ class VocalTranscriber:
         self._processor = None
 
     def _pitch(self, audio: np.ndarray, cancelled: Callable[[], bool]) -> tuple[np.ndarray, np.ndarray]:
+        if self.model.endswith("_fcpe"):
+            return self._fcpe_pitch(audio, cancelled)
         times, pitches = [], []
         for first in range(0, len(audio), SR * 2):
             check_cancel(cancelled)
@@ -143,9 +145,38 @@ class VocalTranscriber:
         check_cancel(cancelled)
         return np.concatenate(times), np.concatenate(pitches)
 
+    def _fcpe_pitch(self, audio: np.ndarray, cancelled: Callable[[], bool]) -> tuple[np.ndarray, np.ndarray]:
+        import torch
+        from torchfcpe import spawn_bundled_infer_model
+        from core.inference_runtime import neural_device
+
+        times, pitches = [], []
+        check_cancel(cancelled)
+        with neural_device(cancelled=cancelled) as device, torch.inference_mode():
+            model = spawn_bundled_infer_model(device=device)
+            for first in range(0, len(audio), SR * 2):
+                check_cancel(cancelled)
+                last = min(len(audio), first + SR * 2)
+                a, b = max(0, first - SR // 4), min(len(audio), last + SR // 4)
+                samples = torch.from_numpy(np.asarray(audio[a:b], dtype=np.float32))[None, :, None]
+                count = (b - a) * 100 // SR + 1
+                f0 = model.infer(
+                    samples.to(device), sr=SR, decoder_mode="local_argmax", threshold=0.006,
+                    f0_min=70, f0_max=1100, interp_uv=False, output_interp_target_length=count,
+                ).cpu().numpy().reshape(-1)
+                if f0.shape != (count,) or not np.isfinite(f0).all() or np.any(f0 < 0):
+                    raise ValueError("FCPE returned invalid pitch evidence.")
+                t = np.arange(count) / 100 + a / SR
+                p = np.where(f0 > 0, librosa.hz_to_midi(np.maximum(f0, 1)), np.nan)
+                keep = (t >= first / SR - 1e-9) & (t < last / SR - 1e-9)
+                times.append(t[keep])
+                pitches.append(p[keep])
+        check_cancel(cancelled)
+        return np.concatenate(times), np.concatenate(pitches)
+
     def _activation(self, audio: np.ndarray) -> np.ndarray:
         from audio_to_midi.model_evidence import onset_evidence
-        return onset_evidence(audio, SR, "vocals", self.model + "_full")["onset"]
+        return onset_evidence(audio, SR, "vocals", self.model.removesuffix("_fcpe") + "_full")["onset"]
 
     def evidence(self, t0: float, t1: float, cancelled: Callable[[], bool]) -> VocalEvidence:
         a, b = max(0, math.ceil(t0 * self.sr)), min(len(self.audio), math.ceil(t1 * self.sr))

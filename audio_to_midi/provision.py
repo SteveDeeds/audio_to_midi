@@ -18,17 +18,21 @@ from audio_to_midi.environment import PIANO_HR_CHECKPOINT
 
 # (import name, pip arguments) per feature; installed in order, skipped when importable.
 _CREPE = [("torch", ["torch"]), ("torchcrepe", ["torchcrepe>=0.0.23"])]
-_MADMOM = [
-    *_CREPE, ("setuptools", ["setuptools>=75"]), ("Cython", ["Cython>=3"]),
+_MADMOM_ONSETS = [
+    ("setuptools", ["setuptools>=75"]), ("Cython", ["Cython>=3"]),
     ("madmom", ["--no-build-isolation",
                 "madmom @ git+https://github.com/CPJKU/madmom.git@27f032e8947204902c675e5e341a3faf5dc86dae"]),
 ]
+_MADMOM = [*_CREPE, *_MADMOM_ONSETS]
+_FCPE_MADMOM = [("torch", ["torch"]), ("torchfcpe", ["torchfcpe==0.0.4"]), *_MADMOM_ONSETS]
 FEATURES: dict[str, list[tuple[str, list[str]]]] = {
     "pyin": [],
     "crepe_tiny": _CREPE,
     "crepe_full": _CREPE,
     "madmom_cnn": _MADMOM,
     "madmom_brnn": _MADMOM,
+    "madmom_cnn_fcpe": _FCPE_MADMOM,
+    "madmom_brnn_fcpe": _FCPE_MADMOM,
     "madmom_cnn_full": _MADMOM,
     "madmom_brnn_full": _MADMOM,
     "yourmt3": [],
@@ -44,13 +48,16 @@ FEATURES: dict[str, list[tuple[str, list[str]]]] = {
     ])],
     "demucs": [("torch", ["torch"]), ("demucs", ["demucs>=4.0.1"])],
     "btc": [("torch", ["torch"])],
+    "lyrics": [("stable_whisper", ["stable-ts>=2.19,<3"])],
 }
 LABELS = {
     "crepe_tiny": "CREPE", "crepe_full": "CREPE", "basic_pitch": "Basic Pitch", "piano_hr": "Piano-HR",
     "adtof": "ADTOF", "demucs": "Demucs", "btc": "BTC chord model",
     "madmom_cnn": "MADMoM CNN vocals", "madmom_brnn": "MADMoM BRNN vocals",
+    "madmom_cnn_fcpe": "MADMoM CNN + FCPE vocals", "madmom_brnn_fcpe": "MADMoM BRNN + FCPE vocals",
     "madmom_cnn_full": "madmom CNN + CREPE full",
     "madmom_brnn_full": "madmom offline BRNN + CREPE full", "yourmt3": "YourMT3+",
+    "lyrics": "Whisper vocal word recognition",
 }
 PIANO_HR_URL = "https://zenodo.org/record/4034264/files/CRNN_note_F1%3D0.9677_pedal_F1%3D0.9186.pth?download=1"
 PIANO_HR_MIN_BYTES = 1.6e8  # the library re-downloads anything smaller

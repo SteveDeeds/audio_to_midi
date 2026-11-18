@@ -64,6 +64,13 @@ def parser() -> argparse.ArgumentParser:
     separate.add_argument("artifacts", type=Path)
     separate.add_argument("--new-revision", action="store_true")
     separate.add_argument("--project", type=Path, help="Import all six outputs into an empty project")
+    lyrics = commands.add_parser("lyrics", help="Local word recognition and/or supplied-lyrics timing on a vocal stem")
+    lyrics.add_argument("audio", type=Path)
+    lyrics.add_argument("output", type=Path, help="New JSON file; existing files are not overwritten")
+    lyrics.add_argument("--lyrics", type=Path, help="UTF-8 known lyrics to align, not recognition hints")
+    lyrics.add_argument("--transcribe", action="store_true", help="Also recognize words independently of supplied lyrics")
+    lyrics.add_argument("--model", default="base.en", help="Whisper checkpoint (default: base.en; small.en is slower)")
+    lyrics.add_argument("--language", default="en")
     return root
 
 
@@ -85,6 +92,18 @@ def main(argv: list[str] | None = None) -> int:
             report = inspect_environment()
             print(json.dumps(report, indent=2))
             return 0 if report["base_ready"] else 1
+        if args.command == "lyrics":
+            from audio_to_midi.lyrics import analyze_lyrics, save_analysis
+
+            if args.output.exists():
+                raise FileExistsError(f"Output already exists: {args.output}")
+            result = analyze_lyrics(
+                args.audio, lyrics_path=args.lyrics, transcribe=args.transcribe,
+                model_name=args.model, language=args.language,
+            )
+            save_analysis(result, args.output)
+            print(f"Saved word estimates to {args.output}")
+            return 0
         if args.command in (None, "gui"):
             import sys
             from PySide6.QtWidgets import QApplication

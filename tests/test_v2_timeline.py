@@ -2,11 +2,12 @@ from dataclasses import replace
 from fractions import Fraction as F
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QRect
+from PySide6.QtCore import QRect, Qt
+from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 from audio_to_midi.domain import Note, Project, Track
@@ -32,6 +33,37 @@ class TimelineGridTests(unittest.TestCase):
             timeline.KEYS, timeline.ROLL_TOP,
             timeline.width() - timeline.KEYS, timeline._roll_bottom() - timeline.ROLL_TOP,
         ))
+
+    def test_vocal_words_are_centered_in_note_rect_and_change_rendering(self):
+        from audio_to_midi.vocal_words import note_key, note_words
+
+        timeline = self.timeline
+        timeline.track.role = "vocals"
+        timeline.low, timeline.high = 58, 65
+        note = Note("voice", F(1), F(3), 60)
+        timeline.track.notes.generated = timeline.notes = [note]
+        baseline = timeline.grab().toImage()
+        timeline.track.settings["vocal_words"] = dict(
+            model="small.en", audio_sha256="a" * 64, mode="automatic_recognition",
+            words=[dict(word="hello", start=.6, end=1.3)],
+        )
+        timeline.word_labels = note_words(
+            timeline.track.notes.resolved(), timeline.project.grid, timeline.track.settings["vocal_words"],
+        )
+        labeled = timeline.grab().toImage()
+        self.assertNotEqual(baseline, labeled)
+        self.assertEqual(timeline.word_labels[note_key(note)], "hello")
+        painter = MagicMock()
+        painter.font.return_value = QFont()
+        timeline._paint_note(painter, note, None, False)
+        rect, flags, text = painter.drawText.call_args.args
+        self.assertEqual(rect, timeline._note_rect(note))
+        self.assertTrue(flags & Qt.AlignmentFlag.AlignHCenter)
+        self.assertTrue(flags & Qt.AlignmentFlag.AlignVCenter)
+        self.assertEqual(text, "hello")
+        # Resize previews use the preview note's center rather than the old center.
+        timeline._paint_note(painter, note, F(4), False)
+        self.assertEqual(painter.drawText.call_args.args[0], timeline._note_rect(note, F(4)))
 
     def test_onsets_stay_in_lane_without_changing_roll_grid(self):
         timeline = self.timeline

@@ -434,7 +434,17 @@ On a **vocals** track, choose **madmom_cnn** or **madmom_brnn**. These combine
 the reviewed neural onset models with CREPE full pitch. Existing `pyin` and
 CREPE choices are unchanged. Five compact controls sit immediately right of
 the model selector; hover over a label or value for its description. They are
-enabled for the two new models and saved per track:
+enabled for the neural vocal models and saved per track.
+
+**madmom_cnn_fcpe** and **madmom_brnn_fcpe** use the same respective attack
+detectors with **FCPE** instead of CREPE full for pitch. FCPE is a separate,
+singing-oriented pitch model, installed on first use (`torchfcpe==0.0.4`,
+including bundled weights; MIT project license). It runs locally on CPU or
+CUDA in interruptible batches; unvoiced frames are not interpolated into
+invented pitches. The existing defaults are unchanged. These combinations
+still use MADMoM's **non-commercial** onset weights; FCPE does not remove
+that restriction. Compare the options on your own stem rather than assuming
+one always wins, especially with harmony vocals or separation bleed.
 
 | Control | Starting value | Useful tuning range | Effect |
 |---|---|---|---|
@@ -466,7 +476,91 @@ Velocity uses the visible crop's RMS energy rather than whole-stem harmonic
 power. Direct onset additions/removals and corrected held notes still guide
 boundaries, and authored notes remain protected. Legacy learned onset-feature
 profiles are retained for legacy models, but are not used/imported by these
-two neural models; their Onset control sets acceptance instead.
+neural models; their Onset control sets acceptance instead.
+
+#### Local lyrics and word timing
+
+Pitch, musical attacks, and words are separate evidence. MADMoM proposes
+acoustic attacks, not linguistic syllables. The optional **Whisper + stable-ts**
+workflow recognizes words or aligns a supplied UTF-8 lyric file to a vocal
+stem. In the main app, select a vocals track and choose **Model > Detect vocal
+words...**, then **small.en** (more accurate, slower) or **base.en** (smaller).
+This processes the full vocal stem in the background, independently of the
+selected pitch/attack model. Optional packages and weights install/download on
+first use after confirmation. **Cancel analysis** discards unfinished results;
+cancellation is checked between Whisper windows, not during a model download.
+
+To use existing results, choose **Model > Import vocal word timings...** and
+select a JSON file produced by the command below. If it contains both analyses,
+choose **Detected words** for actual recognition, or explicitly choose
+**Supplied lyrics (alignment only)**. The source audio checksum must match the
+active stem; a transcript from a different mix or stem is rejected.
+
+Words are centered horizontally and vertically **inside their matching
+piano-roll notes**. Each positive-duration word is assigned to the note with
+the greatest time overlap (ties prefer the closest attack); a word spanning
+several pitches is shown only once. Multiple words on one note share a label.
+Notes and note boundaries are never changed by word detection. Short notes
+clip long labels: zoom in, or hover for the complete text. Words with no
+overlapping note remain saved for later note generation; zero-duration words
+are retained but not displayed.
+
+If detection reports **0 notes labeled**, check its explanation. There may be
+no musical notes yet, the AI notes slider/edits may hide them, or the analyzed
+notes may not overlap the detected words. The status shows the first timed
+word's audio time and bar number, and the existing notes' time span when they
+do not overlap. Whisper can skip a spoken or sung intro: analyzing bars 1-2
+does not label those notes if recognition starts later. Navigate to the
+reported bar and **Analyze visible bars**; saved words match newly generated
+notes automatically. Note publication also reports its word-label count.
+Do not shift the bar-1 offset merely to force labels onto unrelated notes.
+
+Word timestamps stay in audio seconds and are matched again after note edits,
+model changes, or tempo-map changes. Analyzing another view does not erase
+words elsewhere. Save the project to preserve annotations; word import and
+detection support Undo/Redo. Replacing the vocal stem clears its old words.
+Words are currently a piano-roll annotation, not MIDI/MusicXML score lyrics.
+
+```powershell
+python -m pip install "stable-ts>=2.19,<3"
+python -m audio_to_midi lyrics ".\vocals.wav" ".\words.json" --lyrics ".\lyrics.txt" --transcribe --model small.en
+```
+
+Omit `--lyrics` for automatic recognition only. With `--lyrics`, the default
+is known-text alignment; add `--transcribe` to also run independent recognition
+**without** feeding the supplied lyrics as a prompt. Standalone section
+headings such as `Verse 1`, `[Chorus]`, and `Outro` are removed; parenthesized
+sung words are preserved. Expand repeats explicitly in the lyric file.
+
+The default `base.en` checkpoint is a smaller CPU-friendly starting point;
+`small.en` is slower and often more accurate. Use a multilingual Whisper
+checkpoint and `--language` for other languages. Model weights download on
+first use; inference stays local. Audio is decoded with soundfile and passed
+as a 16 kHz waveform, without an external FFmpeg requirement. Whisper and
+stable-ts are MIT projects; stable-ts upstream development is currently paused.
+
+Output JSON records word start/end seconds, model word probabilities (not
+calibrated singing confidence), provenance hashes, and warnings. Existing
+output files are never overwritten. Zero-duration words are retained and
+flagged as unaligned rather than hidden. Known-text alignment **does not**
+verify that supplied words were sung. Review both text and timing: Whisper
+can hallucinate words, miss singing, or confuse backing voices. Word timings
+are **not syllable/phoneme timings** and must not automatically split every
+word into a single MIDI note; sustained melismas can span several pitches.
+
+Two openly reusable reference recordings with sung words:
+
+- [Twinkle Twinkle Little Star, sung by Dcoetzee (CC0)](https://commons.wikimedia.org/wiki/File:Twinkle_Twinkle_Little_Star_-_sung_with_full_lyrics.ogg):
+  solo a cappella; useful for monophonic pitch and words.
+- [Angels We Have Heard on High, U.S. Army Band chorus (public domain)](https://commons.wikimedia.org/wiki/File:U.S._Army_Band_-_Angels_We_Have_Heard_on_High.ogg):
+  choral a cappella; a stress case for melismas/overlapping voices, **not**
+  monophonic pitch ground truth. Review the recording's licensing page for
+  your jurisdiction.
+
+Demucs isolates vocals from instruments, not individual singers. Keep the
+original recordings and licensing/source information alongside locally
+generated stems. Neither these recordings nor supplied lyrics are bundled
+with the application.
 
 There are two tools, with buttons next to **Grid** (or **View** menu):
 

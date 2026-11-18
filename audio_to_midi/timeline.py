@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QToolTip, QWidget
 
 from audio_to_midi.domain import Note, Project, Track
+from audio_to_midi.vocal_words import note_key
 from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, note_value, pitch_name, scale_pitch_classes,
 )
@@ -87,6 +88,7 @@ class Timeline(QWidget):
         self.track: Track | None = None
         self.mode = "notes"
         self.notes: list = []
+        self.word_labels: dict[tuple, str] = {}
         self.selected = None
         self.start = Fraction(0)
         self.end = Fraction(8)
@@ -378,6 +380,19 @@ class Timeline(QWidget):
         painter.drawRect(rect)
         if not outside and rect.width() > 10:
             painter.fillRect(QRectF(rect.right() - 3, rect.top() + 1, 2, rect.height() - 2), QColor(255, 255, 255, 120))
+        text = self.word_labels.get(note_key(note))
+        if text and not outside:
+            painter.save()
+            painter.setClipRect(QRectF(
+                self.KEYS, self._rows_top(), self.width() - self.KEYS, self._roll_bottom() - self._rows_top(),
+            ))
+            painter.setClipRect(rect, Qt.ClipOperation.IntersectClip)
+            font = painter.font()
+            font.setPixelSize(max(6, min(12, int(rect.height()) - 2)))
+            painter.setFont(font)
+            painter.setPen(QColor("#101820"))
+            painter.drawText(rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextSingleLine, text)
+            painter.restore()
 
     # Interaction ----------------------------------------------------------
     def _in_roll(self, x: float, y: float) -> bool:
@@ -473,6 +488,8 @@ class Timeline(QWidget):
 
     def _hover(self, note, event) -> None:
         text = note_summary(self.project, note, self.drums) if note is not None else ""
+        if note is not None and (words := self.word_labels.get(note_key(note))):
+            text += f" | Words: {words}"
         if text != self.toolTip():
             self.setToolTip(text)
             if text:

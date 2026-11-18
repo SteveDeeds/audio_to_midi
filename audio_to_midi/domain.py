@@ -379,6 +379,12 @@ class Track:
         input_source(self)
         if "vocal_parameters" in self.settings:
             VocalParameters.from_dict(self.settings["vocal_parameters"])
+        if "vocal_words" in self.settings:
+            from .vocal_words import validate_words
+
+            if self.role != "vocals":
+                raise ValueError("Vocal words belong on a vocals track.")
+            validate_words(self.settings["vocal_words"], self.duration)
         if "madmom_license_acknowledged" in self.settings and type(self.settings["madmom_license_acknowledged"]) is not bool:
             raise ValueError("MADMoM license acknowledgement must be true or false")
         if any(type(example) is not dict for example in self.training):

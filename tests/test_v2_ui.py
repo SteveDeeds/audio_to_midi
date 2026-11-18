@@ -13,6 +13,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import numpy as np
 import soundfile as sf
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from audio_to_midi.adapters import Prediction
@@ -71,6 +72,155 @@ class EditorTests(unittest.TestCase):
             self.app.processEvents()
             time.sleep(.01)
         self.assertIsNotNone(self.window.timeline.cqt)
+
+    def vocal_words(self):
+        return dict(model="small.en", mode="automatic_recognition", audio_sha256="a" * 64,
+                    words=[dict(word="hello", start=.1, end=.5)])
+
+    def make_vocal(self):
+        self.track.role, self.track.model = "vocals", "madmom_cnn_fcpe"
+        self.track.notes.generated = [Note("voice", F(0), F(2), 60)]
+        self.window._sync_tracks()
+
+    def test_fcpe_models_are_selectable_with_controls_and_descriptions(self):
+        self.make_vocal()
+        for model in ("madmom_cnn_fcpe", "madmom_brnn_fcpe"):
+            index = self.window.models.findData(model)
+            self.assertGreaterEqual(index, 0)
+            self.window.models.setCurrentIndex(index)
+            self.assertEqual(self.track.model, model)
+            self.assertIn("FCPE", self.window.models.itemText(index))
+            self.assertIn("FCPE", self.window.models.itemData(index, Qt.ItemDataRole.ToolTipRole))
+        self.assertTrue(self.window.actions["detect_words"].isEnabled())
+        self.assertTrue(self.window.actions["import_words"].isEnabled())
+
+    def test_word_publication_is_undoable_and_saved_without_changing_notes(self):
+        from audio_to_midi.storage import load_project, save_project
+        from audio_to_midi.vocal_words import note_key
+
+        self.make_vocal()
+        before = deepcopy(self.track.notes.generated)
+        prior_token = token(self.window.project, self.track)
+        self.window._word_publisher(self.track)(self.vocal_words())
+        self.assertEqual(self.track.notes.generated, before)
+        self.assertEqual(token(self.window.project, self.track), prior_token)
+        self.assertEqual(self.window.timeline.word_labels[note_key(before[0])], "hello")
+        self.assertIn("vocal_words", self.track.settings)
+        self.window._undo()
+        self.assertNotIn("vocal_words", self.track.settings)
+        self.window._redo()
+        self.assertEqual(self.track.settings["vocal_words"], self.vocal_words())
+        save_project(self.window.project, self.root / "project")
+        restored = load_project(self.root / "project").track(self.track.id)
+        self.assertEqual(restored.settings["vocal_words"], self.vocal_words())
+
+    def test_word_labels_rematch_after_note_edits_without_viewport_stealing(self):
+        from audio_to_midi.vocal_words import note_key
+
+        self.make_vocal()
+        first = Note("first", F(0), F(2), 60)
+        later = Note("later", F(2), F(4), 64)
+        self.track.notes.generated = [first, later]
+        self.track.settings["vocal_words"] = dict(
+            self.vocal_words(), words=[dict(word="held", start=.1, end=1.1)],
+        )
+        self.window.timeline.start, self.window.timeline.end = F(2), F(4)
+        self.window._refresh()
+        self.assertNotIn(note_key(later), self.window.timeline.word_labels)
+        self.assertEqual(self.window.timeline.word_labels[note_key(first)], "held")
+        self.track.notes.generated = [later]
+        self.window._refresh()
+        self.assertEqual(self.window.timeline.word_labels[note_key(later)], "held")
+
+    def test_zero_labels_explain_intro_gap_with_bar_one_offset(self):
+        from audio_to_midi.timebase import Grid
+
+        self.make_vocal()
+        self.window.project.grid = Grid(126.048, offset_seconds=2.466819440145341)
+        self.track.duration = 20
+        self.track.notes.generated = [Note("intro", F(0), F(8), 60)]
+        annotation = dict(self.vocal_words(), words=[dict(word="first", start=8.56, end=8.96)])
+        self.window._word_publisher(self.track)(annotation)
+        status = self.window.status.text()
+        self.assertIn("0 notes labeled", status)
+        self.assertIn("No note/word time overlap", status)
+        self.assertIn("2.47-6.27 s", status)
+        self.assertIn("8.56 s (bar 4)", status)
+        self.assertEqual(self.track.notes.generated, [Note("intro", F(0), F(8), 60)])
+
+    def test_zero_labels_distinguish_missing_notes_from_filtered_notes(self):
+        self.make_vocal()
+        self.track.notes.generated = []
+        self.window._word_publisher(self.track)(self.vocal_words())
+        self.assertIn("No musical notes yet", self.window.status.text())
+        self.track.notes.generated = [Note("quiet", F(0), F(2), 60, confidence=.1)]
+        self.track.notes.detection_level = 1
+        self.window._word_publisher(self.track)(self.vocal_words())
+        self.assertIn("filtering or edits", self.window.status.text())
+
+    def test_note_publication_reports_newly_matched_words(self):
+        self.make_vocal()
+        self.track.notes.generated = []
+        self.track.settings["vocal_words"] = self.vocal_words()
+        prediction = Prediction(F(0), F(4), (Note("sung", F(0), F(2), 60),), (F(0),))
+        self.assertTrue(self.window._publish((token(self.window.project, self.track), prediction)))
+        self.assertIn("1 notes labeled", self.window.status.text())
+        self.assertEqual(list(self.window.timeline.word_labels.values()), ["hello"])
+
+    def test_word_publication_rejects_stale_audio_or_replaced_words(self):
+        self.make_vocal()
+        accept = self.window._word_publisher(self.track)
+        self.track.settings["vocal_words"] = self.vocal_words()
+        accept(dict(self.vocal_words(), model="base.en"))
+        self.assertEqual(self.track.settings["vocal_words"]["model"], "small.en")
+        self.assertIn("stale", self.window.status.text())
+        accept = self.window._word_publisher(self.track)
+        self.track.audio_path = str(self.root / "replacement.wav")
+        sf.write(self.track.audio_path, np.zeros(16000), 8000)
+        accept(self.vocal_words())
+        self.assertIn("stale", self.window.status.text())
+
+    def test_detect_words_runs_background_recognition_for_selected_model(self):
+        self.make_vocal()
+        data = dict(schema=1, model="small.en", audio_sha256="a" * 64,
+                    analyses={"recognized": dict(mode="automatic_recognition",
+                                                 words=self.vocal_words()["words"])})
+        with patch("audio_to_midi.ui.QInputDialog.getItem", return_value=("small.en", True)), \
+                patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes), \
+                patch("audio_to_midi.provision.missing", return_value=[]), \
+                patch("audio_to_midi.provision.ensure"), \
+                patch("audio_to_midi.lyrics.analyze_lyrics", return_value=data) as recognize:
+            self.window._detect_words()
+            self.wait_idle()
+        self.assertEqual(recognize.call_args.kwargs["model_name"], "small.en")
+        self.assertTrue(callable(recognize.call_args.kwargs["cancelled"]))
+        self.assertEqual(self.track.settings["vocal_words"], self.vocal_words())
+
+    def test_import_words_chooses_recognition_and_verifies_stem_checksum(self):
+        import json
+        from audio_to_midi.evidence_cache import checksum
+
+        self.make_vocal()
+        words = self.vocal_words()
+        words["audio_sha256"] = checksum(self.wav)
+        analysis = dict(schema=1, model="small.en", audio_sha256=words["audio_sha256"],
+                        analyses={"recognized": words,
+                                  "aligned": dict(words, mode="known_lyrics_alignment")})
+        path = self.root / "words.json"
+        path.write_text(json.dumps(analysis), encoding="utf-8")
+        with patch("audio_to_midi.ui.QFileDialog.getOpenFileName", return_value=(str(path), "")), \
+                patch("audio_to_midi.ui.QInputDialog.getItem", return_value=("Detected words", True)):
+            self.window._import_words()
+            self.wait_idle()
+        self.assertEqual(self.track.settings["vocal_words"], words)
+        analysis["audio_sha256"] = "b" * 64
+        path.write_text(json.dumps(analysis), encoding="utf-8")
+        with patch("audio_to_midi.ui.QFileDialog.getOpenFileName", return_value=(str(path), "")), \
+                patch("audio_to_midi.ui.QInputDialog.getItem", return_value=("Detected words", True)):
+            self.window._import_words()
+            self.wait_idle()
+        self.assertIn("does not match", self.window.status.text())
+        self.assertEqual(self.track.settings["vocal_words"], words)
 
     def test_score_export_quantization_default_selection_and_cancel(self):
         from audio_to_midi.musicxml import QUANTIZATIONS

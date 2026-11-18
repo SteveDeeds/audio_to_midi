@@ -66,6 +66,7 @@ def replace_stem(project: Project, track: Track, path: Path) -> None:
     track.audio_path = str(path)
     track.duration = info.duration
     track.sample_rate = info.samplerate
+    track.settings.pop("vocal_words", None)
     track.notes.generated = []
     track.notes.revision += 1
     track.revision += 1
@@ -96,7 +97,7 @@ def identity(project: Project, track: Track) -> str:
         "file": media_identity(track.audio_path),
         "grid": repr(project.grid), "key": project.key, "model": track.model,
         "harmony": harmony_identity(project),
-        "settings": {k: v for k, v in track.settings.items() if k not in ("coverage", "coverage_identity")},
+        "settings": {k: v for k, v in track.settings.items() if k not in ("coverage", "coverage_identity", "vocal_words")},
         "training": track.training, "revision": track.revision,
         **({"vocal_boundary_policy": 1} if track.role == "vocals" else {}),
         **({"vocal_syllable_policy": 1} if track.model in VOCAL_MODELS else {}),

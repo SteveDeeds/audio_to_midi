@@ -15,6 +15,8 @@ MODEL_LABELS = {
     "piano_hr": "Piano HR", "basic_pitch": "Basic Pitch", "yourmt3": "YourMT3+",
     "madmom_brnn_full": "madmom offline BRNN + CREPE full",
     "madmom_cnn_full": "madmom CNN + CREPE full", "adtof": "ADTOF",
+    "madmom_cnn_fcpe": "MADMoM CNN + FCPE",
+    "madmom_brnn_fcpe": "MADMoM BRNN + FCPE",
 }
 
 

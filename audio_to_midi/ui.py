@@ -11,6 +11,7 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from fractions import Fraction
 from pathlib import Path
+import json
 import threading
 import time
 
@@ -50,6 +51,7 @@ from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline
 from audio_to_midi.timing import BeatSession
 from audio_to_midi.vocal_settings import CONTROLS as VOCAL_CONTROLS, MODEL_DESCRIPTIONS, VOCAL_MODELS, VocalParameters
+from audio_to_midi.vocal_words import note_words
 
 MIX, CHORDS = "__mix__", "__chords__"
 GRIDS = (
@@ -278,6 +280,10 @@ class ProjectWindow(QMainWindow):
         self.auto.setChecked(True)
         model.addSeparator()
         self._act(model, "profile", "Import onset profile...", self._profile)
+        model.addSeparator()
+        self._act(model, "detect_words", "Detect vocal words...", self._detect_words)
+        self._act(model, "import_words", "Import vocal word timings...", self._import_words)
+        model.addSeparator()
         self._act(model, "cancel", "&Cancel analysis", self._cancel, "Esc")
         model.addSeparator()
         recognizers = model.addMenu("C&hord recognizer")
@@ -539,11 +545,15 @@ class ProjectWindow(QMainWindow):
         self.timeline.project = self.chord_view.project = self.project
         self.timeline.track = track
         self.timeline.mode = "mix" if view == MIX else "notes"
+        resolved = track.notes.resolved() if track else []
         self._rows = [
-            n for n in track.notes.resolved()
+            n for n in resolved
             if n.end > self.timeline.start and n.start < self.timeline.end
         ] if track else []
         self.timeline.notes = self._rows
+        self.timeline.word_labels = note_words(
+            resolved, grid, track.settings.get("vocal_words"),
+        ) if track and track.role == "vocals" else {}
         self.confidence_panel.setVisible(track is not None)
         self.confidence_slider.blockSignals(True)
         self.confidence_slider.setValue(track.notes.detection_level if track else 100)
@@ -644,6 +654,10 @@ class ProjectWindow(QMainWindow):
                 "Neural vocal models honor direct note/onset edits; feature profiles belong to legacy models."
                 if track and track.model in VOCAL_MODELS else "Choose a track first.",
             ),
+            "detect_words": (bool(track and track.role == "vocals") and not busy,
+                             "Choose a vocals track and finish the current task first."),
+            "import_words": (bool(track and track.role == "vocals") and not busy,
+                             "Choose a vocals track and finish the current task first."),
             "cancel": (busy, "Nothing is running."),
             "key_chroma": (has_mix, "Import a mix first."),
             "octave_up": (self.view != CHORDS and not self.timeline.drums,
@@ -709,7 +723,7 @@ class ProjectWindow(QMainWindow):
             for name in MODELS[track.role]:
                 self.models.addItem(MODEL_LABELS.get(name, name), name)
             for index in range(self.models.count()):
-                description = MODEL_DESCRIPTIONS.get(self.models.itemText(index))
+                description = MODEL_DESCRIPTIONS.get(self.models.itemData(index))
                 if description:
                     self.models.setItemData(index, description, Qt.ItemDataRole.ToolTipRole)
             self.models.setCurrentIndex(self.models.findData(track.model))
@@ -1333,7 +1347,10 @@ class ProjectWindow(QMainWindow):
             return False
         if publish(self.project, result_token, prediction):
             self._refresh()
-            self.status.setText("Notes updated.")
+            if track.role == "vocals" and track.settings.get("vocal_words"):
+                self.status.setText("Notes updated. " + self._word_match_summary(track))
+            else:
+                self.status.setText("Notes updated.")
             return True
         else:
             self.status.setText("Discarded stale inference; edits/project changed.")
@@ -1357,6 +1374,7 @@ class ProjectWindow(QMainWindow):
         return deepcopy((
             track.notes.authored, track.notes.rejections, track.notes.onsets,
             track.training, track.settings.get("imported_midi"), track.notes.detection_level,
+            track.settings.get("vocal_words"),
         ))
 
     def _checkpoint(self, key: str | None = None) -> None:
@@ -1380,7 +1398,7 @@ class ProjectWindow(QMainWindow):
             self._refresh()
             return
         track = self.project.track(key)
-        authored, rejections, onsets, training, imported, detection_level = state
+        authored, rejections, onsets, training, imported, detection_level, words = state
         track.notes.authored = authored
         track.notes.rejections = rejections
         track.notes.onsets = onsets
@@ -1390,6 +1408,10 @@ class ProjectWindow(QMainWindow):
             track.settings.pop("imported_midi", None)
         else:
             track.settings["imported_midi"] = imported
+        if words is None:
+            track.settings.pop("vocal_words", None)
+        else:
+            track.settings["vocal_words"] = words
         track.notes.revision += 1
         self._edited(track)
 
@@ -2202,6 +2224,134 @@ class ProjectWindow(QMainWindow):
             self._play_toggle()
 
     # -- stems and chords ---------------------------------------------------
+    def _vocal_track(self) -> Track:
+        track = self.active
+        if track is None or track.role != "vocals":
+            raise ValueError("Choose a vocals track first.")
+        return track
+
+    def _word_match_summary(self, track: Track) -> str:
+        annotation = track.settings["vocal_words"]
+        notes = track.notes.resolved()
+        labels = note_words(notes, self.project.grid, annotation)
+        timed = [w for w in annotation["words"] if w["end"] > w["start"]]
+        summary = f"{len(labels)} notes labeled."
+        if labels:
+            return summary
+        if not timed:
+            return summary + " All word timings have zero duration and need review."
+        first = timed[0]["start"]
+        first_bar = bar_and_beat(
+            self.project.grid, max(Fraction(0), self.project.grid.seconds_to_beat(first)),
+        )[0]
+        word_hint = f" First detected word: {first:.2f} s (bar {first_bar})."
+        if not notes:
+            if track.notes.generated or track.notes.authored:
+                return summary + " No notes remain visible after filtering or edits; review the AI notes slider and rests." + word_hint
+            return summary + " No musical notes yet; choose a pitch model and Analyze visible bars." + word_hint
+        start = min(self.project.grid.beat_to_seconds(n.start) for n in notes)
+        end = max(self.project.grid.beat_to_seconds(n.end) for n in notes)
+        return (
+            summary + f" No note/word time overlap: existing notes span {start:.2f}-{end:.2f} s."
+            + word_hint + " Analyze visible bars where detected words occur; recognition may have skipped the intro."
+        )
+
+    def _word_publisher(self, track: Track):
+        project_id, track_id = self.project.id, track.id
+        source = media_identity(track.audio_path)
+        previous = deepcopy(track.settings.get("vocal_words"))
+
+        def accept(annotation):
+            current = next((t for t in self.project.tracks if t.id == track_id), None)
+            if (self.project.id != project_id or current is None or current.role != "vocals"
+                    or media_identity(current.audio_path) != source
+                    or current.settings.get("vocal_words") != previous):
+                self.status.setText("Vocal audio or words changed; discarded stale word results.")
+                return
+            from audio_to_midi.vocal_words import validate_words
+
+            validate_words(annotation, current.duration)
+            self._checkpoint(track_id)
+            current.settings["vocal_words"] = annotation
+            self.project.revision += 1
+            self._refresh()
+            timed = sum(w["end"] > w["start"] for w in annotation["words"])
+            mode = "Detected" if annotation["mode"] == "automatic_recognition" else "Aligned supplied"
+            self.status.setText(
+                f"{mode} {len(annotation['words'])} words ({annotation['model']}); "
+                f"{self._word_match_summary(current)} {timed} timed words retained for matching as notes change. "
+                f"{len(annotation['words']) - timed} zero-duration words need review. "
+                "Review text and timing; zoom in to read short notes. Save the project to keep words."
+            )
+        return accept
+
+    def _detect_words(self) -> None:
+        from audio_to_midi import provision
+        from audio_to_midi.lyrics import analyze_lyrics
+        from audio_to_midi.vocal_words import annotation_from_analysis
+
+        track = self._vocal_track()
+        model, ok = QInputDialog.getItem(
+            self, "Detect vocal words", "Local Whisper model (English)", ["small.en", "base.en"], 0, False,
+        )
+        if not ok:
+            return
+        needs = provision.missing("lyrics")
+        if QMessageBox.question(
+            self, "Detect vocal words",
+            f"Recognize words from the entire vocal stem using Whisper {model}? "
+            "Processing stays local and runs in the background. First use downloads model weights "
+            "(small.en about 461 MB; base.en about 139 MB). Singing may be misrecognized. "
+            "Words will be centered on matching notes, without changing notes or splitting syllables. "
+            + (f"\nInstall optional MIT-licensed packages: {', '.join(needs)}." if needs else "")
+            + ("\nThis replaces the track's existing word annotations (Undo restores them)."
+               if track.settings.get("vocal_words") else ""),
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        path, duration = Path(track.audio_path), track.duration
+        accept = self._word_publisher(track)
+
+        def work(cancelled, report):
+            provision.ensure("lyrics", report, cancelled)
+            data = analyze_lyrics(path, model_name=model, report=report, cancelled=cancelled)
+            return annotation_from_analysis(data, "recognized", data["audio_sha256"], duration)
+
+        self._cancel(analysis_only=True)
+        self._run(work, accept, kind="lyrics", message="Recognizing vocal words:", reports=True)
+
+    def _import_words(self) -> None:
+        from audio_to_midi.evidence_cache import checksum
+        from audio_to_midi.vocal_words import annotation_from_analysis
+
+        track = self._vocal_track()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import vocal word timings", filter="Vocal word analysis (*.json)",
+        )
+        if not path:
+            return
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("analyses"), dict):
+            raise ValueError("Choose a word-analysis JSON produced by the lyrics command.")
+        choices = [key for key in ("recognized", "aligned") if key in data["analyses"]]
+        if not choices:
+            raise ValueError("The file contains no recognized or aligned word analysis.")
+        analysis = choices[0]
+        if len(choices) > 1:
+            label, ok = QInputDialog.getItem(
+                self, "Word analysis", "Detected words or supplied-lyrics alignment?",
+                ["Detected words", "Supplied lyrics (alignment only)"], 0, False,
+            )
+            if not ok:
+                return
+            analysis = "recognized" if label == "Detected words" else "aligned"
+        audio, duration = Path(track.audio_path), track.duration
+        accept = self._word_publisher(track)
+        self._cancel(analysis_only=True)
+        self._run(
+            lambda cancelled: annotation_from_analysis(data, analysis, checksum(audio), duration),
+            accept, kind="lyrics", message="Checking vocal word analysis against this stem...",
+        )
+
     def _separate(self, then_detect_chords: bool = False) -> None:
         if not self.project.mix_path:
             raise ValueError("Import a mix first.")

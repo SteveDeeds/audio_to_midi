@@ -4,10 +4,12 @@ from dataclasses import dataclass, fields
 import math
 
 
-VOCAL_MODELS = ("madmom_cnn", "madmom_brnn")
+VOCAL_MODELS = ("madmom_cnn", "madmom_brnn", "madmom_cnn_fcpe", "madmom_brnn_fcpe")
 MODEL_DESCRIPTIONS = {
     "madmom_cnn": "MADMoM CNN syllable attacks + CREPE full pitch. Visible bars only; non-commercial onset weights.",
     "madmom_brnn": "MADMoM bidirectional RNN syllable attacks + CREPE full pitch. Visible bars only; non-commercial onset weights.",
+    "madmom_cnn_fcpe": "MADMoM CNN syllable attacks + FCPE singing pitch. Visible bars only; non-commercial onset weights.",
+    "madmom_brnn_fcpe": "MADMoM bidirectional RNN syllable attacks + FCPE singing pitch. Visible bars only; non-commercial onset weights.",
 }
 CONTROLS = (
     ("neural_threshold", "Onset", 0.01, 0.99, 0.01, 2, "",

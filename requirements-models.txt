@@ -1,5 +1,8 @@
 -r requirements.txt
 torchcrepe>=0.0.23
+torchfcpe==0.0.4
+# Optional local lyric recognition and known-text word alignment.
+stable-ts>=2.19,<3
 setuptools>=75
 Cython>=3
 # MADMoM needs --no-build-isolation and MSVC C++ Build Tools on Windows.
