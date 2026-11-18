@@ -51,7 +51,7 @@ from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline
 from audio_to_midi.timing import BeatSession
 from audio_to_midi.vocal_settings import CONTROLS as VOCAL_CONTROLS, MODEL_DESCRIPTIONS, VOCAL_MODELS, VocalParameters
-from audio_to_midi.vocal_words import note_words
+from audio_to_midi.vocal_words import note_key, note_words
 
 MIX, CHORDS = "__mix__", "__chords__"
 GRIDS = (
@@ -478,7 +478,6 @@ class ProjectWindow(QMainWindow):
         self.timeline.note_requested.connect(
             lambda b, pitch, end: self._guard(lambda: self._add_note(b, pitch, end))
         )
-        self.timeline.note_removed.connect(lambda note: self._guard(lambda: self._remove_note(note)))
         self.timeline.note_resized.connect(lambda note, end: self._guard(lambda: self._resize_note(note, end)))
         self.timeline.note_selected.connect(self._select_note)
         self.timeline.note_selected.connect(lambda note: self._audition(note.start, note.pitch))
@@ -1510,7 +1509,7 @@ class ProjectWindow(QMainWindow):
             self._select_note(note)
             return
         self._checkpoint()
-        confirmed = track.notes.author(note.start, note.end, note.pitch, note.velocity)
+        confirmed = track.notes.author(note.start, note.end, note.pitch, note.velocity, note.lyric)
         record_onset(track, note.start, True)
         if track.role == "drums":
             record_drum(track, self.project, note.start, note.end, note.pitch, True)
@@ -1534,13 +1533,16 @@ class ProjectWindow(QMainWindow):
         else:
             self._edit_note(note, *dialog.values())
 
-    def _replace_note(self, old, start: Fraction, end: Fraction, pitch: int, velocity: int) -> None:
+    def _replace_note(self, old, start: Fraction, end: Fraction, pitch: int, velocity: int,
+                      *, lyric: str | None = None) -> None:
+        if not self.active or old not in self._rows:
+            raise ValueError("The note changed before it could be edited; try again.")
         end = self._clamp_release(start, end, pitch, ignore=old)
         if end <= start:
             raise ValueError("The note would have no length.")
         self._checkpoint()
         self.active.notes.reject(old.start, old.end, old.pitch)
-        self.active.notes.author(start, end, pitch, velocity)
+        self.active.notes.author(start, end, pitch, velocity, old.lyric if lyric is None else lyric)
         record_onset(self.active, start, True)
         if self.active.role == "drums":
             record_drum(self.active, self.project, old.start, old.end, old.pitch, False)
@@ -1578,6 +1580,76 @@ class ProjectWindow(QMainWindow):
             record_drum(self.active, self.project, note.start, note.end, note.pitch, False)
         self._edited()
 
+    def _next_note(self, note: Note) -> Note | None:
+        return min(
+            (n for n in self.active.notes.resolved() if n.start > note.start),
+            key=lambda n: (n.start, n.pitch != note.pitch, n.pitch, n.end, n.id),
+            default=None,
+        )
+
+    def _join_note(self, note: Note) -> None:
+        track = self._require_transcribable()
+        if note not in self._rows:
+            raise ValueError("The note changed before it could be joined; try again.")
+        following = self._next_note(note)
+        if following is None:
+            raise ValueError("There is no next note to join.")
+        end = max(note.end, following.end)
+        resolved = track.notes.resolved()
+        if any(n not in (note, following) and n.pitch == note.pitch
+               and n.start < end and note.start < n.end for n in resolved):
+            raise ValueError("Joining would overlap another note of the same pitch.")
+        lyric = None
+        if track.role == "vocals" and (note.lyric is not None or following.lyric is not None):
+            labels = note_words(resolved, self.project.grid, track.settings.get("vocal_words"))
+            lyric = " ".join(text for n in (note, following) if (text := labels.get(note_key(n))))
+        self._checkpoint()
+        for old in (note, following):
+            track.notes.reject(old.start, old.end, old.pitch)
+            if track.role == "drums":
+                record_drum(track, self.project, old.start, old.end, old.pitch, False)
+        joined = track.notes.author(note.start, end, note.pitch, note.velocity, lyric)
+        if not any(n not in (note, following) and n.start == following.start for n in resolved):
+            track.notes.onsets = [b for b in track.notes.onsets if b != following.start]
+            record_onset(track, following.start, False)
+        record_onset(track, note.start, True)
+        if track.role == "drums":
+            record_drum(track, self.project, note.start, end, note.pitch, True)
+        self._edited(track)
+        self._select_note(joined)
+
+    def _split_note(self, note: Note, beat: Fraction) -> None:
+        track = self._require_transcribable()
+        if note not in self._rows:
+            raise ValueError("The note changed before it could be split; try again.")
+        split = self.project.grid.snap(beat)
+        if not note.start < split < note.end:
+            raise ValueError("Right-click inside the note to split at an interior grid position.")
+        self._checkpoint()
+        track.notes.reject(note.start, note.end, note.pitch)
+        first = track.notes.author(note.start, split, note.pitch, note.velocity, note.lyric)
+        track.notes.author(split, note.end, note.pitch, note.velocity, "" if note.lyric is not None else None)
+        record_onset(track, note.start, True)
+        record_onset(track, split, True)
+        if track.role == "drums":
+            record_drum(track, self.project, note.start, note.end, note.pitch, False)
+            record_drum(track, self.project, note.start, split, note.pitch, True)
+            record_drum(track, self.project, split, note.end, note.pitch, True)
+        self._edited(track)
+        self._select_note(first)
+
+    def _edit_lyric(self, note: Note) -> None:
+        track = self._vocal_track()
+        if note not in self._rows:
+            raise ValueError("The note changed before its lyric could be edited; try again.")
+        current = self.timeline.word_labels.get(note_key(note), "")
+        text, accepted = QInputDialog.getText(self, "Edit lyric", "Lyric (leave empty to clear):", text=current)
+        if not accepted:
+            return
+        text = " ".join(text.split())
+        if text != current:
+            self._replace_note(note, note.start, note.end, note.pitch, note.velocity, lyric=text)
+
     def _rest(self) -> None:
         """Rest over the selected note's span (all pitches)."""
         note = self._selected()
@@ -1595,8 +1667,20 @@ class ProjectWindow(QMainWindow):
     def _info_menu(self, seconds: float, note, at) -> None:
         menu = QMenu(self)
         if note is not None:
-            menu.addAction("Note details...", lambda: self._guard(lambda: self._note_info(note)))
-            menu.addAction("Delete note", lambda: self._guard(lambda: self._remove_note(note)))
+            if not self.active or note not in self._rows:
+                raise ValueError("The note changed; try again.")
+            split = self.project.grid.snap(self.project.grid.seconds_to_beat(seconds))
+            menu.addAction("Delete", lambda: self._guard(lambda: self._remove_note(note)))
+            menu.addAction("Info...", lambda: self._guard(lambda: self._note_info(note)))
+            join = menu.addAction("Join with next note", lambda: self._guard(lambda: self._join_note(note)))
+            join.setEnabled(self._next_note(note) is not None)
+            divide = menu.addAction("Split note", lambda: self._guard(lambda: self._split_note(note, split)))
+            divide.setEnabled(note.start < split < note.end)
+            if self.active.role == "vocals":
+                menu.addAction("Edit lyric...", lambda: self._guard(lambda: self._edit_lyric(note)))
+            if self.timeline.tool != "info":
+                self._popup(menu, at)
+                return
             menu.addSeparator()
         if self.session is None:
             menu.addAction("Detect beats first (Edit > Detect tempo, meter, and key)").setEnabled(False)

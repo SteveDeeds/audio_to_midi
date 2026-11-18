@@ -1,7 +1,7 @@
 """Versioned, atomic project manifests, without backend or GUI dependencies.
 
-Schema 4 adds note confidence and a reversible detection level; schema 3 is
-still readable. Every Fraction is stored as {numerator, denominator} and chords as
+Schema 5 adds editable note lyrics; schemas 3 and 4 are still readable.
+Every Fraction is stored as {numerator, denominator} and chords as
 lead-sheet segments. Relative media paths
 are relative to the manifest folder; loading returns absolute media paths.
 History is deliberately ephemeral, while edit feedback and revisions are durable.
@@ -19,7 +19,7 @@ from .domain import ChordSegment, Note, NoteStore, Project, Track
 from .timebase import Grid
 
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 
 class ProjectStorageError(Exception):
@@ -63,12 +63,17 @@ def _note(note: Note) -> dict:
         "id": note.id, "start": _fraction(note.start), "end": _fraction(note.end),
         "pitch": note.pitch, "velocity": note.velocity, "source": note.source,
         "confidence": note.confidence,
+        "lyric": note.lyric,
     }
 
 
 def _read_note(value: object, schema: int) -> Note:
     keys = {"id", "start", "end", "pitch", "velocity", "source"}
-    value = _object(value, keys | ({"confidence"} if schema >= 4 else set()), "note")
+    if schema >= 4:
+        keys.add("confidence")
+    if schema >= 5:
+        keys.add("lyric")
+    value = _object(value, keys, "note")
     return Note(**{**value, "start": _read_fraction(value["start"]),
                    "end": _read_fraction(value["end"])})
 
@@ -285,7 +290,7 @@ def load_project(folder: Path) -> Project:
         raise InvalidProjectError(f"Cannot decode project manifest: {exc}") from exc
     if type(data) is not dict:
         raise InvalidProjectError("manifest must be an object")
-    if type(data.get("schema_version")) is not int or data["schema_version"] not in (3, SCHEMA_VERSION):
+    if type(data.get("schema_version")) is not int or data["schema_version"] not in (3, 4, SCHEMA_VERSION):
         raise SchemaVersionError(f"Unsupported project schema: {data.get('schema_version')!r}")
     try:
         data = _object(data, {

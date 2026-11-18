@@ -95,6 +95,23 @@ def test_words_map_once_by_overlap_with_melismas_repeats_and_multiple_words():
     assert note_words(notes, Grid(60), data)[note_key(notes[0])] == "long"
 
 
+def test_edited_lyrics_override_recognition_and_blank_suppresses_it():
+    from dataclasses import replace
+    from fractions import Fraction as F
+    from audio_to_midi.domain import Note
+    from audio_to_midi.timebase import Grid
+
+    edited = Note("edited", F(0), F(2), 60, lyric="corrected")
+    blank = Note("blank", F(2), F(4), 62, lyric="")
+    automatic = Note("automatic", F(4), F(6), 64)
+    data = annotation([word("wrong", .1, .5), word("hidden", 1.1, 1.5), word("kept", 2.1, 2.5)])
+    assert note_words([edited, blank, automatic], Grid(), data) == {
+        note_key(edited): "corrected", note_key(automatic): "kept",
+    }
+    moved = replace(edited, start=F(6), end=F(8))
+    assert note_words([moved], Grid(), None) == {note_key(moved): "corrected"}
+
+
 @pytest.mark.parametrize("changes", [
     {"start": True}, {"start": -1}, {"end": float("nan")},
     {"end": 10}, {"word": ""}, {"probability": 2},

@@ -64,10 +64,8 @@ def note_key(note: Note) -> tuple:
 def note_words(notes: Sequence[Note], grid: Grid, annotation: dict | None) -> dict[tuple, str]:
     """Put each timed word on one best-overlapping note; never invent syllables."""
     labels: dict[tuple, list[str]] = {}
-    if not annotation:
-        return {}
     spans = [(note, grid.beat_to_seconds(note.start), grid.beat_to_seconds(note.end)) for note in notes]
-    for word in annotation["words"]:
+    for word in annotation["words"] if annotation else ():
         a, b = word["start"], word["end"]
         if b <= a:
             continue
@@ -78,4 +76,10 @@ def note_words(notes: Sequence[Note], grid: Grid, annotation: dict | None) -> di
         if candidates:
             note = max(candidates, key=lambda row: row[:3])[3]
             labels.setdefault(note_key(note), []).append(word["word"].strip())
-    return {key: " ".join(words) for key, words in labels.items()}
+    result = {key: " ".join(words) for key, words in labels.items()}
+    for note in notes:
+        if note.lyric is not None:
+            result.pop(note_key(note), None)
+            if note.lyric:
+                result[note_key(note)] = note.lyric
+    return result

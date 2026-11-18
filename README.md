@@ -17,6 +17,7 @@ can run in the background.
 The reviewed per-stem rankings, independent cancellable YourMT3+ worker,
 explicit mix/stem sources and disposable inference-evidence cache are described
 in the [model workflow](docs/getting-started.md#5-transcribe-and-correct-notes).
-Projects save in schema 4 and can still open schema 3 projects.
+Projects save in schema 5 (including edited note lyrics) and can still open
+schema 3 and 4 projects.
 The AI-notes slider filters saved predictions without rerunning inference;
 native backend threshold replay remains separate from this display filter.

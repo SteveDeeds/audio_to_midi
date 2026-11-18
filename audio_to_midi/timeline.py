@@ -64,7 +64,6 @@ class Timeline(QWidget):
 
     onset_requested = Signal(object, bool)
     note_requested = Signal(object, int, object)
-    note_removed = Signal(object)
     note_resized = Signal(object, object)
     note_selected = Signal(object)
     note_confirmed = Signal(object)
@@ -84,6 +83,7 @@ class Timeline(QWidget):
         super().__init__(parent)
         self.setMinimumHeight(160)
         self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.project: Project | None = None
         self.track: Track | None = None
         self.mode = "notes"
@@ -224,7 +224,8 @@ class Timeline(QWidget):
         elif self.tool == "info":
             hint = "Info (I): left-click note details, right-click timing / note menu | B: brush | Ctrl+wheel: zoom"
         else:
-            hint = ("Brush (B): click or drag to add, drag a note's end to resize, right-click delete | "
+            hint = ("Brush (B): click or drag to add, click a note to select/confirm, Delete to remove | "
+                    "Right-click note: menu | Drag end: resize | "
                     "Onset lane: click add, right-click delete | I: info | Ctrl+wheel: zoom")
         painter.drawText(8, 16, hint)
         span = self.audio_span[1] - self.audio_span[0]
@@ -407,6 +408,9 @@ class Timeline(QWidget):
         x, y = event.position().x(), event.position().y()
         left = event.button() == Qt.MouseButton.LeftButton
         right = event.button() == Qt.MouseButton.RightButton
+        if not (left or right):
+            return
+        self.setFocus(Qt.FocusReason.MouseFocusReason)
         if self.mode == "mix":
             if x >= self.KEYS and y < self.ROLL_TOP and (left or right):
                 seconds = self._seconds(x)
@@ -419,6 +423,10 @@ class Timeline(QWidget):
         if self.tool == "info":
             if right and x >= self.KEYS and self.LANE_TOP <= y < self._roll_bottom():
                 note = self._hit(x, y)[0] if self._in_roll(x, y) else None
+                if note is not None:
+                    self.selected = note
+                    self.selected_beat = None
+                    self.update()
                 self.info_context_requested.emit(self._seconds(x), note, self._global(event))
                 return
             if x >= self.KEYS and y < self.ROLL_TOP:
@@ -433,7 +441,10 @@ class Timeline(QWidget):
         note, edge = self._hit(x, y)
         if right:
             if note is not None:
-                self.note_removed.emit(note)
+                self.selected = note
+                self.selected_beat = None
+                self.update()
+                self.info_context_requested.emit(self._seconds(x), note, self._global(event))
             else:
                 self.context_requested.emit(self._raw_beat(x), self._pitch(y), self._global(event))
         elif self.tool == "info":
@@ -444,9 +455,14 @@ class Timeline(QWidget):
                 self.update()
                 self.note_info_requested.emit(note, self._global(event))
         elif left and note is not None and edge:
+            self.selected = note
+            self.selected_beat = None
+            self.note_selected.emit(note)
             self._drag = {"kind": "resize", "note": note, "end": note.end, "x": x}
+            self.update()
         elif left and note is not None:
             self.selected = note
+            self.selected_beat = None
             self.note_selected.emit(note)
             self.note_confirmed.emit(note)
             self.update()

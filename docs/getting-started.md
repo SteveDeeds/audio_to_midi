@@ -80,7 +80,8 @@ and template recognition now live in `audio_to_midi.chords`; the shared
 key-to-scale helper remains in `core.chord_analysis`.
 This does not delete or migrate any projects,
 audio, MIDI, profiles, logs, or model caches. The current project format is
-**schema 4**; schema 3 projects still open with unknown note confidence.
+**schema 5**, including edited note lyrics; schema 3 and 4 projects still open.
+Schema 3 detections have unknown note confidence.
 Older schemas and unsupported model aliases are rejected. Preferences keep their current settings location. Compatible
 onset examples can still be imported from older profiles; legacy session state
 is not converted automatically.
@@ -345,7 +346,7 @@ drums use hit strength, and monophonic models use pitch-frame agreement.
 Older saved detections have unknown scores and appear only at **All**; analyze
 again to obtain scores. **All** includes the detector's returned candidates,
 not notes excluded by its internal decoder thresholds or pitch range.
-New saves use project schema 4; schema 3 projects still open, but older app
+New saves use project schema 5; schema 3 and 4 projects still open, but older app
 versions cannot read new saves.
 
 ### Running detection
@@ -570,9 +571,10 @@ There are two tools, with buttons next to **Grid** (or **View** menu):
 |---|---|
 | Click an empty cell | Add a note one beat long |
 | Drag from an empty cell | Add a note and set its length, with the end snapping to half-grid intervals |
-| Click a note | Select it |
+| Left-click a note | Select it; confirm a blue AI note as a green authored note |
 | Drag a note's right edge | Change its length, snapping the end to half-grid intervals |
-| Right-click a note, or **Delete** | Reject it (that pitch stays silent there) |
+| **Delete** | Reject the selected note (that pitch stays silent there) |
+| Right-click a note | Select it and open **Delete**, **Info...**, **Join with next note**, **Split note**; vocals also offer **Edit lyric...** |
 | Right-click empty space | *Rest for this beat* / *Rest for this bar* (silence all pitches) |
 | Click the onset lane | Add an onset (note-attack boundary) |
 | Right-click the onset lane | Remove the nearest onset |
@@ -582,6 +584,26 @@ between grid lines, with a minimum length of half a grid cell. Extend a note
 to the next note's start for connected (legato) playback, or leave a half-grid
 gap for a separate articulation. Clicking an empty cell still adds a
 one-beat note.
+
+Opening a note menu does not confirm or delete the note. **Info...** opens
+the existing note editor. **Join with next note** combines the selected note
+with the next later attack (preferring its pitch for simultaneous candidates),
+including any gap, and keeps the selected note's pitch and velocity.
+Simultaneous chord tones are not joined. The action is disabled on the last
+note; a join that would overwrite another same-pitch note is rejected.
+**Split note** divides at the right-click position, snapped to the selected
+grid, and is disabled if that position is not inside the note. Both results
+become green authored notes and retain the original pitch and velocity.
+These operations support Undo/Redo.
+
+On vocals, **Edit lyric...** starts with the note's detected or edited text.
+It can also add text without running recognition. A changed lyric confirms
+the note, stays centered on it, and follows subsequent note edits. Empty text
+explicitly clears the label, rather than restoring automatic recognition.
+Splitting keeps an edited lyric on the first half only; joining combines the
+two displayed lyrics when either has been edited. Without manual edits,
+recognized words continue to match by their audio times. Save the project to
+keep edits (schema 5; older schema 3/4 projects remain readable).
 
 Onset markers follow the resolved note starts: simultaneous notes share one
 marker, and a marker disappears when its last note is removed or moved.
@@ -593,8 +615,7 @@ marker once a note actually starts there.
   in beats, pitch and velocity, plus **Delete note**. Beats accept `2 1/2`,
   `5/2` or `2.5`; pitches accept `Eb4` or `63`. Clicking empty space does
   nothing, so you can inspect notes without adding any. **Right-click** opens
-  a context menu instead of immediately deleting: on a note it includes
-  **Note details...** and **Delete note**, plus shared beat/downbeat controls
+  the same note context menu, plus shared beat/downbeat controls
   at the exact clicked audio position. Empty space offers the timing controls
   too. Detect beats first to enable timing actions. The upper lane shows
   counted beats and pins alongside note onsets without editing onset boundaries;

@@ -441,6 +441,151 @@ class EditorTests(unittest.TestCase):
         window.folder = self.root / "project"
         window._save()
         self.assertEqual(load_project(window.folder).tracks[0].notes.resolved(), [confirmed])
+        QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, point)
+        self.assertEqual(timeline.selected, confirmed)
+        QTest.keyClick(timeline, Qt.Key.Key_Delete)
+        self.assertEqual(self.track.notes.resolved(), [])
+        window._undo()
+        self.assertEqual(self.track.notes.resolved(), [confirmed])
+
+    def test_right_click_note_selects_without_confirming_and_offers_note_actions(self):
+        from PySide6.QtCore import QPoint
+        from PySide6.QtTest import QTest
+        from audio_to_midi.dialogs import NoteInfoDialog
+
+        window, timeline = self.window, self.window.timeline
+        window.resize(1280, 900)
+        window.show()
+        self.app.processEvents()
+        proposal = Note("ai", F(0), F(2), 60, 83, confidence=.8)
+        self.track.notes.generated = [proposal]
+        window._refresh()
+        at = QPoint(round(timeline._x(F(1))), round(timeline._y(60) + timeline._row_height() / 2))
+        menus = []
+        with patch.object(window, "_popup", side_effect=lambda menu, _: menus.append(menu)), \
+                patch.object(window, "_audition") as audition:
+            QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
+        self.assertEqual(timeline.selected, proposal)
+        self.assertEqual(self.track.notes.resolved(), [proposal])
+        self.assertFalse(self.track.notes.authored)
+        audition.assert_not_called()
+        actions = {action.text(): action for action in menus[0].actions()}
+        self.assertEqual(list(actions), ["Delete", "Info...", "Join with next note", "Split note"])
+        self.assertFalse(actions["Join with next note"].isEnabled())
+        self.assertTrue(actions["Split note"].isEnabled())
+        with patch.object(NoteInfoDialog, "exec", return_value=NoteInfoDialog.DialogCode.Rejected) as info:
+            actions["Info..."].trigger()
+        info.assert_called_once()
+        self.assertEqual(self.track.notes.resolved(), [proposal])
+        actions["Delete"].trigger()
+        self.assertEqual(self.track.notes.resolved(), [])
+        window._undo()
+        self.assertEqual(self.track.notes.resolved(), [proposal])
+
+    def test_split_and_join_context_actions_preserve_notes_and_undo(self):
+        window = self.window
+        original = Note("ai", F(0), F(2), 60, 83, confidence=.8)
+        other = Note("other", F(0), F(2), 64, 71, confidence=.7)
+        later = Note("later", F(3), F(4), 67)
+        self.track.notes.generated = [original, other, later]
+        window._refresh()
+        menus = []
+        with patch.object(window, "_popup", side_effect=lambda menu, _: menus.append(menu)):
+            window._info_menu(.6, original, None)
+        next(a for a in menus[-1].actions() if a.text() == "Split note").trigger()
+        parts = [n for n in self.track.notes.resolved() if n.pitch == 60]
+        self.assertEqual([(n.start, n.end, n.velocity, n.source) for n in parts],
+                         [(F(0), F(5, 4), 83, "authored"), (F(5, 4), F(2), 83, "authored")])
+        self.assertEqual(window.timeline.selected, parts[0])
+        self.assertIn(other, self.track.notes.resolved())
+        self.assertIn(later, self.track.notes.resolved())
+        window._undo()
+        self.assertEqual(self.track.notes.resolved(), [original, other, later])
+        window._redo()
+        first = window._rows[0]
+        with patch.object(window, "_popup", side_effect=lambda menu, _: menus.append(menu)):
+            window._info_menu(.25, first, None)
+        next(a for a in menus[-1].actions() if a.text() == "Join with next note").trigger()
+        joined = window.timeline.selected
+        self.assertEqual((joined.start, joined.end, joined.pitch, joined.velocity), (F(0), F(2), 60, 83))
+        self.assertEqual(self.track.notes.resolved(), [joined, other, later])
+        window._undo()
+        self.assertEqual([n for n in window._rows if n.pitch == 60], parts)
+        window._redo()
+        self.assertEqual(window.timeline.selected, None)
+        self.assertIn(joined, self.track.notes.resolved())
+
+    def test_join_next_pitch_across_gap_preserves_unrelated_notes_and_rejects_stale_edits(self):
+        window = self.window
+        first = Note("first", F(0), F(1), 60, 83)
+        following = Note("next", F(2), F(3), 64, 71)
+        untouched = Note("other", F(3), F(4), 67)
+        self.track.notes.generated = [first, following, untouched]
+        window._refresh()
+        window._join_note(first)
+        joined = window.timeline.selected
+        self.assertEqual((joined.start, joined.end, joined.pitch, joined.velocity),
+                         (F(0), F(3), 60, 83))
+        self.assertEqual(self.track.notes.resolved(), [joined, untouched])
+        history = len(window._history[self.track.id])
+        with self.assertRaisesRegex(ValueError, "changed"):
+            window._join_note(first)
+        with self.assertRaisesRegex(ValueError, "interior grid"):
+            window._split_note(joined, F(0))
+        self.assertEqual(len(window._history[self.track.id]), history)
+        window._undo()
+        self.assertEqual(self.track.notes.resolved(), [first, following, untouched])
+
+    def test_vocal_lyric_context_edits_persist_and_follow_resize_split_join_undo(self):
+        from audio_to_midi.storage import load_project, save_project
+        from audio_to_midi.vocal_words import note_key
+
+        self.make_vocal()
+        window = self.window
+        self.track.settings["vocal_words"] = self.vocal_words()
+        window._refresh()
+        note = window._rows[0]
+        menus = []
+        with patch.object(window, "_popup", side_effect=lambda menu, _: menus.append(menu)):
+            window._info_menu(.5, note, None)
+        edit = next(a for a in menus[-1].actions() if a.text() == "Edit lyric...")
+        with patch("audio_to_midi.ui.QInputDialog.getText", return_value=("correct words", False)):
+            edit.trigger()
+        self.assertEqual(window._rows, [note])
+        with patch("audio_to_midi.ui.QInputDialog.getText", return_value=("correct words", True)) as dialog:
+            edit.trigger()
+        self.assertEqual(dialog.call_args.kwargs["text"], "hello")
+        authored = window.timeline.selected
+        self.assertEqual((authored.source, authored.lyric), ("authored", "correct words"))
+        self.assertEqual(window.timeline.word_labels[note_key(authored)], "correct words")
+        window._undo()
+        self.assertEqual(window.timeline.word_labels[note_key(note)], "hello")
+        window._redo()
+        window._resize_note(window._rows[0], F(3))
+        self.assertEqual(window.timeline.selected.lyric, "correct words")
+        window._split_note(window.timeline.selected, F(1))
+        parts = window._rows
+        self.assertEqual([n.lyric for n in parts], ["correct words", ""])
+        self.assertEqual(list(window.timeline.word_labels.values()), ["correct words"])
+        window._join_note(parts[0])
+        joined = window.timeline.selected
+        self.assertEqual((joined.end, joined.lyric), (F(3), "correct words"))
+        save_project(window.project, self.root / "lyric-project")
+        loaded = load_project(self.root / "lyric-project").track(self.track.id)
+        self.assertEqual(loaded.notes.resolved(), [joined])
+        with patch("audio_to_midi.ui.QInputDialog.getText", return_value=("", True)):
+            window._edit_lyric(joined)
+        self.assertEqual(window.timeline.selected.lyric, "")
+        self.assertEqual(window.timeline.word_labels, {})
+        window._undo()
+        self.assertEqual(list(window.timeline.word_labels.values()), ["correct words"])
+
+    def test_vocal_lyric_can_be_added_without_recognition(self):
+        self.make_vocal()
+        with patch("audio_to_midi.ui.QInputDialog.getText", return_value=("new lyric", True)):
+            self.window._edit_lyric(self.window._rows[0])
+        self.assertEqual(list(self.window.timeline.word_labels.values()), ["new lyric"])
+        self.assertNotIn("vocal_words", self.track.settings)
 
     def test_ai_edge_click_confirms_but_info_does_not(self):
         from PySide6.QtCore import QPoint, Qt
@@ -1886,7 +2031,8 @@ class EditorTests(unittest.TestCase):
         QTest.mouseRelease(timeline, left, none, point(F(7, 2), 48))
         self.assertIn((F(1), F(7, 2), 48), [(n.start, n.end, n.pitch) for n in self.track.notes.resolved()])
 
-        QTest.mouseClick(timeline, right, none, point(F(3, 2), 48))
+        with patch.object(window, "_popup", side_effect=lambda menu, _: menu.actions()[0].trigger()):
+            QTest.mouseClick(timeline, right, none, point(F(3, 2), 48))
         self.assertEqual([(n.start, n.end, n.pitch) for n in self.track.notes.resolved()], [(F(0), F(3), 50)])
         window._undo()
         self.assertIn((F(1), F(7, 2), 48), [(n.start, n.end, n.pitch) for n in self.track.notes.resolved()])
@@ -2029,8 +2175,8 @@ class EditorTests(unittest.TestCase):
                     QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
                 self.assertEqual(track.notes, before, "opening Info context must not delete or confirm")
                 actions = {action.text(): action for action in menus[0].actions()}
-                self.assertIn("Note details...", actions)
-                self.assertIn("Delete note", actions)
+                self.assertIn("Info...", actions)
+                self.assertIn("Delete", actions)
                 self.assertIn("Downbeat of bar...", actions)
                 next(action for text, action in actions.items() if text.startswith("Downbeat of bar ")).trigger()
                 pin = window.session.pins[0]
@@ -2068,7 +2214,7 @@ class EditorTests(unittest.TestCase):
                 timeline.mousePressEvent(event)
             texts = [action.text() for action in popup.call_args.args[0].actions()]
             self.assertIn("Downbeat of bar...", texts)
-            self.assertNotIn("Delete note", texts)
+            self.assertNotIn("Delete", texts)
             self.assertNotIn("Rest for this beat", texts)
         self.assertEqual(drums.notes, before)
         # Info's beat selection must not teach an onset boundary.
@@ -2092,7 +2238,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(timeline.beats, [])
         self.assertFalse(window.shortcuts["D"].isEnabled())
 
-    def test_info_context_note_actions_without_detected_beats_and_brush_delete(self):
+    def test_info_context_note_actions_without_detected_beats_and_brush_menu(self):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest
 
@@ -2109,13 +2255,16 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(len(self.track.notes.resolved()), 1)
         self.assertFalse(actions["Detect beats first (Edit > Detect tempo, meter, and key)"].isEnabled())
         with patch.object(window, "_note_info") as info:
-            actions["Note details..."].trigger()
+            actions["Info..."].trigger()
         info.assert_called_once_with(window._rows[0])
-        actions["Delete note"].trigger()
+        actions["Delete"].trigger()
         self.assertEqual(self.track.notes.resolved(), [])
         window._undo()
         window.actions["brush"].trigger()
-        QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
+        with patch.object(window, "_popup") as popup:
+            QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
+        self.assertEqual(len(self.track.notes.resolved()), 1)
+        next(a for a in popup.call_args.args[0].actions() if a.text() == "Delete").trigger()
         self.assertEqual(self.track.notes.resolved(), [])
 
     def test_info_exact_pin_cancel_and_invalid_pin_leave_no_new_beat(self):
