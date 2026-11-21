@@ -521,7 +521,9 @@ Word timestamps stay in audio seconds and are matched again after note edits,
 model changes, or tempo-map changes. Analyzing another view does not erase
 words elsewhere. Save the project to preserve annotations; word import and
 detection support Undo/Redo. Replacing the vocal stem clears its old words.
-Words are currently a piano-roll annotation, not MIDI/MusicXML score lyrics.
+MusicXML score export includes the displayed vocal lyrics below their matching
+notes, including manual edits and explicit clears. MIDI export does not include
+lyrics.
 
 ```powershell
 python -m pip install "stable-ts>=2.19,<3"
@@ -798,10 +800,30 @@ The setting is remembered.
   the original tempo map to stay aligned with the audio.
   Score export asks for **Quantization**, defaulting to **1/16** notes independently
   of the editor grid. Triplets are only used when explicitly selected (available
-  in meters with quarter-note notation beats). Gaps shorter than the selected
-  quantization are omitted as ordinary articulation, without a slur. Originally
-  touching notes receive a slur; rests at least one quantization step long remain.
+  in meters with quarter-note notation beats). Pitched parts absorb successive
+  notated rests shorter than a quarter note into the preceding note within the
+  measure only when they complete clean undotted values. Think in quarter-note
+  blocks first, then eighth-note blocks, and sixteenths where needed. Keeping
+  those blocks is more important than eliminating every rest: do not create a
+  dotted note merely to absorb silence. This includes dotted-eighth rests when
+  they complete an undotted note, but stops at complete quarter-note rests and
+  longer pauses, independent of export quantization.
+  A short rest at the start of a longer silence is still absorbed: an eighth
+  note followed by an eighth rest and a quarter rest becomes a quarter note
+  followed by a quarter rest. If another eighth rest follows instead, keep it:
+  show a quarter note, eighth rest, then the next attack rather than extending
+  the quarter into a dotted quarter. The same rule applies to a track's final
+  note and the final segment of a tied note, including across a barline.
+  Note attacks never move beyond the selected quantization, and extensions do
+  not add slurs. Originally touching notes receive a slur. Dots remain when
+  required by the attacks or meter; explicit triplet rhythms and drum-hit
+  durations keep their existing notation.
   These changes affect only the exported score, not project notes or MIDI.
+  Vocal lyrics use the same word-to-note matching as the piano roll, before
+  export quantization. Edited lyrics override detected words; cleared lyrics
+  stay cleared. Each label appears once, on the first segment of a tied note.
+  Multiple words assigned to one note remain together; export does not invent
+  syllables or hyphenation. Unmatched and zero-duration words are not exported.
   For command-line score export, use `--quantization` in quarter-note units:
   `1/4` means sixteenths (default), `1/8` means thirty-seconds, and `1/6`
   means sixteenth triplets.
