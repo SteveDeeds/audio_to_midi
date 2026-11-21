@@ -754,7 +754,7 @@ class EditorTests(unittest.TestCase):
                 self.window._refresh()
                 self.window.preview = Mock()
                 self.window._clock = (time.monotonic(), 40.0, 100.0, 1.0)
-                self.window.timeline.playhead = self.window.chord_view.playhead = 40.0
+                self.window._set_play_cursor(40.0)
                 self.window.clock.start()
                 self.window.rebalance.start()
                 with patch.object(self.window, "_play") as play:
@@ -762,8 +762,8 @@ class EditorTests(unittest.TestCase):
                     play.assert_not_called()
                 self.window.preview.stop.assert_called_once()
                 self.assertIsNone(self.window._clock)
-                self.assertIsNone(self.window.timeline.playhead)
-                self.assertIsNone(self.window.chord_view.playhead)
+                self.assertEqual(self.window.timeline.playhead, 0.0)
+                self.assertEqual(self.window.chord_view.playhead, 0.0)
                 self.assertFalse(self.window.clock.isActive())
                 self.assertFalse(self.window.rebalance.isActive())
                 self.assertEqual(self.window.timeline.start, F(0))
@@ -2040,6 +2040,45 @@ class EditorTests(unittest.TestCase):
         QTest.mouseClick(timeline, left, none, QPoint(round(timeline._x(F(2))), 50))
         self.assertIn(F(2), self.track.notes.onsets)
 
+    def test_note_body_drag_persists_and_is_a_single_undoable_edit(self):
+        from PySide6.QtCore import QPoint
+        from PySide6.QtTest import QTest
+        from audio_to_midi.storage import load_project, save_project
+
+        window, timeline = self.window, self.window.timeline
+        window.resize(1280, 900)
+        window.show()
+        self.app.processEvents()
+        original = Note("ai", F(0), F(1), 48, 83, lyric="hello")
+        untouched = Note("other", F(2), F(3), 55)
+        self.track.notes.generated = [original, untouched]
+        window._refresh()
+
+        def point(beat, pitch):
+            return QPoint(
+                round(timeline._x(beat)), round(timeline._y(pitch) + timeline._row_height() / 2),
+            )
+
+        history = len(window._history.get(self.track.id, []))
+        left, none = Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+        with patch.object(window, "_audition"):
+            QTest.mousePress(timeline, left, none, point(F(1, 2), 48))
+            QTest.mouseMove(timeline, point(F(3, 2), 50))
+            self.assertEqual(self.track.notes.resolved(), [original, untouched])
+            QTest.mouseRelease(timeline, left, none, point(F(3, 2), 50))
+        moved = timeline.selected
+        self.assertEqual((moved.start, moved.end, moved.pitch, moved.velocity, moved.lyric, moved.source),
+                         (F(1), F(2), 50, 83, "hello", "authored"))
+        self.assertEqual(self.track.notes.resolved(), [moved, untouched])
+        self.assertEqual(len(window._history[self.track.id]), history + 1)
+        save_project(window.project, self.root / "drag-project")
+        self.assertEqual(load_project(self.root / "drag-project").track(self.track.id).notes.resolved(),
+                         [moved, untouched])
+        window._undo()
+        self.assertEqual(self.track.notes.resolved(), [original, untouched])
+        window._redo()
+        self.assertEqual(self.track.notes.resolved(), [moved, untouched])
+
     def test_dragged_note_ends_use_half_grid_and_preserve_adjacent_notes(self):
         from dataclasses import replace
         from PySide6.QtCore import QPointF, Qt
@@ -2376,6 +2415,7 @@ class EditorTests(unittest.TestCase):
         for index, speed in enumerate((1.0, 0.9, 0.75, 0.5)):
             with self.subTest(speed=speed):
                 window._stop()
+                window._set_play_cursor(0.0)
                 window.speed_choice.setCurrentIndex(index)
                 with patch("audio_to_midi.ui.time.monotonic", return_value=100.0):
                     window._play()
@@ -2398,7 +2438,235 @@ class EditorTests(unittest.TestCase):
                     self.assertAlmostEqual(window.timeline.playhead, speed)
                 with patch("audio_to_midi.ui.time.monotonic", return_value=100 + 2 / speed + .01):
                     self.assertIsNone(window._now())
+                    window._tick()
+                self.assertEqual(window.play_cursor, 2.0)
+                self.assertEqual(window.timeline.playhead, 2.0)
+                self.assertIsNone(window._clock)
         window._stop()
+
+    def test_bar_axis_click_space_stop_and_home_share_a_persistent_cursor(self):
+        from PySide6.QtCore import QPoint
+        from PySide6.QtTest import QTest
+        from audio_to_midi.ui import CHORDS, MIX
+
+        window = self.window
+        window.project.mix_path = str(self.wav)
+        window._sync_tracks()
+        window.show()
+        window.activateWindow()
+        self.app.processEvents()
+        played = []
+        window.preview = SimpleNamespace(
+            play_audio=lambda stereo, rate: played.append((stereo, rate)),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        for view in (self.track.id, MIX, CHORDS):
+            with self.subTest(view=view):
+                window.tracks.setCurrentIndex(window.tracks.findData(view))
+                window._set_window(F(1))
+                window._refresh()
+                widget = window.chord_view if view == CHORDS else window.timeline
+                widget.setFocus()
+                self.app.processEvents()
+                y = widget.HEADER + 8 if view == CHORDS else widget.height() - 5
+                at = QPoint(round(widget._x(F(3, 2))), y)
+                QTest.mouseClick(widget, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, at)
+                expected = window.timeline._seconds(at.x())
+                self.assertAlmostEqual(window.play_cursor, expected)
+                self.assertEqual(window.timeline.playhead, window.chord_view.playhead)
+                with patch("audio_to_midi.ui.time.monotonic", return_value=100.0):
+                    QTest.keyClick(widget, Qt.Key.Key_Space)
+                self.assertAlmostEqual(window._clock[1], expected)
+                self.assertEqual(len(played[-1][0]), 16000 - round(expected * 8000))
+                with patch("audio_to_midi.ui.time.monotonic", return_value=100.1):
+                    QTest.keyClick(widget, Qt.Key.Key_Space)
+                self.assertIsNone(window._clock)
+                self.assertAlmostEqual(window.play_cursor, expected + .1)
+                QTest.keyClick(widget, Qt.Key.Key_Home)
+                self.assertEqual(window.play_cursor, .5)
+                self.assertEqual(window.timeline.start, F(1))
+                QTest.keyClick(widget, Qt.Key.Key_Home)
+                self.assertEqual(window.play_cursor, 0.0)
+                self.assertEqual(window.timeline.start, F(0))
+
+    def test_scrub_keys_preview_context_ending_at_cursor_at_normal_speed(self):
+        from PySide6.QtTest import QTest
+        from audio_to_midi.preview import SCRUB_WINDOW_SECONDS, scrub_audio
+        from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE
+
+        window = self.window
+        played = []
+        window.preview = SimpleNamespace(
+            play_scrub=lambda stereo, rate: played.append((stereo, rate)),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        window.playback_speed = .5
+        window.balance = 100
+        window.actions["metronome"].setChecked(True)
+        window.sound_device = "must not send MIDI"
+        window.show()
+        window.activateWindow()
+        window.timeline.setFocus()
+        self.app.processEvents()
+        hop = HOP_LENGTH / SAMPLE_RATE
+        with patch("audio_to_midi.ui.stretch_audio") as stretch, \
+                patch("audio_to_midi.ui.render_notes") as synth:
+            for rate in (8000, 22050, 48000):
+                with self.subTest(rate=rate):
+                    waveform = np.linspace(-.4, .4, rate * 2, dtype=np.float32)
+                    sf.write(self.wav, waveform, rate, subtype="FLOAT")
+                    played.clear()
+                    window._set_play_cursor(.5)
+                    QTest.keyClick(window.timeline, Qt.Key.Key_BracketRight)
+                    self.assertAlmostEqual(window.play_cursor, .5 + hop)
+                    QTest.keyClick(window.timeline, Qt.Key.Key_BracketLeft)
+                    self.assertAlmostEqual(window.play_cursor, .5)
+                    self.assertEqual(len(played), 2)
+                    for (stereo, played_rate), target in zip(played, (.5 + hop, .5)):
+                        self.assertEqual(played_rate, rate)
+                        self.assertEqual(len(stereo), round(target * rate) - round((target - .08) * rate))
+                        expected = scrub_audio(
+                            waveform[round((target - SCRUB_WINDOW_SECONDS) * rate):round(target * rate)], rate,
+                        )
+                        np.testing.assert_array_equal(stereo, expected)
+        stretch.assert_not_called()
+        synth.assert_not_called()
+        self.assertEqual(window.timeline.playhead, window.chord_view.playhead)
+        self.assertIsNone(window._clock)
+        self.assertFalse(window.clock.isActive())
+
+    def test_scrubbing_clamps_to_audio_bounds_and_follows_cursor_across_screen_edges(self):
+        from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE
+
+        window = self.window
+        played = []
+        window.preview = SimpleNamespace(
+            play_scrub=lambda stereo, rate: played.append(stereo),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        hop = HOP_LENGTH / SAMPLE_RATE
+        window._set_play_cursor(0.0)
+        window._scrub(-1)
+        self.assertEqual(window.play_cursor, 0.0)
+        self.assertEqual(played, [])
+        window._set_play_cursor(2.0 - hop / 2)
+        window._scrub(1)
+        self.assertEqual(window.play_cursor, 2.0)
+        self.assertEqual(len(played[-1]), 640)
+        window._scrub(1)
+        self.assertEqual(len(played), 1)
+        window.bars = 1
+        window._set_window(F(0))
+        window._refresh()
+        window._set_play_cursor(2.0 - hop / 2)
+        window._scrub(1)
+        self.assertEqual(window.timeline.start, F(4))
+        window._set_window(F(4))
+        window._refresh()
+        window._scrub(-1)
+        self.assertLess(window.timeline.start, F(4))
+        self.assertLessEqual(window.timeline.start, window.project.grid.seconds_to_beat(window.play_cursor))
+        self.assertGreater(window.timeline.end, window.project.grid.seconds_to_beat(window.play_cursor))
+        window._reset_state()
+        self.assertEqual(window.play_cursor, 0.0)
+        self.assertEqual(window.timeline.playhead, 0.0)
+        self.assertEqual(window.chord_view.playhead, 0.0)
+
+    def test_scrub_never_previews_word_before_cursor_crosses_its_onset(self):
+        from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE
+
+        window = self.window
+        waveform = np.zeros(16000, dtype=np.float32)
+        waveform[4000:4320] = .5
+        sf.write(self.wav, waveform, 8000, subtype="FLOAT")
+        played = []
+        window.preview = SimpleNamespace(
+            play_scrub=lambda stereo, rate: played.append(stereo),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        hop = HOP_LENGTH / SAMPLE_RATE
+        window._set_play_cursor(.5 - hop)
+        window._scrub(1)
+        self.assertAlmostEqual(window.play_cursor, .5)
+        self.assertEqual(np.abs(played[-1]).max(), 0)
+        window._scrub(1)
+        self.assertAlmostEqual(window.play_cursor, .5 + hop)
+        self.assertGreater(np.abs(played[-1]).max(), 1000)
+        window._set_play_cursor(hop / 2)
+        window._scrub(-1)
+        self.assertEqual(window.play_cursor, 0.0)
+        self.assertEqual(len(played), 2)
+
+    def test_held_scrub_keys_jog_and_stop_repeating_on_release_or_focus_loss(self):
+        from PySide6.QtCore import QEvent
+        from PySide6.QtGui import QKeyEvent
+        from PySide6.QtTest import QTest
+        from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE
+
+        window = self.window
+        played = []
+        window.preview = SimpleNamespace(
+            play_scrub=lambda stereo, rate: played.append(stereo),
+            stop=lambda: None, close_port=lambda: None,
+        )
+        window._set_play_cursor(.5)
+        window.show()
+        window.activateWindow()
+        window.timeline.setFocus()
+        self.app.processEvents()
+        QTest.keyPress(window.timeline, Qt.Key.Key_BracketRight)
+        for kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            repeat = QKeyEvent(kind, Qt.Key.Key_BracketRight, Qt.KeyboardModifier.NoModifier, "]", True)
+            self.app.sendEvent(window.timeline, repeat)
+        self.assertEqual(len(played), 1)
+        self.assertTrue(window.scrub_repeat.isActive())
+        QTest.qWait(160)
+        self.assertGreaterEqual(len(played), 2)
+        self.assertAlmostEqual(window.play_cursor, .5 + len(played) * HOP_LENGTH / SAMPLE_RATE)
+        QTest.keyRelease(window.timeline, Qt.Key.Key_BracketRight)
+        count = len(played)
+        QTest.qWait(140)
+        self.assertEqual(len(played), count)
+        self.assertFalse(window.scrub_repeat.isActive())
+        self.assertIsNone(window._scrub_direction)
+        QTest.keyPress(window.timeline, Qt.Key.Key_BracketLeft)
+        self.app.sendEvent(window, QEvent(QEvent.Type.WindowDeactivate))
+        self.assertFalse(window.scrub_repeat.isActive())
+        self.assertIsNone(window._scrub_direction)
+        QTest.keyRelease(window.timeline, Qt.Key.Key_BracketLeft)
+        window._begin_scrub(1)
+        with patch.object(window, "_scrub", side_effect=ValueError("Audio became unavailable")):
+            with self.assertRaisesRegex(ValueError, "unavailable"):
+                window._repeat_scrub()
+        self.assertFalse(window.scrub_repeat.isActive())
+        self.assertIsNone(window._scrub_direction)
+
+    def test_home_uses_screen_audio_time_with_tempo_map_and_scrub_preserves_tapping(self):
+        from dataclasses import replace
+
+        window = self.window
+        window.project.grid = replace(window.project.grid, offset_seconds=.2,
+                                      anchors=((.2, F(0)), (1.2, F(4))))
+        window._set_window(F(1))
+        window._refresh()
+        window._set_play_cursor(.8)
+        window._rewind()
+        self.assertAlmostEqual(window.play_cursor, .45)
+        self.assertEqual(window.timeline.start, F(1))
+        window._rewind()
+        self.assertEqual(window.play_cursor, 0.0)
+        self.assertEqual(window.timeline.start, F(0))
+        self._mix_only(seconds=40)
+        self.assertEqual(window.play_cursor, 0.0)
+        window.actions["tap"].setChecked(True)
+        window._update_actions()
+        self.assertFalse(window.actions["scrub_left"].isEnabled())
+        self.assertFalse(window.actions["scrub_right"].isEnabled())
+        before = window._clock
+        with self.assertRaisesRegex(ValueError, "tapping"):
+            window._scrub(1)
+        self.assertEqual(window._clock, before)
+        window.actions["tap"].setChecked(False)
 
     def test_speed_change_restarts_at_current_position_and_failure_stops_clock(self):
         window = self.window

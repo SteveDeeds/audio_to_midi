@@ -5,6 +5,7 @@ Drum tracks swap the piano keys for ADTOF's five lanes under a half-height spect
 
 from __future__ import annotations
 
+from dataclasses import replace
 from fractions import Fraction
 
 import numpy as np
@@ -65,12 +66,14 @@ class Timeline(QWidget):
     onset_requested = Signal(object, bool)
     note_requested = Signal(object, int, object)
     note_resized = Signal(object, object)
+    note_moved = Signal(object, object, int)
     note_selected = Signal(object)
     note_confirmed = Signal(object)
     note_info_requested = Signal(object, QPoint)
     info_context_requested = Signal(float, object, QPoint)
     beat_clicked = Signal(float, bool, QPoint)
     context_requested = Signal(object, int, QPoint)
+    cursor_requested = Signal(float)
     zoom_requested = Signal(int)
 
     KEYS = 44
@@ -224,7 +227,7 @@ class Timeline(QWidget):
         elif self.tool == "info":
             hint = "Info (I): left-click note details, right-click timing / note menu | B: brush | Ctrl+wheel: zoom"
         else:
-            hint = ("Brush (B): click or drag to add, click a note to select/confirm, Delete to remove | "
+            hint = ("Brush (B): click or drag to add, click note: select/confirm, drag note: move, Delete: remove | "
                     "Right-click note: menu | Drag end: resize | "
                     "Onset lane: click add, right-click delete | I: info | Ctrl+wheel: zoom")
         painter.drawText(8, 16, hint)
@@ -291,6 +294,11 @@ class Timeline(QWidget):
                 if self.drums and drum_lane(note.pitch) is None:
                     hidden += 1
                     continue
+                if drag and drag["kind"] == "move" and drag["note"] == note:
+                    preview = replace(note, start=drag["start"],
+                                      end=drag["start"] + note.end - note.start, pitch=drag["pitch"])
+                    self._paint_note(painter, preview, None, True, label_note=note)
+                    continue
                 end = drag["end"] if drag and drag["kind"] == "resize" and drag["note"] == note else None
                 self._paint_note(painter, note, end, note == self.selected)
             if hidden:
@@ -302,8 +310,13 @@ class Timeline(QWidget):
         if self.playhead is not None:
             x = round(self._x_seconds(self.playhead))
             if self.KEYS <= x <= width:
-                painter.setPen(QPen(QColor("#ffffff"), 1))
+                color = QColor("#4ade80")
+                painter.setPen(QPen(color, 2))
                 painter.drawLine(x, self.LANE_TOP, x, bottom)
+                painter.setBrush(color)
+                painter.drawPolygon(QPolygonF([
+                    QPointF(x, bottom), QPointF(x - 6, bottom + 9), QPointF(x + 6, bottom + 9),
+                ]))
 
     def _grid_lines(self):
         """(beat, x) of each visible bar, meter beat and selected subdivision."""
@@ -365,7 +378,7 @@ class Timeline(QWidget):
                 ]))
         painter.setBrush(Qt.BrushStyle.NoBrush)
 
-    def _paint_note(self, painter: QPainter, note, end, selected: bool) -> None:
+    def _paint_note(self, painter: QPainter, note, end, selected: bool, *, label_note=None) -> None:
         rect = self._note_rect(note, end)
         outside = not self._visible(note)
         color = QColor("#84dba7" if note.source != "generated" else "#6b9fe8")
@@ -381,7 +394,7 @@ class Timeline(QWidget):
         painter.drawRect(rect)
         if not outside and rect.width() > 10:
             painter.fillRect(QRectF(rect.right() - 3, rect.top() + 1, 2, rect.height() - 2), QColor(255, 255, 255, 120))
-        text = self.word_labels.get(note_key(note))
+        text = self.word_labels.get(note_key(note if label_note is None else label_note))
         if text and not outside:
             painter.save()
             painter.setClipRect(QRectF(
@@ -411,6 +424,9 @@ class Timeline(QWidget):
         if not (left or right):
             return
         self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if left and x >= self.KEYS and self._roll_bottom() <= y < self.height():
+            self.cursor_requested.emit(self._seconds(x))
+            return
         if self.mode == "mix":
             if x >= self.KEYS and y < self.ROLL_TOP and (left or right):
                 seconds = self._seconds(x)
@@ -464,7 +480,11 @@ class Timeline(QWidget):
             self.selected = note
             self.selected_beat = None
             self.note_selected.emit(note)
-            self.note_confirmed.emit(note)
+            self._drag = {
+                "kind": "move", "note": note, "start": note.start, "pitch": note.pitch,
+                "beat": self._raw_beat(x), "row_pitch": self._pitch(y),
+                "x": x, "y": y, "moved": False,
+            }
             self.update()
         elif left:
             start = self._cell(x)
@@ -483,6 +503,21 @@ class Timeline(QWidget):
         drag = self._drag
         if drag:
             grid = self.project.grid
+            if drag["kind"] == "move":
+                if not drag["moved"] and max(abs(x - drag["x"]), abs(y - drag["y"])) < 4:
+                    return
+                drag["moved"] = True
+                note = drag["note"]
+                drag["start"] = max(Fraction(0), grid.snap(note.start + self._raw_beat(x) - drag["beat"]))
+                if self.drums:
+                    lane = drum_lane(self._pitch(y)) - drum_lane(drag["row_pitch"]) + drum_lane(note.pitch)
+                    lane = min(len(DRUM_LANES) - 1, max(0, lane))
+                    drag["pitch"] = note.pitch if lane == drum_lane(note.pitch) else drum_lane_pitch(lane)
+                else:
+                    drag["pitch"] = min(127, max(0, note.pitch + self._pitch(y) - drag["row_pitch"]))
+                self.setCursor(Qt.CursorShape.SizeAllCursor)
+                self.update()
+                return
             minimum = (drag["note"].start if drag["kind"] == "resize" else drag["start"]) + grid.subdivision / 2
             if drag["kind"] == "create" and not drag["moved"] and abs(x - drag["x"]) < 4:
                 return
@@ -496,7 +531,7 @@ class Timeline(QWidget):
                 self.setCursor(Qt.CursorShape.PointingHandCursor if note else Qt.CursorShape.ArrowCursor)
             else:
                 self.setCursor(Qt.CursorShape.SizeHorCursor if edge else
-                               Qt.CursorShape.PointingHandCursor if note else Qt.CursorShape.CrossCursor)
+                               Qt.CursorShape.SizeAllCursor if note else Qt.CursorShape.CrossCursor)
             self._hover(note, event)
         else:
             self.unsetCursor()
@@ -517,7 +552,13 @@ class Timeline(QWidget):
         drag, self._drag = self._drag, None
         if not drag or event.button() != Qt.MouseButton.LeftButton:
             return
-        if drag["kind"] == "resize":
+        if drag["kind"] == "move":
+            note = drag["note"]
+            if (drag["start"], drag["pitch"]) != (note.start, note.pitch):
+                self.note_moved.emit(note, drag["start"], drag["pitch"])
+            elif not drag["moved"]:
+                self.note_confirmed.emit(note)
+        elif drag["kind"] == "resize":
             if drag["end"] != drag["note"].end:
                 self.note_resized.emit(drag["note"], drag["end"])
             else:

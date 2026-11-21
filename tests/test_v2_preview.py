@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import Mock, call, patch
 
 import numpy as np
 
@@ -32,6 +33,48 @@ class PlaybackSpeedTests(unittest.TestCase):
         for speed in (0, -1, 0.8, float("nan"), float("inf")):
             with self.subTest(speed=speed), self.assertRaises(ValueError):
                 stretch_audio(np.zeros(8000, dtype=np.float32), speed)
+
+
+class ScrubPreviewTests(unittest.TestCase):
+    def test_scrub_fades_edges_without_shortening_or_mutating_source(self):
+        from audio_to_midi.preview import scrub_audio
+
+        audio = np.full(640, .5, dtype=np.float32)
+        stereo = scrub_audio(audio, 8000)
+        self.assertEqual(stereo.shape, (640, 2))
+        self.assertEqual(stereo.dtype, np.int16)
+        self.assertEqual(int(stereo[0, 0]), 0)
+        self.assertEqual(int(stereo[-1, 0]), 0)
+        self.assertGreater(stereo[12, 0], 0)
+        self.assertGreater(stereo[32, 0], stereo[12, 0])
+        np.testing.assert_array_equal(audio, np.full(640, .5, dtype=np.float32))
+        np.testing.assert_array_equal(stereo[:, 0], stereo[:, 1])
+
+    def test_scrub_queues_latest_window_on_same_channel_without_stopping(self):
+        from audio_to_midi.preview import Preview
+
+        player = Preview()
+        first, second, third = Mock(), Mock(), Mock()
+        channel = first.play.return_value
+        with patch.object(player, "stop") as stop, \
+                patch.object(player, "_sound", side_effect=[first, second, third]):
+            for _ in range(3):
+                player.play_scrub(np.zeros((640, 2), dtype=np.int16), 8000)
+        stop.assert_called_once()
+        first.play.assert_called_once()
+        second.play.assert_not_called()
+        third.play.assert_not_called()
+        self.assertEqual(channel.queue.call_args_list, [call(second), call(third)])
+
+    def test_scrub_reports_unavailable_audio_channel(self):
+        from audio_to_midi.preview import Preview
+
+        player = Preview()
+        sound = Mock()
+        sound.play.return_value = None
+        with patch.object(player, "stop"), patch.object(player, "_sound", return_value=sound):
+            with self.assertRaisesRegex(RuntimeError, "channel"):
+                player.play_scrub(np.zeros((640, 2), dtype=np.int16), 8000)
 
 
 class TappingCalibrationTests(unittest.TestCase):

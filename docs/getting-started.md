@@ -382,7 +382,8 @@ the status text to read the full message, including any original line breaks.
 **Navigate** with **Previous** / **Next** (Left / Right arrow, or PgUp / PgDn);
 each step scrolls half a screen. The label between them
 shows the visible bars. **|<<** beside Play (also **Home** or **View > Rewind to start**)
-stops playback and returns to bar 1.
+stops playback and moves the green play cursor to the start of the screen.
+Press Home again there to return to the beginning of the song.
 Holding an arrow key does not queue every bar: automatic analysis waits for
 navigation to settle, cancels obsolete work, and keeps at most one pending
 request in the ordinary analysis lane, replacing older requests with the latest.
@@ -565,13 +566,14 @@ with the application.
 
 There are two tools, with buttons next to **Grid** (or **View** menu):
 
-- **Brush (B)**, the default, adds, resizes and deletes notes:
+- **Brush (B)**, the default, adds, moves, resizes and deletes notes:
 
 | Action | Result |
 |---|---|
 | Click an empty cell | Add a note one beat long |
 | Drag from an empty cell | Add a note and set its length, with the end snapping to half-grid intervals |
 | Left-click a note | Select it; confirm a blue AI note as a green authored note |
+| Left-click and drag a note's body | Move its start on the selected grid and change its pitch (or drum lane), with a live preview; release to apply one undoable edit |
 | Drag a note's right edge | Change its length, snapping the end to half-grid intervals |
 | **Delete** | Reject the selected note (that pitch stays silent there) |
 | Right-click a note | Select it and open **Delete**, **Info...**, **Join with next note**, **Split note**; vocals also offer **Edit lyric...** |
@@ -584,6 +586,11 @@ between grid lines, with a minimum length of half a grid cell. Extend a note
 to the next note's start for connected (legato) playback, or leave a half-grid
 gap for a separate articulation. Clicking an empty cell still adds a
 one-beat note.
+
+Moving keeps the note's length, velocity and lyric, but clips its release at
+the audio end or the next note of the same pitch, as other note edits do.
+Dragging left cannot move a note before beat zero. A click without dragging
+still selects/confirms the note; the Info tool still opens note details.
 
 Opening a note menu does not confirm or delete the note. **Info...** opens
 the existing note editor. **Join with next note** combines the selected note
@@ -721,8 +728,29 @@ Undo and redo work in the Chords view too. Playback adds voiced chords.
 
 ## 7. Listen
 
-**Play** (or Space) plays from the start of the visible window; **Stop** ends
-it, and the view follows the playhead. In a stem view you hear the stem mostly
+The play cursor is a vertical green line with an upward-pointing triangle on
+the bar-labeled x-axis. Click that axis to position it without snapping to the
+note grid. **Play** (or Space) plays from the cursor; **Stop** (or Space again)
+stops and leaves the cursor at that position. The view follows it during
+playback. **Home** moves to the start of the screen; a second Home, or Home
+when already there, moves to the beginning of the song.
+
+Use **[** to scrub left and **]** to scrub right. Each press moves the cursor
+by one CQT time bin (256 samples at 22,050 Hz, about 11.6 ms), but previews
+the **80 ms ending at the cursor**, in normal forward audio order. Short
+3 ms fades prevent clicks at the preview edges. The preview never includes
+audio after the cursor: when locating a word's onset, step forward until the
+word first becomes audible, then fine-tune with individual presses.
+
+Hold either bracket key to jog through overlapping preview windows on the
+same audio channel. Release it to stop moving; the last preview finishes.
+Space, Home, or leaving the grid also ends held-key jogging.
+Scrubbing always uses **100% speed**, with no synthesized notes or metronome,
+regardless of the Speed and Audio/Synth settings. Near the start of the audio,
+the preview is clipped to the available preceding audio. Scrubbing is
+unavailable during downbeat tapping.
+
+In a stem view you hear the stem mostly
 on the right and the notes mostly on the left; in the Chords view you hear the
 mix with the chords.
 

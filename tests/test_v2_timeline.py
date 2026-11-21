@@ -2,11 +2,12 @@ from dataclasses import replace
 from fractions import Fraction as F
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QRect, Qt
+from PySide6.QtCore import QPointF, QRect, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
@@ -33,6 +34,94 @@ class TimelineGridTests(unittest.TestCase):
             timeline.KEYS, timeline.ROLL_TOP,
             timeline.width() - timeline.KEYS, timeline._roll_bottom() - timeline.ROLL_TOP,
         ))
+
+    def mouse_event(self, beat, pitch):
+        return SimpleNamespace(
+            position=lambda: QPointF(
+                self.timeline._x(beat),
+                self.timeline._y(pitch) + self.timeline._row_height() / 2,
+            ),
+            button=lambda: Qt.MouseButton.LeftButton,
+        )
+
+    def test_play_cursor_is_green_with_upward_triangle_on_bar_axis(self):
+        timeline = self.timeline
+        timeline.playhead = timeline.project.grid.beat_to_seconds(F(1, 2))
+        image = timeline.grab().toImage()
+        x = round(timeline._x(F(1, 2)))
+        bottom = timeline._roll_bottom()
+        self.assertEqual(image.pixelColor(x, timeline.ROLL_TOP + 10).name(), "#4ade80")
+        self.assertEqual(image.pixelColor(x, bottom + 4).name(), "#4ade80")
+        self.assertEqual(image.pixelColor(x - 4, bottom + 7).name(), "#4ade80")
+        self.assertNotEqual(image.pixelColor(x - 4, bottom + 1).name(), "#4ade80")
+
+    def test_bar_axis_click_requests_unsnapped_cursor_without_editing_notes_or_onsets(self):
+        timeline = self.timeline
+        positions, notes, onsets = [], [], []
+        timeline.cursor_requested.connect(positions.append)
+        timeline.note_requested.connect(lambda *args: notes.append(args))
+        timeline.onset_requested.connect(lambda *args: onsets.append(args))
+        for mode, tool in (("notes", "brush"), ("notes", "info"), ("mix", "brush")):
+            with self.subTest(mode=mode, tool=tool):
+                timeline.mode, timeline.tool = mode, tool
+                event = self.mouse_event(F(7, 10), 60)
+                event.position = lambda: QPointF(timeline._x(F(7, 10)), timeline.height() - 5)
+                timeline.mousePressEvent(event)
+                self.assertAlmostEqual(positions[-1], timeline.project.grid.beat_to_seconds(F(7, 10)))
+        self.assertEqual(len(positions), 3)
+        self.assertEqual(notes, [])
+        self.assertEqual(onsets, [])
+
+    def test_note_body_drag_snaps_start_preserves_length_and_previews_without_editing(self):
+        timeline = self.timeline
+        note = Note("ai", F(1), F(17, 8), 60, 83)
+        timeline.notes = [note]
+        moved, confirmed = [], []
+        timeline.note_moved.connect(lambda *args: moved.append(args))
+        timeline.note_confirmed.connect(confirmed.append)
+        timeline.mousePressEvent(self.mouse_event(F(3, 2), 60))
+        self.assertEqual(confirmed, [])
+        timeline.mouseMoveEvent(self.mouse_event(F(21, 8), 62))
+        with patch.object(timeline, "_paint_note") as paint:
+            timeline.grab()
+        preview = paint.call_args.args[1]
+        self.assertEqual((preview.start, preview.end, preview.pitch), (F(9, 4), F(27, 8), 62))
+        self.assertEqual(timeline.notes, [note])
+        self.assertEqual(moved, [])
+        timeline.mouseReleaseEvent(self.mouse_event(F(21, 8), 62))
+        self.assertEqual(moved, [(note, F(9, 4), 62)])
+        self.assertEqual(confirmed, [])
+
+    def test_note_click_jitter_confirms_and_leftward_drag_stops_at_zero(self):
+        timeline = self.timeline
+        note = Note("ai", F(1), F(2), 60)
+        timeline.notes = [note]
+        moved, confirmed = [], []
+        timeline.note_moved.connect(lambda *args: moved.append(args))
+        timeline.note_confirmed.connect(confirmed.append)
+        timeline.mousePressEvent(self.mouse_event(F(3, 2), 60))
+        timeline.mouseMoveEvent(self.mouse_event(F(3, 2) + F(1, 100), 60))
+        timeline.mouseReleaseEvent(self.mouse_event(F(3, 2), 60))
+        self.assertEqual(confirmed, [note])
+        self.assertEqual(moved, [])
+        timeline.mousePressEvent(self.mouse_event(F(3, 2), 60))
+        timeline.mouseMoveEvent(self.mouse_event(F(-1), 60))
+        timeline.mouseReleaseEvent(self.mouse_event(F(-1), 60))
+        self.assertEqual(moved, [(note, F(0), 60)])
+
+    def test_drum_body_drag_uses_lanes_and_keeps_original_gm_pitch_for_horizontal_moves(self):
+        timeline = self.timeline
+        timeline.track.role = "drums"
+        note = Note("snare", F(1), F(2), 40)
+        timeline.notes = [note]
+        moved = []
+        timeline.note_moved.connect(lambda *args: moved.append(args))
+        for target, expected in ((40, 40), (36, 36)):
+            with self.subTest(target=target):
+                timeline.mousePressEvent(self.mouse_event(F(3, 2), 40))
+                timeline.mouseMoveEvent(self.mouse_event(F(5, 2), target))
+                timeline.mouseReleaseEvent(self.mouse_event(F(5, 2), target))
+                self.assertEqual(moved[-1], (note, F(2), expected))
 
     def test_vocal_words_are_centered_in_note_rect_and_change_rendering(self):
         from audio_to_midi.vocal_words import note_key, note_words

@@ -17,8 +17,8 @@ import time
 
 import numpy as np
 import soundfile as sf
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeyEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
     QPushButton, QSizePolicy, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
@@ -42,10 +42,10 @@ from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, parse_number, position,
 )
 from audio_to_midi.preview import (
-    PLAYBACK_SPEEDS, SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs, midi_volume, mix,
-    render_notes, stretch_audio,
+    PLAYBACK_SPEEDS, SCRUB_WINDOW_SECONDS, SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs,
+    midi_volume, mix, render_notes, scrub_audio, stretch_audio,
 )
-from audio_to_midi.spectrogram import colorize, cqt_image, song_reference
+from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE, colorize, cqt_image, song_reference
 from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline
@@ -150,6 +150,8 @@ class ProjectWindow(QMainWindow):
         self.sound_device = self.settings.value("preview/output", "") or None
         self.latency_ms = int(self.settings.value("preview/midi_latency_ms", 0))
         self.playback_speed = 1.0
+        self.play_cursor = 0.0
+        self._scrub_direction: int | None = None
         try:
             self.balance = max(-100, min(100, int(self.settings.value("preview/balance", 0))))
         except (TypeError, ValueError):
@@ -177,6 +179,7 @@ class ProjectWindow(QMainWindow):
         self.actions: dict[str, QAction] = {}
         self.tool_buttons: dict[str, QToolButton] = {}
         self._build()
+        self._set_play_cursor(0.0)
         self._sync_tracks()
         self._saved_project = deepcopy(self.project)
 
@@ -261,6 +264,8 @@ class ProjectWindow(QMainWindow):
         view.addSeparator()
         self._act(view, "rewind", "&Rewind to start", self._rewind, "Home")
         self._act(view, "play", "&Play / stop (Space)", self._play_toggle)
+        self._act(view, "scrub_left", "Scrub left one CQT bin", lambda: self._scrub(-1), "[").setAutoRepeat(False)
+        self._act(view, "scrub_right", "Scrub right one CQT bin", lambda: self._scrub(1), "]").setAutoRepeat(False)
         self._act(view, "metronome", "&Metronome click", lambda checked: None, checkable=True)
         view.addSeparator()
         tools = QActionGroup(self)
@@ -463,7 +468,7 @@ class ProjectWindow(QMainWindow):
         rewind.setDefaultAction(self.actions["rewind"])
         rewind.setText("|<<")
         rewind.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        rewind.setToolTip("Rewind to start (Home): stop playback and return to bar 1.")
+        rewind.setToolTip("Home: stop and move to the screen start; press again there to go to the song start.")
         self.tool_buttons["rewind"] = rewind
         row.addWidget(rewind)
         for text, slot in (("Play", self._play), ("Stop", self._stop)):
@@ -479,6 +484,9 @@ class ProjectWindow(QMainWindow):
             lambda b, pitch, end: self._guard(lambda: self._add_note(b, pitch, end))
         )
         self.timeline.note_resized.connect(lambda note, end: self._guard(lambda: self._resize_note(note, end)))
+        self.timeline.note_moved.connect(
+            lambda note, start, pitch: self._guard(lambda: self._move_note(note, start, pitch))
+        )
         self.timeline.note_selected.connect(self._select_note)
         self.timeline.note_selected.connect(lambda note: self._audition(note.start, note.pitch))
         self.timeline.note_confirmed.connect(lambda note: self._guard(lambda: self._confirm_note(note)))
@@ -489,8 +497,10 @@ class ProjectWindow(QMainWindow):
         self.timeline.beat_clicked.connect(lambda s, right, at: self._guard(lambda: self._beat_clicked(s, right, at)))
         self.timeline.context_requested.connect(lambda b, p, at: self._guard(lambda: self._roll_menu(b, at)))
         self.timeline.zoom_requested.connect(lambda steps: self._guard(lambda: self._zoom(-steps)))
+        self.timeline.cursor_requested.connect(lambda seconds: self._guard(lambda: self._seek_cursor(seconds)))
         self.chord_view = ChordView()
         self.chord_view.changed.connect(lambda segments: self._guard(lambda: self._set_chords(segments)))
+        self.chord_view.cursor_requested.connect(lambda seconds: self._guard(lambda: self._seek_cursor(seconds)))
         self.pages = QStackedWidget()
         self.pages.addWidget(self.timeline)
         self.pages.addWidget(self.chord_view)
@@ -528,6 +538,33 @@ class ProjectWindow(QMainWindow):
         self.rebalance.setSingleShot(True)
         self.rebalance.setInterval(200)
         self.rebalance.timeout.connect(lambda: self._guard(self._replay_balanced))
+        self.scrub_repeat = QTimer(self)
+        self.scrub_repeat.setSingleShot(True)
+        self.scrub_repeat.setInterval(round(SCRUB_WINDOW_SECONDS * 1000 * .75))
+        self.scrub_repeat.timeout.connect(lambda: self._guard(self._repeat_scrub))
+        for widget in (self, self.timeline, self.chord_view):
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() in (QEvent.Type.WindowDeactivate, QEvent.Type.FocusOut):
+            self._stop_scrub_repeat()
+        if isinstance(event, QKeyEvent):
+            direction = {Qt.Key.Key_BracketLeft: -1, Qt.Key.Key_BracketRight: 1}.get(event.key())
+            if direction is not None:
+                if event.type() == QEvent.Type.KeyRelease:
+                    if not event.isAutoRepeat() and self._scrub_direction == direction:
+                        self._stop_scrub_repeat()
+                    return True
+                action = self.actions["scrub_left" if direction < 0 else "scrub_right"]
+                if action.isEnabled() and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                    if event.type() == QEvent.Type.ShortcutOverride:
+                        event.accept()
+                        return True
+                    if event.type() == QEvent.Type.KeyPress:
+                        if not event.isAutoRepeat():
+                            self._guard(lambda: self._begin_scrub(direction))
+                        return True
+        return super().eventFilter(watched, event)
 
     def _guard(self, action) -> None:
         try:
@@ -663,6 +700,8 @@ class ProjectWindow(QMainWindow):
                           "Pitch scrolling is unavailable in chords and drum lanes."),
             "octave_down": (self.view != CHORDS and not self.timeline.drums,
                             "Pitch scrolling is unavailable in chords and drum lanes."),
+            "scrub_left": (bool(has_mix or track) and not tapping, "Choose audio and finish downbeat tapping first."),
+            "scrub_right": (bool(has_mix or track) and not tapping, "Choose audio and finish downbeat tapping first."),
         }
         for name, (ok, why) in rules.items():
             action = self.actions[name]
@@ -713,6 +752,7 @@ class ProjectWindow(QMainWindow):
     def _track_changed(self) -> None:
         if self._building:
             return
+        self._stop_scrub_repeat()
         self._cancel(analysis_only=True)
         self._building = True
         self.models.clear()
@@ -1023,9 +1063,15 @@ class ProjectWindow(QMainWindow):
         self._queue_visible()
 
     def _rewind(self) -> None:
+        screen_start = max(0.0, self.project.grid.beat_to_seconds(self.timeline.start))
+        at_screen_start = abs(self.play_cursor - screen_start) < 1e-6
         self._stop()
+        if not at_screen_start:
+            self._set_play_cursor(screen_start)
+            return
         self._cancel(analysis_only=True)
         self._set_window(Fraction(0))
+        self._set_play_cursor(0.0)
         self._load_envelope()
         self._refresh()
         self._queue_visible()
@@ -1571,6 +1617,9 @@ class ProjectWindow(QMainWindow):
             raise ValueError("The note changed before the resize finished; try again.")
         self._replace_note(note, note.start, end, note.pitch, note.velocity)
 
+    def _move_note(self, note: Note, start: Fraction, pitch: int) -> None:
+        self._replace_note(note, start, start + note.end - note.start, pitch, note.velocity)
+
     def _remove_note(self, note) -> None:
         if not self.active or note not in self._rows:
             raise ValueError("The note changed before it could be removed; try again.")
@@ -1776,6 +1825,7 @@ class ProjectWindow(QMainWindow):
             self._key_dialog = None
         self._key_chroma.clear()
         self._set_window(Fraction(0))
+        self._set_play_cursor(0.0)
         self._sync_tracks()
         self._saved_project = deepcopy(self.project)
 
@@ -1886,6 +1936,7 @@ class ProjectWindow(QMainWindow):
             track.revision += 1
         self.session, self.taps = None, []
         self._set_window(Fraction(0))
+        self._set_play_cursor(0.0)
         self._sync_tracks()
         self.tracks.setCurrentIndex(self.tracks.findData(MIX))
         self._detect()
@@ -2580,6 +2631,81 @@ class ProjectWindow(QMainWindow):
                   message=f"Detecting chords ({CHORD_MODELS[model]})...")
 
     # -- playback -----------------------------------------------------------
+    def _playback_path(self) -> str:
+        track = self.active
+        path = self.project.mix_path if self.view in (MIX, CHORDS) else (track.audio_path if track else None)
+        if not path:
+            raise ValueError("Import a mix or choose a track.")
+        return path
+
+    def _set_play_cursor(self, seconds: float, *, follow: bool = False) -> None:
+        self.play_cursor = max(0.0, seconds)
+        self.timeline.playhead = self.chord_view.playhead = self.play_cursor
+        beat = self.project.grid.seconds_to_beat(self.play_cursor)
+        if follow and not self.timeline.start <= beat < self.timeline.end:
+            self._cancel(analysis_only=True)
+            self._set_window((beat // self.project.grid.bar_beats) * self.project.grid.bar_beats)
+            self._load_envelope()
+            self._refresh()
+            self._queue_visible()
+        self.timeline.update()
+        self.chord_view.update()
+
+    def _seek_cursor(self, seconds: float) -> None:
+        if self.tapping:
+            raise ValueError("Finish downbeat tapping before repositioning the play cursor.")
+        duration = sf.info(self._playback_path()).duration
+        self._stop()
+        self._set_play_cursor(min(duration, max(0.0, seconds)))
+
+    def _stop_scrub_repeat(self) -> None:
+        self.scrub_repeat.stop()
+        self._scrub_direction = None
+
+    def _begin_scrub(self, direction: int) -> None:
+        self._stop_scrub_repeat()
+        if self._scrub(direction):
+            self._scrub_direction = direction
+            self.scrub_repeat.start()
+
+    def _repeat_scrub(self) -> None:
+        direction = self._scrub_direction
+        self._stop_scrub_repeat()
+        if direction is not None:
+            self._begin_scrub(direction)
+
+    def _scrub(self, direction: int) -> bool:
+        if self.tapping:
+            raise ValueError("Finish downbeat tapping before scrubbing.")
+        path = self._playback_path()
+        if self._clock is not None:
+            self._stop()
+        hop = HOP_LENGTH / SAMPLE_RATE
+        with sf.SoundFile(path) as audio:
+            rate = audio.samplerate
+            duration = len(audio) / rate
+            if not len(audio):
+                raise ValueError("No audio to scrub.")
+            current = min(duration, max(0.0, self.play_cursor))
+            target = min(duration, max(0.0, current + direction * hop))
+            if target == current:
+                self.status.setText("Start of audio." if direction < 0 else "End of audio.")
+                return False
+            first = max(0, round((target - SCRUB_WINDOW_SECONDS) * rate))
+            last = round(target * rate)
+            if last <= first:
+                self._set_play_cursor(target, follow=True)
+                self.status.setText("Start of audio.")
+                return False
+            audio.seek(first)
+            segment = audio.read(last - first, dtype="float32", always_2d=True).mean(axis=1)
+        if not len(segment):
+            raise ValueError("No audio in this scrub window.")
+        self._player().play_scrub(scrub_audio(segment, rate), rate)
+        self._set_play_cursor(target, follow=True)
+        self.status.setText(f"Scrub: {target:.4f} s; 80 ms before cursor at 100% speed.")
+        return True
+
     def _player(self):
         if self.preview is None:
             from audio_to_midi.preview import Preview
@@ -2617,15 +2743,15 @@ class ProjectWindow(QMainWindow):
             self._play(now)
 
     def _play(self, start_seconds: float | None = None, audition=None) -> None:
-        """Play from the window start (or `start_seconds`); `audition` plays just that note's span."""
+        """Play from the cursor (or `start_seconds`); auditions leave the cursor in place."""
         view, track = self.view, self.active
-        path = self.project.mix_path if view in (MIX, CHORDS) else (track.audio_path if track else None)
-        if not path:
-            raise ValueError("Import a mix or choose a track.")
+        path = self._playback_path()
         grid = self.project.grid
         if audition is not None:
             start_seconds = grid.beat_to_seconds(audition.start)
-        a = max(0.0, grid.beat_to_seconds(self.timeline.start) if start_seconds is None else start_seconds)
+        if start_seconds is None:
+            start_seconds = grid.beat_to_seconds(self.timeline.start) if self.tapping else self.play_cursor
+        a = max(0.0, start_seconds)
         with sf.SoundFile(path) as audio:
             rate = audio.samplerate
             audio.seek(min(len(audio), round(a * rate)))
@@ -2639,6 +2765,8 @@ class ProjectWindow(QMainWindow):
         b = a + len(segment) / rate
         speed = 1.0 if self.tapping else self.playback_speed
         self._stop()
+        if audition is None:
+            self._set_play_cursor(a, follow=True)
         segment = stretch_audio(segment, speed)
         clicks = audition is None and self.actions["metronome"].isChecked()
         extra = self._clicks(a, b, len(segment), rate, speed) if clicks else np.zeros_like(segment)
@@ -2698,21 +2826,15 @@ class ProjectWindow(QMainWindow):
         if now is None:
             self._clear_playhead()
             return
-        self.timeline.playhead = self.chord_view.playhead = now
-        if self.project.grid.seconds_to_beat(now) >= self.timeline.end:
-            self._set_window(self.timeline.end)
-            self._load_envelope()
-            self._refresh()
-        self.timeline.update()
-        self.chord_view.update()
+        self._set_play_cursor(now, follow=True)
 
     def _clear_playhead(self) -> None:
+        if self._clock is not None:
+            now = self._now()
+            self._set_play_cursor(self._clock[2] if now is None else now)
         self._clock = None
         self.clock.stop()
         self.rebalance.stop()
-        self.timeline.playhead = self.chord_view.playhead = None
-        self.timeline.update()
-        self.chord_view.update()
 
     def _play_toggle(self) -> None:
         if self._clock is not None:
@@ -2721,6 +2843,7 @@ class ProjectWindow(QMainWindow):
             self._play()
 
     def _stop(self) -> None:
+        self._stop_scrub_repeat()
         if self.preview:
             self.preview.stop()
         self._clear_playhead()
