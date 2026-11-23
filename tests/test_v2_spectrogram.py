@@ -1,8 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
-from audio_to_midi.spectrogram import HIGH_PITCH, LOW_PITCH, colorize, cqt_image
+from audio_to_midi.spectrogram import HIGH_PITCH, LOW_PITCH, colorize, cqt_image, song_overview
 
 
 class SpectrogramTests(unittest.TestCase):
@@ -33,6 +34,14 @@ class SpectrogramTests(unittest.TestCase):
             path = os.path.join(folder, "song.wav")
             sf.write(path, np.concatenate([loud, quiet]), rate)
             reference = song_reference(path)
+            overview_reference, overview, duration = song_overview(path)
+        self.assertAlmostEqual(overview_reference, reference)
+        self.assertEqual(duration, 4)
+        self.assertEqual(overview.shape[0], HIGH_PITCH - LOW_PITCH + 1)
+        self.assertLessEqual(overview.shape[1], 800)
+        row = HIGH_PITCH - 45  # 110 Hz / A2, high pitches first.
+        self.assertGreater(int(overview[row, overview.shape[1] // 4].sum()),
+                           int(overview[row, overview.shape[1] * 3 // 4].sum()))
         self_scaled = cqt_image(quiet, rate)
         song_scaled = cqt_image(quiet, rate, reference)
         self.assertAlmostEqual(float(self_scaled.max()), 1.0, places=3)
@@ -46,6 +55,18 @@ class SpectrogramTests(unittest.TestCase):
         rgb = colorize(image)
         self.assertEqual(rgb.shape, (88, 4, 3))
         self.assertGreater(int(rgb[0].sum()), int(rgb[-1].sum()))
+
+    def test_overview_compression_keeps_brief_attacks_including_last_frame(self):
+        magnitude = np.zeros((88, 1603), dtype=np.float32)
+        magnitude[10, 1] = 2
+        magnitude[70, -1] = 2
+        with patch("audio_to_midi.spectrogram._song_magnitude", return_value=(magnitude, 60)):
+            peak, rgb, duration = song_overview("song.wav")
+        self.assertEqual(rgb.shape, (88, 800, 3))
+        self.assertEqual((peak, duration), (2, 60))
+        self.assertGreater(int(rgb[77, 0].sum()), 600)
+        self.assertGreater(int(rgb[17, -1].sum()), 600)
+        self.assertLess(int(rgb[77, -1].sum()), 100)
 
 
 if __name__ == "__main__":

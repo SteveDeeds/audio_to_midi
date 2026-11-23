@@ -125,8 +125,13 @@ changes unsaved.
 
 ## 3. Count the bars (Mix view)
 
-Choose **Mix** in the **Track** selector. The upper lane shows the mix
-amplitude with a line for every detected beat; the area below is a constant-Q
+Choose **Mix** in the **Track** selector. A whole-song CQT overview
+above the main amplitude lane has a box marking the visible time range.
+Click the overview to center that section in the main view at the current
+zoom level. The box follows scrolling and zooming. The overview and amplitude
+lane have the same height; the spectrum and note rows below share the remaining space.
+The main lane shows the mix amplitude with a line for every detected beat;
+the area below is a constant-Q
 spectrogram of the mix. The line under the menus summarizes the timing, for
 example `120 BPM · 4/4 · Bar 1: 0.350 s · Key: D major`; click **Edit...** to
 type values yourself.
@@ -165,7 +170,7 @@ app which beats are downbeats, and it counts every other beat from them.
   the original recording in a DAW.
 
 You can also count bars while listening to **any stem** (drums, bass, vocals,
-or another part). Choose that track and **Info (I)** to see the same colored
+or another part). Choose that track to see the same colored
 beat markers over its audio and notes. Right-click in the waveform,
 spectrogram, or note lanes for the timing menu. A pin uses **exactly where you
 right-clicked**, not the nearest detected beat or the note's start; click the
@@ -412,12 +417,12 @@ same way, on a 40 dB log scale so weaker chord tones still show. Blue notes are 
 are yours. **Hover over a note** to see its name, the bar and beat it starts
 on, its length and velocity.
 
-**Left-click a blue note with the Brush tool to confirm it.** It turns green,
+**Left-click a blue note to confirm it.** It turns green,
 keeping its pitch, timing, and velocity, and stays visible even with **AI notes**
 set to **None**. Confirmation is saved and supports Undo/Redo; clicking a green
 note just selects it. A click on the release edge also confirms; dragging the
-edge still resizes. The Info tool continues to open the note dialog without
-confirming merely by opening it.
+edge still resizes. Right-click and choose **Info...** to open the note dialog
+without confirming merely by opening it.
 
 Velocity comes from how loud the note is in its stem: the power at the note's
 pitch and its first harmonics over the note's first 200 ms, compared with the
@@ -566,33 +571,36 @@ original recordings and licensing/source information alongside locally
 generated stems. Neither these recordings nor supplied lyrics are bundled
 with the application.
 
-There are two tools, with buttons next to **Grid** (or **View** menu):
-
-- **Brush (B)**, the default, adds, moves, resizes and deletes notes:
+There are no editing modes: left-click adds or selects; right-click opens
+a context menu with note information and timing controls.
 
 | Action | Result |
 |---|---|
-| Click an empty cell | Add a note one beat long |
+| Click an empty cell | Add a note using the **New note** dropdown length |
 | Drag from an empty cell | Add a note and set its length, with the end snapping to half-grid intervals |
 | Left-click a note | Select it; confirm a blue AI note as a green authored note |
 | Left-click and drag a note's body | Move its start on the selected grid and change its pitch (or drum lane), with a live preview; release to apply one undoable edit |
 | Drag a note's right edge | Change its length, snapping the end to half-grid intervals |
 | **Delete** | Reject the selected note (that pitch stays silent there) |
 | Right-click a note | Select it and open **Delete**, **Info...**, **Join with next note**, **Split note**; vocals also offer **Edit lyric...** |
-| Right-click empty space | *Rest for this beat* / *Rest for this bar* (silence all pitches) |
-| Click the onset lane | Add an onset (note-attack boundary) |
-| Right-click the onset lane | Remove the nearest onset |
+| Right-click empty space | *Rest for this beat* / *Rest for this bar* (silence all pitches), plus timing controls |
+| Click the onset lane | Select a detected beat, or add an onset (note-attack boundary) away from beat markers |
+| Right-click the onset lane | Open timing controls and **Remove onset here** |
 
 Note starts stay on the selected grid; dragged note ends can land halfway
 between grid lines, with a minimum length of half a grid cell. Extend a note
 to the next note's start for connected (legato) playback, or leave a half-grid
-gap for a separate articulation. Clicking an empty cell still adds a
-one-beat note.
+gap for a separate articulation. **New note** offers 1/16 through 1 whole
+note in sixteenth-note increments, displayed as reduced fractions
+(1/16, 1/8, 3/16, 1/4, and so on), independently of the grid and
+meter. It defaults to 1/4 (a quarter note) and remembers your selection
+between launches. Dragging from an empty cell overrides this click length.
+Notes still stop at the audio end or the next note of the same pitch.
 
 Moving keeps the note's length, velocity and lyric, but clips its release at
 the audio end or the next note of the same pitch, as other note edits do.
 Dragging left cannot move a note before beat zero. A click without dragging
-still selects/confirms the note; the Info tool still opens note details.
+still selects/confirms the note; **Info...** in its context menu opens note details.
 
 Opening a note menu does not confirm or delete the note. **Info...** opens
 the existing note editor. **Join with next note** combines the selected note
@@ -617,19 +625,17 @@ keep edits (schema 5; older schema 3/4 projects remain readable).
 Onset markers follow the resolved note starts: simultaneous notes share one
 marker, and a marker disappears when its last note is removed or moved.
 Detected candidates with no note are not shown as onsets. Clicking the onset
-lane still teaches an attack boundary for reanalysis, but it only shows a
+lane away from a detected beat still teaches an attack boundary for reanalysis, but it only shows a
 marker once a note actually starts there.
 
-- **Info (I)**: click a note to open a small editor with its bar, beat, length
-  in beats, pitch and velocity, plus **Delete note**. Beats accept `2 1/2`,
-  `5/2` or `2.5`; pitches accept `Eb4` or `63`. Clicking empty space does
-  nothing, so you can inspect notes without adding any. **Right-click** opens
-  the same note context menu, plus shared beat/downbeat controls
-  at the exact clicked audio position. Empty space offers the timing controls
-  too. Detect beats first to enable timing actions. The upper lane shows
-  counted beats and pins alongside note onsets without editing onset boundaries;
-  switch to **Brush (B)** to add or remove onsets. Starts must fit the selected
-  grid; note ends can use half-grid intervals, just like dragging.
+**Info...** in the note context menu opens a small editor with its bar, beat,
+length in beats, pitch and velocity, plus **Delete note**. Beats accept
+`2 1/2`, `5/2` or `2.5`; pitches accept `Eb4` or `63`.
+The context menu also offers shared beat/downbeat controls at the exact
+clicked audio position. Detect beats first to enable timing actions.
+The upper lane shows counted beats and pins alongside note onsets.
+Starts must fit the selected grid; note ends can use half-grid intervals,
+just like dragging.
 
 **Drums** have their own view: the spectrogram fills the top half, and below it
 are ADTOF's five lanes - Cymbal, Hi-hat, Tom, Snare and Kick - instead of piano

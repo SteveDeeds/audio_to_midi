@@ -69,22 +69,24 @@ class Timeline(QWidget):
     note_moved = Signal(object, object, int)
     note_selected = Signal(object)
     note_confirmed = Signal(object)
-    note_info_requested = Signal(object, QPoint)
     info_context_requested = Signal(float, object, QPoint)
     beat_clicked = Signal(float, bool, QPoint)
     context_requested = Signal(object, int, QPoint)
     cursor_requested = Signal(float)
     zoom_requested = Signal(int)
+    overview_requested = Signal(float)
 
     KEYS = 44
-    LANE_TOP = 22
-    ROLL_TOP = 84
+    OVERVIEW_TOP = 22
+    AMPLITUDE_HEIGHT = 62
+    LANE_TOP = OVERVIEW_TOP + AMPLITUDE_HEIGHT
+    ROLL_TOP = LANE_TOP + AMPLITUDE_HEIGHT
     FOOTER = 16
     EDGE = 6
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(160)
+        self.setMinimumHeight(160 + self.AMPLITUDE_HEIGHT)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.project: Project | None = None
@@ -97,6 +99,9 @@ class Timeline(QWidget):
         self.end = Fraction(8)
         self.envelope = np.zeros(0)
         self.audio_span = (0.0, 0.0)
+        self.overview_cqt: QImage | None = None
+        self._overview_buffer = None
+        self.overview_duration = 0.0
         self.cqt: QImage | None = None
         self._cqt_buffer = None
         self.low, self.high = 36, 96
@@ -104,7 +109,7 @@ class Timeline(QWidget):
         self.selected_beat: float | None = None
         self.taps: list[float] = []
         self.playhead: float | None = None
-        self.tool = "brush"
+        self.note_length = Fraction(1)
         self._drag = None
 
     # Geometry -------------------------------------------------------------
@@ -130,6 +135,14 @@ class Timeline(QWidget):
         self._cqt_buffer = rgb
         height, width, _ = rgb.shape
         self.cqt = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
+
+    def set_overview_cqt(self, rgb: np.ndarray | None) -> None:
+        if rgb is None or rgb.size == 0:
+            self.overview_cqt, self._overview_buffer = None, None
+            return
+        self._overview_buffer = rgb
+        height, width, _ = rgb.shape
+        self.overview_cqt = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
 
     def _roll_bottom(self) -> int:
         return max(self.ROLL_TOP + 12, self.height() - self.FOOTER)
@@ -214,6 +227,38 @@ class Timeline(QWidget):
         return self.mode == "notes" and self.project is not None and self.track is not None
 
     # Painting -------------------------------------------------------------
+    def _overview_selection(self) -> QRectF | None:
+        if not self.project or self.overview_duration <= 0:
+            return None
+        start, end = self._span()
+        start = max(0.0, min(self.overview_duration, start))
+        end = max(start, min(self.overview_duration, end))
+        width = max(1, self.width() - self.KEYS - 1)
+        return QRectF(
+            self.KEYS + start / self.overview_duration * width, self.OVERVIEW_TOP + 1,
+            (end - start) / self.overview_duration * width, self.AMPLITUDE_HEIGHT - 2,
+        )
+
+    def _paint_envelope(self, painter: QPainter, envelope: np.ndarray,
+                        left: float, right: float, top: int) -> None:
+        painter.setPen(QColor("#42657c"))
+        middle = top + self.AMPLITUDE_HEIGHT // 2 + 6
+        for i, value in enumerate(envelope):
+            x = round(left + i / len(envelope) * (right - left))
+            painter.drawLine(x, middle, x, round(middle - 28 * value))
+
+    def _paint_overview(self, painter: QPainter) -> None:
+        rect = QRectF(self.KEYS, self.OVERVIEW_TOP,
+                      max(1, self.width() - self.KEYS), self.AMPLITUDE_HEIGHT)
+        painter.fillRect(rect, QColor("#101620"))
+        if self.overview_cqt is not None:
+            painter.drawImage(rect, self.overview_cqt)
+        selection = self._overview_selection()
+        if selection is not None and selection.width() > 0:
+            painter.fillRect(selection, QColor(79, 195, 217, 25))
+            painter.setPen(QPen(QColor("#4fc3d9"), 2))
+            painter.drawRect(selection)
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.fillRect(self.rect(), QColor("#171d28"))
@@ -222,26 +267,20 @@ class Timeline(QWidget):
         row_height = self._row_height()
         painter.setPen(QColor("#8994a7"))
         if self.mode == "mix":
-            hint = ("Beat lane: click a beat to select, right-click to pin bar 1 / remove | "
+            hint = ("Overview: click to view section | Beat lane: click to select, right-click to pin / remove | "
                     "Right-click roll: beat and bar actions | Ctrl+wheel: zoom")
-        elif self.tool == "info":
-            hint = "Info (I): left-click note details, right-click timing / note menu | B: brush | Ctrl+wheel: zoom"
         else:
-            hint = ("Brush (B): click or drag to add, click note: select/confirm, drag note: move, Delete: remove | "
-                    "Right-click note: menu | Drag end: resize | "
-                    "Onset lane: click add, right-click delete | I: info | Ctrl+wheel: zoom")
+            hint = ("Left-click: add/select, drag: move/resize | Right-click: menu / Info | "
+                    "Overview: click to view section | Delete: remove | Ctrl+wheel: zoom")
         painter.drawText(8, 16, hint)
+        self._paint_overview(painter)
         span = self.audio_span[1] - self.audio_span[0]
         if self.project and span > 0:
             grid = self.project.grid
             audio_left = self._x(grid.seconds_to_beat(self.audio_span[0]))
             audio_right = self._x(grid.seconds_to_beat(self.audio_span[1]))
             if len(self.envelope):
-                painter.setPen(QColor("#42657c"))
-                middle = (self.LANE_TOP + self.ROLL_TOP) // 2 + 6
-                for i, value in enumerate(self.envelope):
-                    x = round(audio_left + i / len(self.envelope) * (audio_right - audio_left))
-                    painter.drawLine(x, middle, x, round(middle - 28 * value))
+                self._paint_envelope(painter, self.envelope, audio_left, audio_right, self.LANE_TOP)
             if self.cqt is not None and self.drums:
                 target = QRectF(audio_left, self.ROLL_TOP, audio_right - audio_left, self._rows_top() - self.ROLL_TOP)
                 painter.drawImage(target, self.cqt, QRectF(0, 0, self.cqt.width(), self.cqt.height()))
@@ -286,8 +325,7 @@ class Timeline(QWidget):
                     x = round(self._x(beat))
                     painter.setPen(QPen(QColor("#f7b554"), 2))
                     painter.drawLine(x, self.LANE_TOP + 4, x, self.ROLL_TOP - 2)
-            if self.tool == "info":
-                self._paint_beats(painter)
+            self._paint_beats(painter)
             drag = self._drag
             hidden = 0
             for note in self.notes:
@@ -424,6 +462,13 @@ class Timeline(QWidget):
         if not (left or right):
             return
         self.setFocus(Qt.FocusReason.MouseFocusReason)
+        if left and self.KEYS <= x < self.width() and self.OVERVIEW_TOP <= y < self.LANE_TOP:
+            if self.overview_duration > 0:
+                seconds = (x - self.KEYS) / max(1, self.width() - self.KEYS - 1) * self.overview_duration
+                self.overview_requested.emit(min(self.overview_duration, seconds))
+            return
+        if y < self.LANE_TOP:
+            return
         if left and x >= self.KEYS and self._roll_bottom() <= y < self.height():
             self.cursor_requested.emit(self._seconds(x))
             return
@@ -436,41 +481,28 @@ class Timeline(QWidget):
             return
         if not self.track:
             return
-        if self.tool == "info":
-            if right and x >= self.KEYS and self.LANE_TOP <= y < self._roll_bottom():
-                note = self._hit(x, y)[0] if self._in_roll(x, y) else None
-                if note is not None:
-                    self.selected = note
-                    self.selected_beat = None
-                    self.update()
+        if right and x >= self.KEYS and self.LANE_TOP <= y < self._roll_bottom():
+            note = self._hit(x, y)[0] if self._in_roll(x, y) else None
+            if note is not None:
+                self.selected = note
+                self.selected_beat = None
+                self.update()
+            if note is not None or y < self._rows_top():
                 self.info_context_requested.emit(self._seconds(x), note, self._global(event))
-                return
-            if x >= self.KEYS and y < self.ROLL_TOP:
-                if left and self.beats:
-                    self.beat_clicked.emit(self._seconds(x), False, self._global(event))
-                return
+            else:
+                self.context_requested.emit(self._raw_beat(x), self._pitch(y), self._global(event))
+            return
         if x >= self.KEYS and y < self.ROLL_TOP:
+            nearest = min(self.beats, key=lambda beat: abs(self._x_seconds(beat[0]) - x), default=None)
+            if nearest is not None and abs(self._x_seconds(nearest[0]) - x) <= self.EDGE:
+                self.beat_clicked.emit(nearest[0], False, self._global(event))
+                return
             self.onset_requested.emit(self._beat(x), left)
             return
         if not self._in_roll(x, y):
             return
         note, edge = self._hit(x, y)
-        if right:
-            if note is not None:
-                self.selected = note
-                self.selected_beat = None
-                self.update()
-                self.info_context_requested.emit(self._seconds(x), note, self._global(event))
-            else:
-                self.context_requested.emit(self._raw_beat(x), self._pitch(y), self._global(event))
-        elif self.tool == "info":
-            if left and note is not None:
-                self.selected_beat = None
-                self.selected = note
-                self.note_selected.emit(note)
-                self.update()
-                self.note_info_requested.emit(note, self._global(event))
-        elif left and note is not None and edge:
+        if left and note is not None and edge:
             self.selected = note
             self.selected_beat = None
             self.note_selected.emit(note)
@@ -495,8 +527,7 @@ class Timeline(QWidget):
             self.update()
 
     def _default_end(self, start: Fraction) -> Fraction:
-        grid = self.project.grid
-        return max(start + grid.subdivision, grid.snap(start + beat_length(grid)))
+        return start + self.note_length
 
     def mouseMoveEvent(self, event) -> None:
         x, y = event.position().x(), event.position().y()
@@ -525,13 +556,13 @@ class Timeline(QWidget):
             drag["end"] = max(minimum, grid.snap_end(self._raw_beat(x)))
             self.update()
             return
-        if self._editable() and self._in_roll(x, y):
+        if self.KEYS <= x < self.width() and self.OVERVIEW_TOP <= y < self.LANE_TOP and self.overview_duration > 0:
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._hover(None, event)
+        elif self._editable() and self._in_roll(x, y):
             note, edge = self._hit(x, y)
-            if self.tool == "info":
-                self.setCursor(Qt.CursorShape.PointingHandCursor if note else Qt.CursorShape.ArrowCursor)
-            else:
-                self.setCursor(Qt.CursorShape.SizeHorCursor if edge else
-                               Qt.CursorShape.SizeAllCursor if note else Qt.CursorShape.CrossCursor)
+            self.setCursor(Qt.CursorShape.SizeHorCursor if edge else
+                           Qt.CursorShape.SizeAllCursor if note else Qt.CursorShape.CrossCursor)
             self._hover(note, event)
         else:
             self.unsetCursor()

@@ -43,15 +43,39 @@ def _mono(audio: np.ndarray, sample_rate: int) -> np.ndarray:
     return mono
 
 
-def song_reference(path: str) -> float:
-    """Peak CQT magnitude of a whole file, so every window shares the song's brightness scale."""
+def _song_magnitude(path: str) -> tuple[np.ndarray, float]:
     import soundfile as sf
 
     data, rate = sf.read(path, dtype="float32", always_2d=True)
     mono = _mono(data, rate)
     if len(mono) < HOP_LENGTH or not np.all(np.isfinite(mono)):
-        return 0.0
-    return float(_magnitude(mono).max())
+        return np.zeros((HIGH_PITCH - LOW_PITCH + 1, max(1, len(mono) // HOP_LENGTH)),
+                        dtype=np.float32), len(data) / rate
+    return _magnitude(mono), len(data) / rate
+
+
+def song_reference(path: str) -> float:
+    """Peak CQT magnitude of a whole file, so every window shares the song's brightness scale."""
+    magnitude, _ = _song_magnitude(path)
+    return float(magnitude.max())
+
+
+def _levels(magnitude: np.ndarray, peak: float) -> np.ndarray:
+    if peak <= 0:
+        return np.zeros_like(magnitude, dtype=np.float32)
+    decibels = 20 * np.log10(np.clip(magnitude / peak, 10 ** (-FLOOR_DB / 20), 1))
+    return ((decibels + FLOOR_DB) / FLOOR_DB).astype(np.float32)
+
+
+def song_overview(path: str) -> tuple[float, np.ndarray, float]:
+    """Whole-song CQT peak and RGB overview, retaining brief attacks in at most 800 columns."""
+    magnitude, duration = _song_magnitude(path)
+    peak = float(magnitude.max())
+    columns = magnitude.shape[1]
+    if columns > 800:
+        edges = np.linspace(0, columns, 801, dtype=np.int64)
+        magnitude = np.maximum.reduceat(magnitude, edges[:-1], axis=1)
+    return peak, colorize(_levels(magnitude, peak)), duration
 
 
 def cqt_image(audio: np.ndarray, sample_rate: int, reference: float | None = None) -> np.ndarray:
@@ -69,10 +93,7 @@ def cqt_image(audio: np.ndarray, sample_rate: int, reference: float | None = Non
         return np.zeros((rows, max(1, len(mono) // HOP_LENGTH)), dtype=np.float32)
     magnitude = _magnitude(mono)
     peak = float(magnitude.max()) if reference is None else float(reference)
-    if peak <= 0:
-        return np.zeros_like(magnitude, dtype=np.float32)
-    decibels = 20 * np.log10(np.clip(magnitude / peak, 10 ** (-FLOOR_DB / 20), 1))
-    return ((decibels + FLOOR_DB) / FLOOR_DB).astype(np.float32)
+    return _levels(magnitude, peak)
 
 
 def colorize(image: np.ndarray) -> np.ndarray:

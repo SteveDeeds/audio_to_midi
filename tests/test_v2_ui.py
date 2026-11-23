@@ -53,6 +53,10 @@ class EditorTests(unittest.TestCase):
         if self.window.job:
             self.window.job.wait(10000)
             self.app.processEvents()
+        timeout = time.monotonic() + 10
+        while self.window._reference_jobs and time.monotonic() < timeout:
+            self.app.processEvents()
+            time.sleep(.005)
         with patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes):
             self.window.close()
         self.window.deleteLater()
@@ -470,7 +474,7 @@ class EditorTests(unittest.TestCase):
         self.assertFalse(self.track.notes.authored)
         audition.assert_not_called()
         actions = {action.text(): action for action in menus[0].actions()}
-        self.assertEqual(list(actions), ["Delete", "Info...", "Join with next note", "Split note"])
+        self.assertEqual(list(actions)[:4], ["Delete", "Info...", "Join with next note", "Split note"])
         self.assertFalse(actions["Join with next note"].isEnabled())
         self.assertTrue(actions["Split note"].isEnabled())
         with patch.object(NoteInfoDialog, "exec", return_value=NoteInfoDialog.DialogCode.Rejected) as info:
@@ -587,7 +591,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(list(self.window.timeline.word_labels.values()), ["new lyric"])
         self.assertNotIn("vocal_words", self.track.settings)
 
-    def test_ai_edge_click_confirms_but_info_does_not(self):
+    def test_ai_edge_click_confirms_but_context_info_does_not(self):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest
         from audio_to_midi.dialogs import NoteInfoDialog
@@ -600,12 +604,12 @@ class EditorTests(unittest.TestCase):
         window.show()
         self.app.processEvents()
         y = round(timeline._y(60) + timeline._row_height() / 2)
-        window.actions["info"].trigger()
-        with patch.object(NoteInfoDialog, "exec", return_value=NoteInfoDialog.DialogCode.Rejected):
-            QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
+        with patch.object(NoteInfoDialog, "exec", return_value=NoteInfoDialog.DialogCode.Rejected), \
+                patch.object(window, "_popup", side_effect=lambda menu, _: next(
+                    action for action in menu.actions() if action.text() == "Info...").trigger()):
+            QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier,
                              QPoint(round(timeline._x(F(1))), y))
         self.assertFalse(self.track.notes.authored)
-        window.actions["brush"].trigger()
         QTest.mouseClick(timeline, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier,
                          QPoint(round(timeline._x(F(2))) - 2, y))
         self.assertEqual([(n.start, n.end, n.source) for n in window._rows],
@@ -630,13 +634,55 @@ class EditorTests(unittest.TestCase):
         ident = (str(self.wav), self.wav.stat().st_mtime_ns)
         self.window._references.clear()
         self.window._reference_jobs.clear()
-        with patch("audio_to_midi.ui.song_reference", side_effect=ValueError("invalid audio")), \
+        with patch("audio_to_midi.ui.song_overview", side_effect=ValueError("invalid audio")), \
                 patch("audio_to_midi.ui.threading.Thread") as thread:
             thread.side_effect = lambda **kwargs: SimpleNamespace(start=kwargs["target"])
             self.window._request_reference(ident)
         self.assertNotIn(ident, self.window._reference_jobs)
         self.assertNotIn(ident, self.window._references)
         self.assertIn("ValueError: invalid audio", self.window.status.text())
+
+    def test_overview_cached_across_navigation_and_ignores_late_other_source(self):
+        window, timeline = self.window, self.window.timeline
+        ident = (str(self.wav), self.wav.stat().st_mtime_ns)
+        rgb = np.full((88, 800, 3), 80, dtype=np.uint8)
+        window._overview_ready(ident, rgb, 2)
+        self.assertIs(timeline._overview_buffer, rgb)
+        self.assertEqual(timeline.overview_duration, 2)
+        window._references[ident] = 1
+        with patch.object(window, "_queue_visible"), patch.object(window, "_request_reference") as request:
+            window._navigate(1)
+            self.assertIs(timeline._overview_buffer, rgb)
+            self.assertEqual(timeline.overview_duration, 2)
+            request.assert_not_called()
+        window._overview_ready(("other.wav", 1), np.ones((88, 3, 3), dtype=np.uint8), 3)
+        self.assertIs(timeline._overview_buffer, rgb)
+        window.tracks.clear()
+        window._load_envelope()
+        self.assertIsNone(timeline.overview_cqt)
+        self.assertEqual(timeline.overview_duration, 0)
+
+    def test_overview_click_shows_clicked_section_at_current_zoom_without_seeking(self):
+        window, timeline = self.window, self.window.timeline
+        ident = (str(self.wav), self.wav.stat().st_mtime_ns)
+        window._overview_ready(ident, np.ones((88, 800, 3), dtype=np.uint8), 40)
+        window._references[ident] = 1
+        with patch.object(window, "_queue_visible") as queue:
+            for fraction in (0, .5, 1):
+                with self.subTest(fraction=fraction):
+                    event = SimpleNamespace(
+                        position=lambda: SimpleNamespace(
+                            x=lambda: timeline.KEYS + fraction * (timeline.width() - timeline.KEYS - 1),
+                            y=lambda: timeline.OVERVIEW_TOP + 10),
+                        button=lambda: Qt.MouseButton.LeftButton,
+                    )
+                    timeline.mousePressEvent(event)
+                    clicked = window.project.grid.seconds_to_beat(fraction * 40)
+                    self.assertLessEqual(timeline.start, clicked)
+                    self.assertGreaterEqual(timeline.end, clicked)
+                    self.assertEqual(timeline.end - timeline.start, window.bars * window.project.grid.bar_beats)
+                    self.assertEqual(window.play_cursor, 0)
+            self.assertEqual(queue.call_count, 3)
 
     def use_neural_vocals(self):
         self.track.role = "vocals"
@@ -2037,8 +2083,57 @@ class EditorTests(unittest.TestCase):
         window._undo()
         self.assertIn((F(1), F(7, 2), 48), [(n.start, n.end, n.pitch) for n in self.track.notes.resolved()])
 
-        QTest.mouseClick(timeline, left, none, QPoint(round(timeline._x(F(2))), 50))
+        QTest.mouseClick(timeline, left, none, QPoint(round(timeline._x(F(2))), timeline.LANE_TOP + 28))
         self.assertIn(F(2), self.track.notes.onsets)
+
+    def test_new_note_dropdown_controls_clicks_and_restores_saved_selection(self):
+        from PySide6.QtCore import QPointF
+
+        window, timeline = self.window, self.window.timeline
+        timeline.resize(1400, 400)
+        self.assertEqual(window.note_length_choice.currentData(), F(1))
+        self.assertEqual(
+            [window.note_length_choice.itemText(index) for index in range(16)],
+            ["1/16", "1/8", "3/16", "1/4", "5/16", "3/8", "7/16", "1/2",
+             "9/16", "5/8", "11/16", "3/4", "13/16", "7/8", "15/16", "1"],
+        )
+        with patch.object(window, "_audition"):
+            for index in range(16):
+                with self.subTest(sixteenths=index + 1):
+                    window.note_length_choice.setCurrentIndex(index)
+                    pitch = 40 + index
+                    event = SimpleNamespace(
+                        position=lambda: QPointF(
+                            timeline._x(F(0)),
+                            timeline._y(pitch) + timeline._row_height() / 2,
+                        ),
+                        button=lambda: Qt.MouseButton.LeftButton,
+                    )
+                    timeline.mousePressEvent(event)
+                    timeline.mouseReleaseEvent(event)
+                    note = next(n for n in self.track.notes.resolved() if n.pitch == pitch)
+                    self.assertEqual(note.end - note.start, F(index + 1, 4))
+            window.note_length_choice.setCurrentIndex(0)
+            window._add_note(F(1), 60)
+        self.assertEqual(timeline.selected.end, F(5, 4))
+        restored = ProjectWindow()
+        try:
+            self.assertEqual(restored.note_length_choice.currentData(), F(1, 4))
+            self.assertEqual(restored.timeline.note_length, F(1, 4))
+        finally:
+            restored.close()
+            restored.deleteLater()
+
+    def test_selected_click_length_still_clamps_to_audio_and_next_same_pitch(self):
+        window = self.window
+        window.note_length_choice.setCurrentIndex(15)
+        self.track.notes.generated = [Note("later", F(2), F(3), 60)]
+        window._refresh()
+        with patch.object(window, "_audition"):
+            window._add_note(F(0), 60)
+            self.assertEqual(window.timeline.selected.end, F(2))
+            window._add_note(F(3), 62)
+            self.assertEqual(window.timeline.selected.end, F(4))
 
     def test_note_body_drag_persists_and_is_a_single_undoable_edit(self):
         from PySide6.QtCore import QPoint
@@ -2143,7 +2238,7 @@ class EditorTests(unittest.TestCase):
         self.assertEqual(note_summary(self.window.project, note),
                          f"Eb4 (63) \u00b7 bar 1, beat 3 1/2 \u00b7 1 beat (quarter) \u00b7 velocity {note.velocity}")
 
-    def test_info_tool_edits_and_deletes_a_clicked_note(self):
+    def test_context_info_edits_and_deletes_a_clicked_note(self):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest
         from audio_to_midi.dialogs import NoteInfoDialog
@@ -2153,11 +2248,8 @@ class EditorTests(unittest.TestCase):
         window.show()
         self.app.processEvents()
         window._add_note(F(1), 48)
-        window.actions["info"].trigger()
-        self.assertEqual(timeline.tool, "info")
-        self.assertTrue(window.actions["info"].isChecked() and not window.actions["brush"].isChecked())
         at = QPoint(round(timeline._x(F(3, 2))), round(timeline._y(48) + timeline._row_height() / 2))
-        left, none = Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier
+        right, none = Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier
 
         def edit(dialog):
             self.assertEqual((dialog.bar.value(), dialog.beat.text(), dialog.length.text(), dialog.pitch.text()),
@@ -2167,11 +2259,11 @@ class EditorTests(unittest.TestCase):
             dialog.pitch.setText("Eb3")
             return NoteInfoDialog.DialogCode.Accepted
 
-        with patch.object(NoteInfoDialog, "exec", edit):
-            QTest.mouseClick(timeline, left, none, at)
+        with patch.object(NoteInfoDialog, "exec", edit), \
+                patch.object(window, "_popup", side_effect=lambda menu, _: next(
+                    action for action in menu.actions() if action.text() == "Info...").trigger()):
+            QTest.mouseClick(timeline, right, none, at)
         self.assertEqual([(n.start, n.end, n.pitch) for n in self.track.notes.resolved()], [(F(1, 4), F(3, 4), 51)])
-        QTest.mouseClick(timeline, left, none, QPoint(round(timeline._x(F(3))), at.y()))
-        self.assertEqual(len(self.track.notes.resolved()), 1, "the info tool never adds notes")
 
         def delete(dialog):
             dialog._delete()
@@ -2180,8 +2272,6 @@ class EditorTests(unittest.TestCase):
         with patch.object(NoteInfoDialog, "exec", delete):
             window._note_info(window._rows[0])
         self.assertEqual(self.track.notes.resolved(), [])
-        window.actions["brush"].trigger()
-        self.assertEqual(timeline.tool, "brush")
 
     def test_info_right_click_pins_exact_audio_position_in_every_part(self):
         from PySide6.QtCore import QPoint, Qt
@@ -2193,7 +2283,6 @@ class EditorTests(unittest.TestCase):
         window.resize(1280, 900)
         window.show()
         self.app.processEvents()
-        window.actions["info"].trigger()
         for role in ("bass", "drums", "vocals", "piano", "guitar", "other"):
             with self.subTest(role=role):
                 track = self.track if role == "bass" else add_stem(window.project, self.wav, role)
@@ -2242,7 +2331,6 @@ class EditorTests(unittest.TestCase):
         window.tracks.setCurrentIndex(window.tracks.findData(drums.id))
         window.session = BeatSession([Beat(i * .5, .9) for i in range(4)], 120, 2)
         window._session_changed()
-        window.actions["info"].trigger()
         before = deepcopy(drums.notes)
         for y in (timeline.LANE_TOP + 10, timeline.ROLL_TOP + 10, timeline._rows_top() + 10):
             x = timeline._x_seconds(.61)
@@ -2254,9 +2342,9 @@ class EditorTests(unittest.TestCase):
             texts = [action.text() for action in popup.call_args.args[0].actions()]
             self.assertIn("Downbeat of bar...", texts)
             self.assertNotIn("Delete", texts)
-            self.assertNotIn("Rest for this beat", texts)
+            self.assertEqual("Rest for this beat" in texts, y >= timeline._rows_top())
         self.assertEqual(drums.notes, before)
-        # Info's beat selection must not teach an onset boundary.
+        # Selecting a detected beat must not teach an onset boundary.
         with patch.object(window, "_onset") as onset:
             timeline.mousePressEvent(SimpleNamespace(
                 position=lambda: QPointF(timeline._x_seconds(.5), timeline.LANE_TOP + 10),
@@ -2273,11 +2361,10 @@ class EditorTests(unittest.TestCase):
         self.assertIn("Clear all pins", actions)
         actions["Unpin"].trigger()
         self.assertEqual(window.session.pins, [])
-        window.actions["brush"].trigger()
-        self.assertEqual(timeline.beats, [])
-        self.assertFalse(window.shortcuts["D"].isEnabled())
+        self.assertEqual(timeline.beats, window._lane_beats())
+        self.assertTrue(window.shortcuts["D"].isEnabled())
 
-    def test_info_context_note_actions_without_detected_beats_and_brush_menu(self):
+    def test_context_note_actions_without_detected_beats(self):
         from PySide6.QtCore import QPoint, Qt
         from PySide6.QtTest import QTest
 
@@ -2286,7 +2373,6 @@ class EditorTests(unittest.TestCase):
         window.show()
         self.app.processEvents()
         window._add_note(F(1), 48)
-        window.actions["info"].trigger()
         at = QPoint(round(timeline._x(F(3, 2))), round(timeline._y(48) + timeline._row_height() / 2))
         with patch.object(window, "_popup") as popup:
             QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
@@ -2299,7 +2385,6 @@ class EditorTests(unittest.TestCase):
         actions["Delete"].trigger()
         self.assertEqual(self.track.notes.resolved(), [])
         window._undo()
-        window.actions["brush"].trigger()
         with patch.object(window, "_popup") as popup:
             QTest.mouseClick(timeline, Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, at)
         self.assertEqual(len(self.track.notes.resolved()), 1)

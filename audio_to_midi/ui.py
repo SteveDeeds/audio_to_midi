@@ -45,7 +45,7 @@ from audio_to_midi.preview import (
     PLAYBACK_SPEEDS, SCRUB_WINDOW_SECONDS, SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs,
     midi_volume, mix, render_notes, scrub_audio, stretch_audio,
 )
-from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE, colorize, cqt_image, song_reference
+from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE, colorize, cqt_image, song_overview
 from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline
@@ -128,6 +128,7 @@ class StatusLabel(QLabel):
 class ProjectWindow(QMainWindow):
     reference_ready = Signal(object, float)
     reference_failed = Signal(object, str)
+    overview_ready = Signal(object, object, float)
 
     def __init__(self):
         super().__init__()
@@ -166,9 +167,11 @@ class ProjectWindow(QMainWindow):
         self._building = False
         self._cqt_cache: dict[tuple, tuple] = {}
         self._references: dict[tuple, float] = {}  # (path, mtime) -> whole-song CQT peak
+        self._overviews: dict[tuple, tuple[np.ndarray, float]] = {}
         self._reference_jobs: set[tuple] = set()
         self.reference_ready.connect(self._reference_ready)
         self.reference_failed.connect(self._reference_failed)
+        self.overview_ready.connect(self._overview_ready)
         self._mix_data: dict[tuple, tuple] = {}
         self._key_dialog = None
         self._key_chroma: dict[tuple, dict] = {}
@@ -267,14 +270,6 @@ class ProjectWindow(QMainWindow):
         self._act(view, "scrub_left", "Scrub left one CQT bin", lambda: self._scrub(-1), "[").setAutoRepeat(False)
         self._act(view, "scrub_right", "Scrub right one CQT bin", lambda: self._scrub(1), "]").setAutoRepeat(False)
         self._act(view, "metronome", "&Metronome click", lambda checked: None, checkable=True)
-        view.addSeparator()
-        tools = QActionGroup(self)
-        for name, text, key in (("brush", "&Brush tool (add, resize, delete notes)", "B"),
-                                ("info", "&Info tool (note details and timing menu)", "I")):
-            action = self._act(view, name, text, lambda checked, n=name: self._set_tool(n) if checked else None,
-                               key, checkable=True)
-            tools.addAction(action)
-        self.actions["brush"].setChecked(True)
 
         model = bar.addMenu("&Model")
         self._act(model, "analyze", "Analyze &visible bars", lambda: self._analyze(False))
@@ -389,6 +384,20 @@ class ProjectWindow(QMainWindow):
         self.confidence_label = QLabel()
         confidence_layout.addWidget(self.confidence_label)
         row.addWidget(self.confidence_panel)
+        row.addSpacing(16)
+        row.addWidget(QLabel("New note:"))
+        self.note_length_choice = QComboBox()
+        for sixteenths in range(1, 17):
+            self.note_length_choice.addItem(str(Fraction(sixteenths, 16)), Fraction(sixteenths, 4))
+        sixteenths = int(self.settings.value("editor/note_length_sixteenths", 4))
+        if not 1 <= sixteenths <= 16:
+            raise ValueError("New note length must be from 1 to 16 sixteenth notes.")
+        self.note_length_choice.setCurrentIndex(sixteenths - 1)
+        self.note_length_choice.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.note_length_choice.setToolTip(
+            "Length of click-added notes, in sixteenth-note increments (1/4 is a quarter note). "
+            "Independent of the grid; drag to set a different length.")
+        row.addWidget(self.note_length_choice)
         row.addStretch(1)
         root.addLayout(row)
 
@@ -430,14 +439,6 @@ class ProjectWindow(QMainWindow):
             self.grid_choice.addItem(text, value)
         self.grid_choice.currentIndexChanged.connect(lambda: self._guard(self._grid_changed))
         row.addWidget(self.grid_choice)
-        row.addSpacing(16)
-        for name, text in (("brush", "Brush (B)"), ("info", "Info (I)")):
-            button = QToolButton()
-            button.setDefaultAction(self.actions[name])
-            button.setText(text)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            self.tool_buttons[name] = button
-            row.addWidget(button)
         row.addStretch(1)
         row.addWidget(QLabel("Audio"))
         self.balance_slider = QSlider(Qt.Orientation.Horizontal)
@@ -479,6 +480,8 @@ class ProjectWindow(QMainWindow):
 
         self.timeline = Timeline()
         self.timeline.project = self.project
+        self.note_length_choice.currentIndexChanged.connect(lambda: self._guard(self._note_length_changed))
+        self._note_length_changed()
         self.timeline.onset_requested.connect(lambda b, keep: self._guard(lambda: self._onset(b, keep)))
         self.timeline.note_requested.connect(
             lambda b, pitch, end: self._guard(lambda: self._add_note(b, pitch, end))
@@ -490,7 +493,6 @@ class ProjectWindow(QMainWindow):
         self.timeline.note_selected.connect(self._select_note)
         self.timeline.note_selected.connect(lambda note: self._audition(note.start, note.pitch))
         self.timeline.note_confirmed.connect(lambda note: self._guard(lambda: self._confirm_note(note)))
-        self.timeline.note_info_requested.connect(lambda note, at: self._guard(lambda: self._note_info(note)))
         self.timeline.info_context_requested.connect(
             lambda seconds, note, at: self._guard(lambda: self._info_menu(seconds, note, at))
         )
@@ -498,6 +500,7 @@ class ProjectWindow(QMainWindow):
         self.timeline.context_requested.connect(lambda b, p, at: self._guard(lambda: self._roll_menu(b, at)))
         self.timeline.zoom_requested.connect(lambda steps: self._guard(lambda: self._zoom(-steps)))
         self.timeline.cursor_requested.connect(lambda seconds: self._guard(lambda: self._seek_cursor(seconds)))
+        self.timeline.overview_requested.connect(lambda seconds: self._guard(lambda: self._overview_navigate(seconds)))
         self.chord_view = ChordView()
         self.chord_view.changed.connect(lambda segments: self._guard(lambda: self._set_chords(segments)))
         self.chord_view.cursor_requested.connect(lambda seconds: self._guard(lambda: self._seek_cursor(seconds)))
@@ -601,7 +604,7 @@ class ProjectWindow(QMainWindow):
         )
         if self.timeline.selected not in self._rows:
             self.timeline.selected = None
-        show_beats = view == MIX or (track is not None and self.timeline.tool == "info")
+        show_beats = view == MIX or track is not None
         self.timeline.beats = self._lane_beats() if show_beats else []
         self.timeline.taps = list(self.taps) if show_beats else []
         self.timeline.update()
@@ -709,7 +712,7 @@ class ProjectWindow(QMainWindow):
             action.setToolTip("" if ok else why)
         for key in ("D", "U"):
             self.shortcuts[key].setEnabled(
-                self.view == MIX or (self.view == "track" and self.timeline.tool == "info")
+                self.view in (MIX, "track")
             )
         self.cancel_button.setVisible(busy)
 
@@ -779,18 +782,11 @@ class ProjectWindow(QMainWindow):
         self.timeline.selected = None
         self.timeline.selected_beat = None
         self.pages.setCurrentIndex(1 if view == CHORDS else 0)
-        for name, button in self.tool_buttons.items():
-            button.setVisible(name == "rewind" or view == "track")
         self._load_envelope()
         if view == CHORDS:
             self._load_mix_data()
         self._refresh()
         self._queue_visible()
-
-    def _set_tool(self, name: str) -> None:
-        self.timeline.tool = name
-        self.timeline.unsetCursor()
-        self._refresh()
 
     def _audio_path(self) -> str | None:
         track = self.active
@@ -803,12 +799,18 @@ class ProjectWindow(QMainWindow):
     def _load_envelope(self) -> None:
         self.timeline.envelope = np.zeros(0)
         self.timeline.audio_span = (0.0, 0.0)
+        self.timeline.set_overview_cqt(None)
+        self.timeline.overview_duration = 0.0
         self.timeline.set_cqt(None)
         path = self._audio_path()
         if not path or not Path(path).exists():
             return
         grid = self.project.grid
         ident = (path, Path(path).stat().st_mtime_ns)
+        overview = self._overviews.get(ident)
+        if overview is not None:
+            rgb, self.timeline.overview_duration = overview
+            self.timeline.set_overview_cqt(rgb)
         reference = self._references.get(ident)
         if reference is None:
             self._request_reference(ident)
@@ -839,14 +841,14 @@ class ProjectWindow(QMainWindow):
         self.timeline.set_cqt(rgb)
 
     def _request_reference(self, ident: tuple) -> None:
-        """Measure a file's whole-song CQT peak once, off the UI thread."""
+        """Load the whole-song overview and CQT peak once, off the UI thread."""
         if ident in self._reference_jobs:
             return
         self._reference_jobs.add(ident)
-
         def work():
             try:
-                value = song_reference(ident[0])
+                value, rgb, duration = song_overview(ident[0])
+                self.overview_ready.emit(ident, rgb, duration)
             except Exception as error:
                 try:
                     self.reference_failed.emit(ident, f"{type(error).__name__}: {error}")
@@ -862,7 +864,15 @@ class ProjectWindow(QMainWindow):
 
     def _reference_failed(self, ident: tuple, message: str) -> None:
         self._reference_jobs.discard(ident)
-        self.status.setText(f"Spectrogram reference failed for {ident[0]}: {message}")
+        self.status.setText(f"CQT overview / spectrogram reference failed for {ident[0]}: {message}")
+
+    def _overview_ready(self, ident: tuple, rgb: np.ndarray, duration: float) -> None:
+        self._overviews[ident] = rgb, duration
+        path = self._audio_path()
+        if path and Path(path).exists() and (path, Path(path).stat().st_mtime_ns) == ident:
+            self.timeline.set_overview_cqt(rgb)
+            self.timeline.overview_duration = duration
+            self.timeline.update()
 
     def _reference_ready(self, ident: tuple, value: float) -> None:
         self._reference_jobs.discard(ident)
@@ -1062,6 +1072,17 @@ class ProjectWindow(QMainWindow):
         self._refresh()
         self._queue_visible()
 
+    def _overview_navigate(self, seconds: float) -> None:
+        """Center the clicked section at the current zoom, aligned to a bar."""
+        grid = self.project.grid
+        beat = grid.seconds_to_beat(seconds)
+        start = ((beat - self.bars * grid.bar_beats / 2) // grid.bar_beats) * grid.bar_beats
+        self._cancel(analysis_only=True)
+        self._set_window(start)
+        self._load_envelope()
+        self._refresh()
+        self._queue_visible()
+
     def _rewind(self) -> None:
         screen_start = max(0.0, self.project.grid.beat_to_seconds(self.timeline.start))
         at_screen_start = abs(self.play_cursor - screen_start) < 1e-6
@@ -1100,6 +1121,13 @@ class ProjectWindow(QMainWindow):
         self._cancel(analysis_only=True)
         self._refresh()
         self._queue_visible()
+
+    def _note_length_changed(self) -> None:
+        value = self.note_length_choice.currentData()
+        if not isinstance(value, Fraction):
+            raise ValueError("Choose a new note length.")
+        self.timeline.note_length = value
+        self.settings.setValue("editor/note_length_sixteenths", int(value * 4))
 
     # -- background jobs ---------------------------------------------------
     def _show_job_status(self, text: str) -> None:
@@ -1511,9 +1539,8 @@ class ProjectWindow(QMainWindow):
 
     def _add_note(self, beat: Fraction, pitch: int, end: Fraction | None = None) -> None:
         track = self._require_transcribable()
-        grid = self.project.grid
         if end is None:
-            end = max(beat + grid.subdivision, grid.snap(beat + beat_length(grid)))
+            end = self.timeline._default_end(beat)
         stop = self._clamp_release(beat, end, pitch)
         if beat < 0 or stop <= beat:
             raise ValueError("Note is outside the audio.")
@@ -1568,7 +1595,7 @@ class ProjectWindow(QMainWindow):
             self._select_note(match)
 
     def _note_info(self, note) -> None:
-        """Info tool: edit or delete one note in a small dialog."""
+        """Edit or delete one note from its context menu."""
         if not self.active or note not in self._rows:
             raise ValueError("The note changed; try again.")
         dialog = NoteInfoDialog(self, self.project, note, drums=self.active.role == "drums")
@@ -1727,14 +1754,14 @@ class ProjectWindow(QMainWindow):
             divide.setEnabled(note.start < split < note.end)
             if self.active.role == "vocals":
                 menu.addAction("Edit lyric...", lambda: self._guard(lambda: self._edit_lyric(note)))
-            if self.timeline.tool != "info":
-                self._popup(menu, at)
-                return
             menu.addSeparator()
         if self.session is None:
             menu.addAction("Detect beats first (Edit > Detect tempo, meter, and key)").setEnabled(False)
         else:
             self._beat_menu(menu, seconds, tolerance=0.0, pin_here=True)
+        if note is None and self.active:
+            beat = self.project.grid.snap(self.project.grid.seconds_to_beat(seconds))
+            menu.addAction("Remove onset here", lambda: self._guard(lambda: self._onset(beat, False)))
         self._popup(menu, at)
 
     def _roll_menu(self, beat: Fraction, at) -> None:
@@ -1751,6 +1778,11 @@ class ProjectWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("Rest for this beat", lambda: self._guard(lambda: self._rest_range(cell, cell + unit)))
         menu.addAction("Rest for this bar", lambda: self._guard(lambda: self._rest_range(bar_start, bar_start + bar)))
+        menu.addSeparator()
+        if self.session is None:
+            menu.addAction("Detect beats first (Edit > Detect tempo, meter, and key)").setEnabled(False)
+        else:
+            self._beat_menu(menu, grid.beat_to_seconds(beat), tolerance=0.0, pin_here=True)
         self._popup(menu, at)
 
     def _delete_key(self) -> None:

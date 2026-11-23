@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
+
 from PySide6.QtCore import QPointF, QRect, Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
@@ -55,20 +57,82 @@ class TimelineGridTests(unittest.TestCase):
         self.assertEqual(image.pixelColor(x - 4, bottom + 7).name(), "#4ade80")
         self.assertNotEqual(image.pixelColor(x - 4, bottom + 1).name(), "#4ade80")
 
+    def test_overview_shows_whole_cqt_and_time_mapped_viewport_in_all_modes(self):
+        timeline = self.timeline
+        timeline.project.grid = Grid(offset_seconds=2)
+        timeline.set_overview_cqt(np.full((88, 800, 3), [50, 80, 110], dtype=np.uint8))
+        timeline.overview_duration = 20
+        timeline.envelope = np.ones(800)
+        timeline.audio_span = (2, 6)
+        y = timeline.OVERVIEW_TOP + timeline.AMPLITUDE_HEIGHT // 2
+        for mode, role in (("mix", "bass"), ("notes", "bass"), ("notes", "drums")):
+            with self.subTest(mode=mode, role=role):
+                timeline.mode, timeline.track.role = mode, role
+                timeline.start, timeline.end = F(0), F(8)
+                image = timeline.grab().toImage()
+                width = timeline.width() - timeline.KEYS - 1
+                self.assertEqual(image.pixelColor(timeline.KEYS, y).name(), "#32506e")
+                self.assertEqual(image.pixelColor(timeline.width() - 2, y).name(), "#32506e")
+                box = timeline._overview_selection()
+                self.assertAlmostEqual(box.left(), timeline.KEYS + width * .1)
+                self.assertAlmostEqual(box.right(), timeline.KEYS + width * .3)
+                self.assertEqual(image.pixelColor(round(box.left()), y).name(), "#4fc3d9")
+                self.assertEqual(box.height() + 2, timeline.ROLL_TOP - timeline.LANE_TOP)
+                timeline.start, timeline.end = F(8), F(12)
+                moved = timeline.grab().toImage()
+                box = timeline._overview_selection()
+                self.assertAlmostEqual(box.left(), timeline.KEYS + width * .3)
+                self.assertAlmostEqual(box.right(), timeline.KEYS + width * .4)
+                self.assertEqual(moved.pixelColor(round(box.right()), y).name(), "#4fc3d9")
+                self.assertEqual(moved.pixelColor(timeline.KEYS, y),
+                                 image.pixelColor(timeline.KEYS, y))
+
+    def test_overview_viewport_clips_to_audio_and_clicks_navigate_without_editing(self):
+        timeline = self.timeline
+        timeline.overview_duration = 2
+        timeline.project.grid = Grid(offset_seconds=-1)
+        box = timeline._overview_selection()
+        self.assertEqual(box.left(), timeline.KEYS)
+        self.assertEqual(box.right(), timeline.width() - 1)
+        timeline.start, timeline.end = F(10), F(18)
+        self.assertEqual(timeline._overview_selection().width(), 0)
+        timeline.overview_duration = 0
+        self.assertIsNone(timeline._overview_selection())
+        timeline.overview_duration = 2
+        edits = []
+        positions = []
+        timeline.overview_requested.connect(positions.append)
+        timeline.onset_requested.connect(lambda *args: edits.append(args))
+        timeline.beat_clicked.connect(lambda *args: edits.append(args))
+        timeline.info_context_requested.connect(lambda *args: edits.append(args))
+        for mode in ("mix", "notes"):
+            timeline.mode = mode
+            for button in (Qt.MouseButton.LeftButton, Qt.MouseButton.RightButton):
+                event = SimpleNamespace(
+                    position=lambda: QPointF(
+                        timeline.KEYS + (timeline.width() - timeline.KEYS - 1) / 4,
+                        timeline.OVERVIEW_TOP + 20),
+                    button=lambda: button,
+                )
+                timeline.mousePressEvent(event)
+                timeline.mouseReleaseEvent(event)
+        self.assertEqual(edits, [])
+        self.assertEqual(positions, [.5, .5])
+
     def test_bar_axis_click_requests_unsnapped_cursor_without_editing_notes_or_onsets(self):
         timeline = self.timeline
         positions, notes, onsets = [], [], []
         timeline.cursor_requested.connect(positions.append)
         timeline.note_requested.connect(lambda *args: notes.append(args))
         timeline.onset_requested.connect(lambda *args: onsets.append(args))
-        for mode, tool in (("notes", "brush"), ("notes", "info"), ("mix", "brush")):
-            with self.subTest(mode=mode, tool=tool):
-                timeline.mode, timeline.tool = mode, tool
+        for mode in ("notes", "mix"):
+            with self.subTest(mode=mode):
+                timeline.mode = mode
                 event = self.mouse_event(F(7, 10), 60)
                 event.position = lambda: QPointF(timeline._x(F(7, 10)), timeline.height() - 5)
                 timeline.mousePressEvent(event)
                 self.assertAlmostEqual(positions[-1], timeline.project.grid.beat_to_seconds(F(7, 10)))
-        self.assertEqual(len(positions), 3)
+        self.assertEqual(len(positions), 2)
         self.assertEqual(notes, [])
         self.assertEqual(onsets, [])
 
@@ -91,6 +155,35 @@ class TimelineGridTests(unittest.TestCase):
         timeline.mouseReleaseEvent(self.mouse_event(F(21, 8), 62))
         self.assertEqual(moved, [(note, F(9, 4), 62)])
         self.assertEqual(confirmed, [])
+
+    def test_click_length_is_exact_and_independent_of_grid_meter_and_instrument(self):
+        timeline = self.timeline
+        requested = []
+        timeline.note_requested.connect(lambda *args: requested.append(args))
+        for role in ("bass", "drums"):
+            timeline.track.role = role
+            pitch = 60 if role == "bass" else 36
+            for step in (F(1), F(1, 3)):
+                timeline.project.grid = Grid(denominator=8, subdivision=step)
+                for sixteenths in range(1, 17):
+                    with self.subTest(role=role, step=step, sixteenths=sixteenths):
+                        timeline.note_length = F(sixteenths, 4)
+                        event = self.mouse_event(F(13, 12), pitch)
+                        start = timeline._cell(event.position().x())
+                        timeline.mousePressEvent(event)
+                        self.assertEqual(timeline._drag["end"], start + F(sixteenths, 4))
+                        timeline.mouseReleaseEvent(event)
+                        self.assertEqual(requested[-1], (start, pitch, start + F(sixteenths, 4)))
+
+    def test_dragged_creation_overrides_selected_click_length(self):
+        timeline = self.timeline
+        timeline.note_length = F(4)
+        requested = []
+        timeline.note_requested.connect(lambda *args: requested.append(args))
+        timeline.mousePressEvent(self.mouse_event(F(1), 60))
+        timeline.mouseMoveEvent(self.mouse_event(F(11, 8), 60))
+        timeline.mouseReleaseEvent(self.mouse_event(F(11, 8), 60))
+        self.assertEqual(requested, [(F(1), 60, F(11, 8))])
 
     def test_note_click_jitter_confirms_and_leftward_drag_stops_at_zero(self):
         timeline = self.timeline
@@ -168,10 +261,10 @@ class TimelineGridTests(unittest.TestCase):
 
     def test_detected_beats_stay_in_lane_in_mix_and_info_views(self):
         timeline = self.timeline
-        for mode, tool in (("mix", "brush"), ("notes", "info")):
+        for mode in ("mix", "notes"):
             for kind in ("uncounted", "counted", "downbeat", "pin"):
                 with self.subTest(mode=mode, kind=kind):
-                    timeline.mode, timeline.tool = mode, tool
+                    timeline.mode = mode
                     timeline.beats = []
                     baseline = timeline.grab().toImage()
                     timeline.beats = [(1 / 6, kind, "1")]
