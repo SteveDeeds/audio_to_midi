@@ -80,7 +80,8 @@ and template recognition now live in `audio_to_midi.chords`; the shared
 key-to-scale helper remains in `core.chord_analysis`.
 This does not delete or migrate any projects,
 audio, MIDI, profiles, logs, or model caches. The current project format is
-**schema 4**; schema 3 projects still open with unknown note confidence.
+**schema 5**, including edited note lyrics; schema 3 and 4 projects still open.
+Schema 3 detections have unknown note confidence.
 Older schemas and unsupported model aliases are rejected. Preferences keep their current settings location. Compatible
 onset examples can still be imported from older profiles; legacy session state
 is not converted automatically.
@@ -124,8 +125,13 @@ changes unsaved.
 
 ## 3. Count the bars (Mix view)
 
-Choose **Mix** in the **Track** selector. The upper lane shows the mix
-amplitude with a line for every detected beat; the area below is a constant-Q
+Choose **Mix** in the **Track** selector. A whole-song CQT overview
+above the main amplitude lane has a box marking the visible time range.
+Click the overview to center that section in the main view at the current
+zoom level. The box follows scrolling and zooming. The overview and amplitude
+lane have the same height; the spectrum and note rows below share the remaining space.
+The main lane shows the mix amplitude with a line for every detected beat;
+the area below is a constant-Q
 spectrogram of the mix. The line under the menus summarizes the timing, for
 example `120 BPM · 4/4 · Bar 1: 0.350 s · Key: D major`; click **Edit...** to
 type values yourself.
@@ -164,7 +170,7 @@ app which beats are downbeats, and it counts every other beat from them.
   the original recording in a DAW.
 
 You can also count bars while listening to **any stem** (drums, bass, vocals,
-or another part). Choose that track and **Info (I)** to see the same colored
+or another part). Choose that track to see the same colored
 beat markers over its audio and notes. Right-click in the waveform,
 spectrogram, or note lanes for the timing menu. A pin uses **exactly where you
 right-clicked**, not the nearest detected beat or the note's start; click the
@@ -345,7 +351,7 @@ drums use hit strength, and monophonic models use pitch-frame agreement.
 Older saved detections have unknown scores and appear only at **All**; analyze
 again to obtain scores. **All** includes the detector's returned candidates,
 not notes excluded by its internal decoder thresholds or pitch range.
-New saves use project schema 4; schema 3 projects still open, but older app
+New saves use project schema 5; schema 3 and 4 projects still open, but older app
 versions cannot read new saves.
 
 ### Running detection
@@ -381,7 +387,8 @@ the status text to read the full message, including any original line breaks.
 **Navigate** with **Previous** / **Next** (Left / Right arrow, or PgUp / PgDn);
 each step scrolls half a screen. The label between them
 shows the visible bars. **|<<** beside Play (also **Home** or **View > Rewind to start**)
-stops playback and returns to bar 1.
+stops playback and moves the green play cursor to the start of the screen.
+Press Home again there to return to the beginning of the song.
 Holding an arrow key does not queue every bar: automatic analysis waits for
 navigation to settle, cancels obsolete work, and keeps at most one pending
 request in the ordinary analysis lane, replacing older requests with the latest.
@@ -410,12 +417,12 @@ same way, on a 40 dB log scale so weaker chord tones still show. Blue notes are 
 are yours. **Hover over a note** to see its name, the bar and beat it starts
 on, its length and velocity.
 
-**Left-click a blue note with the Brush tool to confirm it.** It turns green,
+**Left-click a blue note to confirm it.** It turns green,
 keeping its pitch, timing, and velocity, and stays visible even with **AI notes**
 set to **None**. Confirmation is saved and supports Undo/Redo; clicking a green
 note just selects it. A click on the release edge also confirms; dragging the
-edge still resizes. The Info tool continues to open the note dialog without
-confirming merely by opening it.
+edge still resizes. Right-click and choose **Info...** to open the note dialog
+without confirming merely by opening it.
 
 Velocity comes from how loud the note is in its stem: the power at the note's
 pitch and its first harmonics over the note's first 200 ms, compared with the
@@ -434,7 +441,17 @@ On a **vocals** track, choose **madmom_cnn** or **madmom_brnn**. These combine
 the reviewed neural onset models with CREPE full pitch. Existing `pyin` and
 CREPE choices are unchanged. Five compact controls sit immediately right of
 the model selector; hover over a label or value for its description. They are
-enabled for the two new models and saved per track:
+enabled for the neural vocal models and saved per track.
+
+**madmom_cnn_fcpe** and **madmom_brnn_fcpe** use the same respective attack
+detectors with **FCPE** instead of CREPE full for pitch. FCPE is a separate,
+singing-oriented pitch model, installed on first use (`torchfcpe==0.0.4`,
+including bundled weights; MIT project license). It runs locally on CPU or
+CUDA in interruptible batches; unvoiced frames are not interpolated into
+invented pitches. The existing defaults are unchanged. These combinations
+still use MADMoM's **non-commercial** onset weights; FCPE does not remove
+that restriction. Compare the options on your own stem rather than assuming
+one always wins, especially with harmony vocals or separation bleed.
 
 | Control | Starting value | Useful tuning range | Effect |
 |---|---|---|---|
@@ -466,46 +483,159 @@ Velocity uses the visible crop's RMS energy rather than whole-stem harmonic
 power. Direct onset additions/removals and corrected held notes still guide
 boundaries, and authored notes remain protected. Legacy learned onset-feature
 profiles are retained for legacy models, but are not used/imported by these
-two neural models; their Onset control sets acceptance instead.
+neural models; their Onset control sets acceptance instead.
 
-There are two tools, with buttons next to **Grid** (or **View** menu):
+#### Local lyrics and word timing
 
-- **Brush (B)**, the default, adds, resizes and deletes notes:
+Pitch, musical attacks, and words are separate evidence. MADMoM proposes
+acoustic attacks, not linguistic syllables. The optional **Whisper + stable-ts**
+workflow recognizes words or aligns a supplied UTF-8 lyric file to a vocal
+stem. In the main app, select a vocals track and choose **Model > Detect vocal
+words...**, then **small.en** (more accurate, slower) or **base.en** (smaller).
+This processes the full vocal stem in the background, independently of the
+selected pitch/attack model. Optional packages and weights install/download on
+first use after confirmation. **Cancel analysis** discards unfinished results;
+cancellation is checked between Whisper windows, not during a model download.
+
+To use existing results, choose **Model > Import vocal word timings...** and
+select a JSON file produced by the command below. If it contains both analyses,
+choose **Detected words** for actual recognition, or explicitly choose
+**Supplied lyrics (alignment only)**. The source audio checksum must match the
+active stem; a transcript from a different mix or stem is rejected.
+
+Words are centered horizontally and vertically **inside their matching
+piano-roll notes**. Each positive-duration word is assigned to the note with
+the greatest time overlap (ties prefer the closest attack); a word spanning
+several pitches is shown only once. Multiple words on one note share a label.
+Notes and note boundaries are never changed by word detection. Short notes
+clip long labels: zoom in, or hover for the complete text. Words with no
+overlapping note remain saved for later note generation; zero-duration words
+are retained but not displayed.
+
+If detection reports **0 notes labeled**, check its explanation. There may be
+no musical notes yet, the AI notes slider/edits may hide them, or the analyzed
+notes may not overlap the detected words. The status shows the first timed
+word's audio time and bar number, and the existing notes' time span when they
+do not overlap. Whisper can skip a spoken or sung intro: analyzing bars 1-2
+does not label those notes if recognition starts later. Navigate to the
+reported bar and **Analyze visible bars**; saved words match newly generated
+notes automatically. Note publication also reports its word-label count.
+Do not shift the bar-1 offset merely to force labels onto unrelated notes.
+
+Word timestamps stay in audio seconds and are matched again after note edits,
+model changes, or tempo-map changes. Analyzing another view does not erase
+words elsewhere. Save the project to preserve annotations; word import and
+detection support Undo/Redo. Replacing the vocal stem clears its old words.
+MusicXML score export includes the displayed vocal lyrics below their matching
+notes, including manual edits and explicit clears. MIDI export does not include
+lyrics.
+
+```powershell
+python -m pip install "stable-ts>=2.19,<3"
+python -m audio_to_midi lyrics ".\vocals.wav" ".\words.json" --lyrics ".\lyrics.txt" --transcribe --model small.en
+```
+
+Omit `--lyrics` for automatic recognition only. With `--lyrics`, the default
+is known-text alignment; add `--transcribe` to also run independent recognition
+**without** feeding the supplied lyrics as a prompt. Standalone section
+headings such as `Verse 1`, `[Chorus]`, and `Outro` are removed; parenthesized
+sung words are preserved. Expand repeats explicitly in the lyric file.
+
+The default `base.en` checkpoint is a smaller CPU-friendly starting point;
+`small.en` is slower and often more accurate. Use a multilingual Whisper
+checkpoint and `--language` for other languages. Model weights download on
+first use; inference stays local. Audio is decoded with soundfile and passed
+as a 16 kHz waveform, without an external FFmpeg requirement. Whisper and
+stable-ts are MIT projects; stable-ts upstream development is currently paused.
+
+Output JSON records word start/end seconds, model word probabilities (not
+calibrated singing confidence), provenance hashes, and warnings. Existing
+output files are never overwritten. Zero-duration words are retained and
+flagged as unaligned rather than hidden. Known-text alignment **does not**
+verify that supplied words were sung. Review both text and timing: Whisper
+can hallucinate words, miss singing, or confuse backing voices. Word timings
+are **not syllable/phoneme timings** and must not automatically split every
+word into a single MIDI note; sustained melismas can span several pitches.
+
+Two openly reusable reference recordings with sung words:
+
+- [Twinkle Twinkle Little Star, sung by Dcoetzee (CC0)](https://commons.wikimedia.org/wiki/File:Twinkle_Twinkle_Little_Star_-_sung_with_full_lyrics.ogg):
+  solo a cappella; useful for monophonic pitch and words.
+- [Angels We Have Heard on High, U.S. Army Band chorus (public domain)](https://commons.wikimedia.org/wiki/File:U.S._Army_Band_-_Angels_We_Have_Heard_on_High.ogg):
+  choral a cappella; a stress case for melismas/overlapping voices, **not**
+  monophonic pitch ground truth. Review the recording's licensing page for
+  your jurisdiction.
+
+Demucs isolates vocals from instruments, not individual singers. Keep the
+original recordings and licensing/source information alongside locally
+generated stems. Neither these recordings nor supplied lyrics are bundled
+with the application.
+
+There are no editing modes: left-click adds or selects; right-click opens
+a context menu with note information and timing controls.
 
 | Action | Result |
 |---|---|
-| Click an empty cell | Add a note one beat long |
+| Click an empty cell | Add a note using the **New note** dropdown length |
 | Drag from an empty cell | Add a note and set its length, with the end snapping to half-grid intervals |
-| Click a note | Select it |
+| Left-click a note | Select it; confirm a blue AI note as a green authored note |
+| Left-click and drag a note's body | Move its start on the selected grid and change its pitch (or drum lane), with a live preview; release to apply one undoable edit |
 | Drag a note's right edge | Change its length, snapping the end to half-grid intervals |
-| Right-click a note, or **Delete** | Reject it (that pitch stays silent there) |
-| Right-click empty space | *Rest for this beat* / *Rest for this bar* (silence all pitches) |
-| Click the onset lane | Add an onset (note-attack boundary) |
-| Right-click the onset lane | Remove the nearest onset |
+| **Delete** | Reject the selected note (that pitch stays silent there) |
+| Right-click a note | Select it and open **Delete**, **Info...**, **Join with next note**, **Split note**; vocals also offer **Edit lyric...** |
+| Right-click empty space | *Rest for this beat* / *Rest for this bar* (silence all pitches), plus timing controls |
+| Click the onset lane | Select a detected beat, or add an onset (note-attack boundary) away from beat markers |
+| Right-click the onset lane | Open timing controls and **Remove onset here** |
 
 Note starts stay on the selected grid; dragged note ends can land halfway
 between grid lines, with a minimum length of half a grid cell. Extend a note
 to the next note's start for connected (legato) playback, or leave a half-grid
-gap for a separate articulation. Clicking an empty cell still adds a
-one-beat note.
+gap for a separate articulation. **New note** offers 1/16 through 1 whole
+note in sixteenth-note increments, displayed as reduced fractions
+(1/16, 1/8, 3/16, 1/4, and so on), independently of the grid and
+meter. It defaults to 1/4 (a quarter note) and remembers your selection
+between launches. Dragging from an empty cell overrides this click length.
+Notes still stop at the audio end or the next note of the same pitch.
+
+Moving keeps the note's length, velocity and lyric, but clips its release at
+the audio end or the next note of the same pitch, as other note edits do.
+Dragging left cannot move a note before beat zero. A click without dragging
+still selects/confirms the note; **Info...** in its context menu opens note details.
+
+Opening a note menu does not confirm or delete the note. **Info...** opens
+the existing note editor. **Join with next note** combines the selected note
+with the next later attack (preferring its pitch for simultaneous candidates),
+including any gap, and keeps the selected note's pitch and velocity.
+Simultaneous chord tones are not joined. The action is disabled on the last
+note; a join that would overwrite another same-pitch note is rejected.
+**Split note** divides at the right-click position, snapped to the selected
+grid, and is disabled if that position is not inside the note. Both results
+become green authored notes and retain the original pitch and velocity.
+These operations support Undo/Redo.
+
+On vocals, **Edit lyric...** starts with the note's detected or edited text.
+It can also add text without running recognition. A changed lyric confirms
+the note, stays centered on it, and follows subsequent note edits. Empty text
+explicitly clears the label, rather than restoring automatic recognition.
+Splitting keeps an edited lyric on the first half only; joining combines the
+two displayed lyrics when either has been edited. Without manual edits,
+recognized words continue to match by their audio times. Save the project to
+keep edits (schema 5; older schema 3/4 projects remain readable).
 
 Onset markers follow the resolved note starts: simultaneous notes share one
 marker, and a marker disappears when its last note is removed or moved.
 Detected candidates with no note are not shown as onsets. Clicking the onset
-lane still teaches an attack boundary for reanalysis, but it only shows a
+lane away from a detected beat still teaches an attack boundary for reanalysis, but it only shows a
 marker once a note actually starts there.
 
-- **Info (I)**: click a note to open a small editor with its bar, beat, length
-  in beats, pitch and velocity, plus **Delete note**. Beats accept `2 1/2`,
-  `5/2` or `2.5`; pitches accept `Eb4` or `63`. Clicking empty space does
-  nothing, so you can inspect notes without adding any. **Right-click** opens
-  a context menu instead of immediately deleting: on a note it includes
-  **Note details...** and **Delete note**, plus shared beat/downbeat controls
-  at the exact clicked audio position. Empty space offers the timing controls
-  too. Detect beats first to enable timing actions. The upper lane shows
-  counted beats and pins alongside note onsets without editing onset boundaries;
-  switch to **Brush (B)** to add or remove onsets. Starts must fit the selected
-  grid; note ends can use half-grid intervals, just like dragging.
+**Info...** in the note context menu opens a small editor with its bar, beat,
+length in beats, pitch and velocity, plus **Delete note**. Beats accept
+`2 1/2`, `5/2` or `2.5`; pitches accept `Eb4` or `63`.
+The context menu also offers shared beat/downbeat controls at the exact
+clicked audio position. Detect beats first to enable timing actions.
+The upper lane shows counted beats and pins alongside note onsets.
+Starts must fit the selected grid; note ends can use half-grid intervals,
+just like dragging.
 
 **Drums** have their own view: the spectrogram fills the top half, and below it
 are ADTOF's five lanes - Cymbal, Hi-hat, Tom, Snare and Kick - instead of piano
@@ -606,8 +736,29 @@ Undo and redo work in the Chords view too. Playback adds voiced chords.
 
 ## 7. Listen
 
-**Play** (or Space) plays from the start of the visible window; **Stop** ends
-it, and the view follows the playhead. In a stem view you hear the stem mostly
+The play cursor is a vertical green line with an upward-pointing triangle on
+the bar-labeled x-axis. Click that axis to position it without snapping to the
+note grid. **Play** (or Space) plays from the cursor; **Stop** (or Space again)
+stops and leaves the cursor at that position. The view follows it during
+playback. **Home** moves to the start of the screen; a second Home, or Home
+when already there, moves to the beginning of the song.
+
+Use **[** to scrub left and **]** to scrub right. Each press moves the cursor
+by one CQT time bin (256 samples at 22,050 Hz, about 11.6 ms), but previews
+the **80 ms ending at the cursor**, in normal forward audio order. Short
+3 ms fades prevent clicks at the preview edges. The preview never includes
+audio after the cursor: when locating a word's onset, step forward until the
+word first becomes audible, then fine-tune with individual presses.
+
+Hold either bracket key to jog through overlapping preview windows on the
+same audio channel. Release it to stop moving; the last preview finishes.
+Space, Home, or leaving the grid also ends held-key jogging.
+Scrubbing always uses **100% speed**, with no synthesized notes or metronome,
+regardless of the Speed and Audio/Synth settings. Near the start of the audio,
+the preview is clipped to the available preceding audio. Scrubbing is
+unavailable during downbeat tapping.
+
+In a stem view you hear the stem mostly
 on the right and the notes mostly on the left; in the Chords view you hear the
 mix with the chords.
 
@@ -655,10 +806,30 @@ The setting is remembered.
   the original tempo map to stay aligned with the audio.
   Score export asks for **Quantization**, defaulting to **1/16** notes independently
   of the editor grid. Triplets are only used when explicitly selected (available
-  in meters with quarter-note notation beats). Gaps shorter than the selected
-  quantization are omitted as ordinary articulation, without a slur. Originally
-  touching notes receive a slur; rests at least one quantization step long remain.
+  in meters with quarter-note notation beats). Pitched parts absorb successive
+  notated rests shorter than a quarter note into the preceding note within the
+  measure only when they complete clean undotted values. Think in quarter-note
+  blocks first, then eighth-note blocks, and sixteenths where needed. Keeping
+  those blocks is more important than eliminating every rest: do not create a
+  dotted note merely to absorb silence. This includes dotted-eighth rests when
+  they complete an undotted note, but stops at complete quarter-note rests and
+  longer pauses, independent of export quantization.
+  A short rest at the start of a longer silence is still absorbed: an eighth
+  note followed by an eighth rest and a quarter rest becomes a quarter note
+  followed by a quarter rest. If another eighth rest follows instead, keep it:
+  show a quarter note, eighth rest, then the next attack rather than extending
+  the quarter into a dotted quarter. The same rule applies to a track's final
+  note and the final segment of a tied note, including across a barline.
+  Note attacks never move beyond the selected quantization, and extensions do
+  not add slurs. Originally touching notes receive a slur. Dots remain when
+  required by the attacks or meter; explicit triplet rhythms and drum-hit
+  durations keep their existing notation.
   These changes affect only the exported score, not project notes or MIDI.
+  Vocal lyrics use the same word-to-note matching as the piano roll, before
+  export quantization. Edited lyrics override detected words; cleared lyrics
+  stay cleared. Each label appears once, on the first segment of a tied note.
+  Multiple words assigned to one note remain together; export does not invent
+  syllables or hyphenation. Unmatched and zero-duration words are not exported.
   For command-line score export, use `--quantization` in quarter-note units:
   `1/4` means sixteenths (default), `1/8` means thirty-seconds, and `1/6`
   means sixteenth triplets.

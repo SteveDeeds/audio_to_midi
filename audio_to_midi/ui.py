@@ -11,13 +11,14 @@ from copy import deepcopy
 from dataclasses import asdict, replace
 from fractions import Fraction
 from pathlib import Path
+import json
 import threading
 import time
 
 import numpy as np
 import soundfile as sf
-from PySide6.QtCore import QSettings, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeySequence, QShortcut
+from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeyEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
     QPushButton, QSizePolicy, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
@@ -41,15 +42,16 @@ from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, parse_number, position,
 )
 from audio_to_midi.preview import (
-    PLAYBACK_SPEEDS, SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs, midi_volume, mix,
-    render_notes, stretch_audio,
+    PLAYBACK_SPEEDS, SCRUB_WINDOW_SECONDS, SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs,
+    midi_volume, mix, render_notes, scrub_audio, stretch_audio,
 )
-from audio_to_midi.spectrogram import colorize, cqt_image, song_reference
+from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE, colorize, cqt_image, song_overview
 from audio_to_midi.storage import import_media, load_project, save_project
 from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline
 from audio_to_midi.timing import BeatSession
 from audio_to_midi.vocal_settings import CONTROLS as VOCAL_CONTROLS, MODEL_DESCRIPTIONS, VOCAL_MODELS, VocalParameters
+from audio_to_midi.vocal_words import note_key, note_words
 
 MIX, CHORDS = "__mix__", "__chords__"
 GRIDS = (
@@ -126,6 +128,7 @@ class StatusLabel(QLabel):
 class ProjectWindow(QMainWindow):
     reference_ready = Signal(object, float)
     reference_failed = Signal(object, str)
+    overview_ready = Signal(object, object, float)
 
     def __init__(self):
         super().__init__()
@@ -148,6 +151,8 @@ class ProjectWindow(QMainWindow):
         self.sound_device = self.settings.value("preview/output", "") or None
         self.latency_ms = int(self.settings.value("preview/midi_latency_ms", 0))
         self.playback_speed = 1.0
+        self.play_cursor = 0.0
+        self._scrub_direction: int | None = None
         try:
             self.balance = max(-100, min(100, int(self.settings.value("preview/balance", 0))))
         except (TypeError, ValueError):
@@ -162,9 +167,11 @@ class ProjectWindow(QMainWindow):
         self._building = False
         self._cqt_cache: dict[tuple, tuple] = {}
         self._references: dict[tuple, float] = {}  # (path, mtime) -> whole-song CQT peak
+        self._overviews: dict[tuple, tuple[np.ndarray, float]] = {}
         self._reference_jobs: set[tuple] = set()
         self.reference_ready.connect(self._reference_ready)
         self.reference_failed.connect(self._reference_failed)
+        self.overview_ready.connect(self._overview_ready)
         self._mix_data: dict[tuple, tuple] = {}
         self._key_dialog = None
         self._key_chroma: dict[tuple, dict] = {}
@@ -175,6 +182,7 @@ class ProjectWindow(QMainWindow):
         self.actions: dict[str, QAction] = {}
         self.tool_buttons: dict[str, QToolButton] = {}
         self._build()
+        self._set_play_cursor(0.0)
         self._sync_tracks()
         self._saved_project = deepcopy(self.project)
 
@@ -259,15 +267,9 @@ class ProjectWindow(QMainWindow):
         view.addSeparator()
         self._act(view, "rewind", "&Rewind to start", self._rewind, "Home")
         self._act(view, "play", "&Play / stop (Space)", self._play_toggle)
+        self._act(view, "scrub_left", "Scrub left one CQT bin", lambda: self._scrub(-1), "[").setAutoRepeat(False)
+        self._act(view, "scrub_right", "Scrub right one CQT bin", lambda: self._scrub(1), "]").setAutoRepeat(False)
         self._act(view, "metronome", "&Metronome click", lambda checked: None, checkable=True)
-        view.addSeparator()
-        tools = QActionGroup(self)
-        for name, text, key in (("brush", "&Brush tool (add, resize, delete notes)", "B"),
-                                ("info", "&Info tool (note details and timing menu)", "I")):
-            action = self._act(view, name, text, lambda checked, n=name: self._set_tool(n) if checked else None,
-                               key, checkable=True)
-            tools.addAction(action)
-        self.actions["brush"].setChecked(True)
 
         model = bar.addMenu("&Model")
         self._act(model, "analyze", "Analyze &visible bars", lambda: self._analyze(False))
@@ -278,6 +280,10 @@ class ProjectWindow(QMainWindow):
         self.auto.setChecked(True)
         model.addSeparator()
         self._act(model, "profile", "Import onset profile...", self._profile)
+        model.addSeparator()
+        self._act(model, "detect_words", "Detect vocal words...", self._detect_words)
+        self._act(model, "import_words", "Import vocal word timings...", self._import_words)
+        model.addSeparator()
         self._act(model, "cancel", "&Cancel analysis", self._cancel, "Esc")
         model.addSeparator()
         recognizers = model.addMenu("C&hord recognizer")
@@ -378,6 +384,20 @@ class ProjectWindow(QMainWindow):
         self.confidence_label = QLabel()
         confidence_layout.addWidget(self.confidence_label)
         row.addWidget(self.confidence_panel)
+        row.addSpacing(16)
+        row.addWidget(QLabel("New note:"))
+        self.note_length_choice = QComboBox()
+        for sixteenths in range(1, 17):
+            self.note_length_choice.addItem(str(Fraction(sixteenths, 16)), Fraction(sixteenths, 4))
+        sixteenths = int(self.settings.value("editor/note_length_sixteenths", 4))
+        if not 1 <= sixteenths <= 16:
+            raise ValueError("New note length must be from 1 to 16 sixteenth notes.")
+        self.note_length_choice.setCurrentIndex(sixteenths - 1)
+        self.note_length_choice.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.note_length_choice.setToolTip(
+            "Length of click-added notes, in sixteenth-note increments (1/4 is a quarter note). "
+            "Independent of the grid; drag to set a different length.")
+        row.addWidget(self.note_length_choice)
         row.addStretch(1)
         root.addLayout(row)
 
@@ -419,14 +439,6 @@ class ProjectWindow(QMainWindow):
             self.grid_choice.addItem(text, value)
         self.grid_choice.currentIndexChanged.connect(lambda: self._guard(self._grid_changed))
         row.addWidget(self.grid_choice)
-        row.addSpacing(16)
-        for name, text in (("brush", "Brush (B)"), ("info", "Info (I)")):
-            button = QToolButton()
-            button.setDefaultAction(self.actions[name])
-            button.setText(text)
-            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-            self.tool_buttons[name] = button
-            row.addWidget(button)
         row.addStretch(1)
         row.addWidget(QLabel("Audio"))
         self.balance_slider = QSlider(Qt.Orientation.Horizontal)
@@ -457,7 +469,7 @@ class ProjectWindow(QMainWindow):
         rewind.setDefaultAction(self.actions["rewind"])
         rewind.setText("|<<")
         rewind.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
-        rewind.setToolTip("Rewind to start (Home): stop playback and return to bar 1.")
+        rewind.setToolTip("Home: stop and move to the screen start; press again there to go to the song start.")
         self.tool_buttons["rewind"] = rewind
         row.addWidget(rewind)
         for text, slot in (("Play", self._play), ("Stop", self._stop)):
@@ -468,24 +480,30 @@ class ProjectWindow(QMainWindow):
 
         self.timeline = Timeline()
         self.timeline.project = self.project
+        self.note_length_choice.currentIndexChanged.connect(lambda: self._guard(self._note_length_changed))
+        self._note_length_changed()
         self.timeline.onset_requested.connect(lambda b, keep: self._guard(lambda: self._onset(b, keep)))
         self.timeline.note_requested.connect(
             lambda b, pitch, end: self._guard(lambda: self._add_note(b, pitch, end))
         )
-        self.timeline.note_removed.connect(lambda note: self._guard(lambda: self._remove_note(note)))
         self.timeline.note_resized.connect(lambda note, end: self._guard(lambda: self._resize_note(note, end)))
+        self.timeline.note_moved.connect(
+            lambda note, start, pitch: self._guard(lambda: self._move_note(note, start, pitch))
+        )
         self.timeline.note_selected.connect(self._select_note)
         self.timeline.note_selected.connect(lambda note: self._audition(note.start, note.pitch))
         self.timeline.note_confirmed.connect(lambda note: self._guard(lambda: self._confirm_note(note)))
-        self.timeline.note_info_requested.connect(lambda note, at: self._guard(lambda: self._note_info(note)))
         self.timeline.info_context_requested.connect(
             lambda seconds, note, at: self._guard(lambda: self._info_menu(seconds, note, at))
         )
         self.timeline.beat_clicked.connect(lambda s, right, at: self._guard(lambda: self._beat_clicked(s, right, at)))
         self.timeline.context_requested.connect(lambda b, p, at: self._guard(lambda: self._roll_menu(b, at)))
         self.timeline.zoom_requested.connect(lambda steps: self._guard(lambda: self._zoom(-steps)))
+        self.timeline.cursor_requested.connect(lambda seconds: self._guard(lambda: self._seek_cursor(seconds)))
+        self.timeline.overview_requested.connect(lambda seconds: self._guard(lambda: self._overview_navigate(seconds)))
         self.chord_view = ChordView()
         self.chord_view.changed.connect(lambda segments: self._guard(lambda: self._set_chords(segments)))
+        self.chord_view.cursor_requested.connect(lambda seconds: self._guard(lambda: self._seek_cursor(seconds)))
         self.pages = QStackedWidget()
         self.pages.addWidget(self.timeline)
         self.pages.addWidget(self.chord_view)
@@ -523,6 +541,33 @@ class ProjectWindow(QMainWindow):
         self.rebalance.setSingleShot(True)
         self.rebalance.setInterval(200)
         self.rebalance.timeout.connect(lambda: self._guard(self._replay_balanced))
+        self.scrub_repeat = QTimer(self)
+        self.scrub_repeat.setSingleShot(True)
+        self.scrub_repeat.setInterval(round(SCRUB_WINDOW_SECONDS * 1000 * .75))
+        self.scrub_repeat.timeout.connect(lambda: self._guard(self._repeat_scrub))
+        for widget in (self, self.timeline, self.chord_view):
+            widget.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if event.type() in (QEvent.Type.WindowDeactivate, QEvent.Type.FocusOut):
+            self._stop_scrub_repeat()
+        if isinstance(event, QKeyEvent):
+            direction = {Qt.Key.Key_BracketLeft: -1, Qt.Key.Key_BracketRight: 1}.get(event.key())
+            if direction is not None:
+                if event.type() == QEvent.Type.KeyRelease:
+                    if not event.isAutoRepeat() and self._scrub_direction == direction:
+                        self._stop_scrub_repeat()
+                    return True
+                action = self.actions["scrub_left" if direction < 0 else "scrub_right"]
+                if action.isEnabled() and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+                    if event.type() == QEvent.Type.ShortcutOverride:
+                        event.accept()
+                        return True
+                    if event.type() == QEvent.Type.KeyPress:
+                        if not event.isAutoRepeat():
+                            self._guard(lambda: self._begin_scrub(direction))
+                        return True
+        return super().eventFilter(watched, event)
 
     def _guard(self, action) -> None:
         try:
@@ -539,11 +584,15 @@ class ProjectWindow(QMainWindow):
         self.timeline.project = self.chord_view.project = self.project
         self.timeline.track = track
         self.timeline.mode = "mix" if view == MIX else "notes"
+        resolved = track.notes.resolved() if track else []
         self._rows = [
-            n for n in track.notes.resolved()
+            n for n in resolved
             if n.end > self.timeline.start and n.start < self.timeline.end
         ] if track else []
         self.timeline.notes = self._rows
+        self.timeline.word_labels = note_words(
+            resolved, grid, track.settings.get("vocal_words"),
+        ) if track and track.role == "vocals" else {}
         self.confidence_panel.setVisible(track is not None)
         self.confidence_slider.blockSignals(True)
         self.confidence_slider.setValue(track.notes.detection_level if track else 100)
@@ -555,7 +604,7 @@ class ProjectWindow(QMainWindow):
         )
         if self.timeline.selected not in self._rows:
             self.timeline.selected = None
-        show_beats = view == MIX or (track is not None and self.timeline.tool == "info")
+        show_beats = view == MIX or track is not None
         self.timeline.beats = self._lane_beats() if show_beats else []
         self.timeline.taps = list(self.taps) if show_beats else []
         self.timeline.update()
@@ -644,12 +693,18 @@ class ProjectWindow(QMainWindow):
                 "Neural vocal models honor direct note/onset edits; feature profiles belong to legacy models."
                 if track and track.model in VOCAL_MODELS else "Choose a track first.",
             ),
+            "detect_words": (bool(track and track.role == "vocals") and not busy,
+                             "Choose a vocals track and finish the current task first."),
+            "import_words": (bool(track and track.role == "vocals") and not busy,
+                             "Choose a vocals track and finish the current task first."),
             "cancel": (busy, "Nothing is running."),
             "key_chroma": (has_mix, "Import a mix first."),
             "octave_up": (self.view != CHORDS and not self.timeline.drums,
                           "Pitch scrolling is unavailable in chords and drum lanes."),
             "octave_down": (self.view != CHORDS and not self.timeline.drums,
                             "Pitch scrolling is unavailable in chords and drum lanes."),
+            "scrub_left": (bool(has_mix or track) and not tapping, "Choose audio and finish downbeat tapping first."),
+            "scrub_right": (bool(has_mix or track) and not tapping, "Choose audio and finish downbeat tapping first."),
         }
         for name, (ok, why) in rules.items():
             action = self.actions[name]
@@ -657,7 +712,7 @@ class ProjectWindow(QMainWindow):
             action.setToolTip("" if ok else why)
         for key in ("D", "U"):
             self.shortcuts[key].setEnabled(
-                self.view == MIX or (self.view == "track" and self.timeline.tool == "info")
+                self.view in (MIX, "track")
             )
         self.cancel_button.setVisible(busy)
 
@@ -700,6 +755,7 @@ class ProjectWindow(QMainWindow):
     def _track_changed(self) -> None:
         if self._building:
             return
+        self._stop_scrub_repeat()
         self._cancel(analysis_only=True)
         self._building = True
         self.models.clear()
@@ -709,7 +765,7 @@ class ProjectWindow(QMainWindow):
             for name in MODELS[track.role]:
                 self.models.addItem(MODEL_LABELS.get(name, name), name)
             for index in range(self.models.count()):
-                description = MODEL_DESCRIPTIONS.get(self.models.itemText(index))
+                description = MODEL_DESCRIPTIONS.get(self.models.itemData(index))
                 if description:
                     self.models.setItemData(index, description, Qt.ItemDataRole.ToolTipRole)
             self.models.setCurrentIndex(self.models.findData(track.model))
@@ -726,18 +782,11 @@ class ProjectWindow(QMainWindow):
         self.timeline.selected = None
         self.timeline.selected_beat = None
         self.pages.setCurrentIndex(1 if view == CHORDS else 0)
-        for name, button in self.tool_buttons.items():
-            button.setVisible(name == "rewind" or view == "track")
         self._load_envelope()
         if view == CHORDS:
             self._load_mix_data()
         self._refresh()
         self._queue_visible()
-
-    def _set_tool(self, name: str) -> None:
-        self.timeline.tool = name
-        self.timeline.unsetCursor()
-        self._refresh()
 
     def _audio_path(self) -> str | None:
         track = self.active
@@ -750,12 +799,18 @@ class ProjectWindow(QMainWindow):
     def _load_envelope(self) -> None:
         self.timeline.envelope = np.zeros(0)
         self.timeline.audio_span = (0.0, 0.0)
+        self.timeline.set_overview_cqt(None)
+        self.timeline.overview_duration = 0.0
         self.timeline.set_cqt(None)
         path = self._audio_path()
         if not path or not Path(path).exists():
             return
         grid = self.project.grid
         ident = (path, Path(path).stat().st_mtime_ns)
+        overview = self._overviews.get(ident)
+        if overview is not None:
+            rgb, self.timeline.overview_duration = overview
+            self.timeline.set_overview_cqt(rgb)
         reference = self._references.get(ident)
         if reference is None:
             self._request_reference(ident)
@@ -786,14 +841,14 @@ class ProjectWindow(QMainWindow):
         self.timeline.set_cqt(rgb)
 
     def _request_reference(self, ident: tuple) -> None:
-        """Measure a file's whole-song CQT peak once, off the UI thread."""
+        """Load the whole-song overview and CQT peak once, off the UI thread."""
         if ident in self._reference_jobs:
             return
         self._reference_jobs.add(ident)
-
         def work():
             try:
-                value = song_reference(ident[0])
+                value, rgb, duration = song_overview(ident[0])
+                self.overview_ready.emit(ident, rgb, duration)
             except Exception as error:
                 try:
                     self.reference_failed.emit(ident, f"{type(error).__name__}: {error}")
@@ -809,7 +864,15 @@ class ProjectWindow(QMainWindow):
 
     def _reference_failed(self, ident: tuple, message: str) -> None:
         self._reference_jobs.discard(ident)
-        self.status.setText(f"Spectrogram reference failed for {ident[0]}: {message}")
+        self.status.setText(f"CQT overview / spectrogram reference failed for {ident[0]}: {message}")
+
+    def _overview_ready(self, ident: tuple, rgb: np.ndarray, duration: float) -> None:
+        self._overviews[ident] = rgb, duration
+        path = self._audio_path()
+        if path and Path(path).exists() and (path, Path(path).stat().st_mtime_ns) == ident:
+            self.timeline.set_overview_cqt(rgb)
+            self.timeline.overview_duration = duration
+            self.timeline.update()
 
     def _reference_ready(self, ident: tuple, value: float) -> None:
         self._reference_jobs.discard(ident)
@@ -1009,10 +1072,27 @@ class ProjectWindow(QMainWindow):
         self._refresh()
         self._queue_visible()
 
+    def _overview_navigate(self, seconds: float) -> None:
+        """Center the clicked section at the current zoom, aligned to a bar."""
+        grid = self.project.grid
+        beat = grid.seconds_to_beat(seconds)
+        start = ((beat - self.bars * grid.bar_beats / 2) // grid.bar_beats) * grid.bar_beats
+        self._cancel(analysis_only=True)
+        self._set_window(start)
+        self._load_envelope()
+        self._refresh()
+        self._queue_visible()
+
     def _rewind(self) -> None:
+        screen_start = max(0.0, self.project.grid.beat_to_seconds(self.timeline.start))
+        at_screen_start = abs(self.play_cursor - screen_start) < 1e-6
         self._stop()
+        if not at_screen_start:
+            self._set_play_cursor(screen_start)
+            return
         self._cancel(analysis_only=True)
         self._set_window(Fraction(0))
+        self._set_play_cursor(0.0)
         self._load_envelope()
         self._refresh()
         self._queue_visible()
@@ -1041,6 +1121,13 @@ class ProjectWindow(QMainWindow):
         self._cancel(analysis_only=True)
         self._refresh()
         self._queue_visible()
+
+    def _note_length_changed(self) -> None:
+        value = self.note_length_choice.currentData()
+        if not isinstance(value, Fraction):
+            raise ValueError("Choose a new note length.")
+        self.timeline.note_length = value
+        self.settings.setValue("editor/note_length_sixteenths", int(value * 4))
 
     # -- background jobs ---------------------------------------------------
     def _show_job_status(self, text: str) -> None:
@@ -1333,7 +1420,10 @@ class ProjectWindow(QMainWindow):
             return False
         if publish(self.project, result_token, prediction):
             self._refresh()
-            self.status.setText("Notes updated.")
+            if track.role == "vocals" and track.settings.get("vocal_words"):
+                self.status.setText("Notes updated. " + self._word_match_summary(track))
+            else:
+                self.status.setText("Notes updated.")
             return True
         else:
             self.status.setText("Discarded stale inference; edits/project changed.")
@@ -1357,6 +1447,7 @@ class ProjectWindow(QMainWindow):
         return deepcopy((
             track.notes.authored, track.notes.rejections, track.notes.onsets,
             track.training, track.settings.get("imported_midi"), track.notes.detection_level,
+            track.settings.get("vocal_words"),
         ))
 
     def _checkpoint(self, key: str | None = None) -> None:
@@ -1380,7 +1471,7 @@ class ProjectWindow(QMainWindow):
             self._refresh()
             return
         track = self.project.track(key)
-        authored, rejections, onsets, training, imported, detection_level = state
+        authored, rejections, onsets, training, imported, detection_level, words = state
         track.notes.authored = authored
         track.notes.rejections = rejections
         track.notes.onsets = onsets
@@ -1390,6 +1481,10 @@ class ProjectWindow(QMainWindow):
             track.settings.pop("imported_midi", None)
         else:
             track.settings["imported_midi"] = imported
+        if words is None:
+            track.settings.pop("vocal_words", None)
+        else:
+            track.settings["vocal_words"] = words
         track.notes.revision += 1
         self._edited(track)
 
@@ -1444,9 +1539,8 @@ class ProjectWindow(QMainWindow):
 
     def _add_note(self, beat: Fraction, pitch: int, end: Fraction | None = None) -> None:
         track = self._require_transcribable()
-        grid = self.project.grid
         if end is None:
-            end = max(beat + grid.subdivision, grid.snap(beat + beat_length(grid)))
+            end = self.timeline._default_end(beat)
         stop = self._clamp_release(beat, end, pitch)
         if beat < 0 or stop <= beat:
             raise ValueError("Note is outside the audio.")
@@ -1488,7 +1582,7 @@ class ProjectWindow(QMainWindow):
             self._select_note(note)
             return
         self._checkpoint()
-        confirmed = track.notes.author(note.start, note.end, note.pitch, note.velocity)
+        confirmed = track.notes.author(note.start, note.end, note.pitch, note.velocity, note.lyric)
         record_onset(track, note.start, True)
         if track.role == "drums":
             record_drum(track, self.project, note.start, note.end, note.pitch, True)
@@ -1501,7 +1595,7 @@ class ProjectWindow(QMainWindow):
             self._select_note(match)
 
     def _note_info(self, note) -> None:
-        """Info tool: edit or delete one note in a small dialog."""
+        """Edit or delete one note from its context menu."""
         if not self.active or note not in self._rows:
             raise ValueError("The note changed; try again.")
         dialog = NoteInfoDialog(self, self.project, note, drums=self.active.role == "drums")
@@ -1512,13 +1606,16 @@ class ProjectWindow(QMainWindow):
         else:
             self._edit_note(note, *dialog.values())
 
-    def _replace_note(self, old, start: Fraction, end: Fraction, pitch: int, velocity: int) -> None:
+    def _replace_note(self, old, start: Fraction, end: Fraction, pitch: int, velocity: int,
+                      *, lyric: str | None = None) -> None:
+        if not self.active or old not in self._rows:
+            raise ValueError("The note changed before it could be edited; try again.")
         end = self._clamp_release(start, end, pitch, ignore=old)
         if end <= start:
             raise ValueError("The note would have no length.")
         self._checkpoint()
         self.active.notes.reject(old.start, old.end, old.pitch)
-        self.active.notes.author(start, end, pitch, velocity)
+        self.active.notes.author(start, end, pitch, velocity, old.lyric if lyric is None else lyric)
         record_onset(self.active, start, True)
         if self.active.role == "drums":
             record_drum(self.active, self.project, old.start, old.end, old.pitch, False)
@@ -1547,6 +1644,9 @@ class ProjectWindow(QMainWindow):
             raise ValueError("The note changed before the resize finished; try again.")
         self._replace_note(note, note.start, end, note.pitch, note.velocity)
 
+    def _move_note(self, note: Note, start: Fraction, pitch: int) -> None:
+        self._replace_note(note, start, start + note.end - note.start, pitch, note.velocity)
+
     def _remove_note(self, note) -> None:
         if not self.active or note not in self._rows:
             raise ValueError("The note changed before it could be removed; try again.")
@@ -1555,6 +1655,76 @@ class ProjectWindow(QMainWindow):
         if self.active.role == "drums":
             record_drum(self.active, self.project, note.start, note.end, note.pitch, False)
         self._edited()
+
+    def _next_note(self, note: Note) -> Note | None:
+        return min(
+            (n for n in self.active.notes.resolved() if n.start > note.start),
+            key=lambda n: (n.start, n.pitch != note.pitch, n.pitch, n.end, n.id),
+            default=None,
+        )
+
+    def _join_note(self, note: Note) -> None:
+        track = self._require_transcribable()
+        if note not in self._rows:
+            raise ValueError("The note changed before it could be joined; try again.")
+        following = self._next_note(note)
+        if following is None:
+            raise ValueError("There is no next note to join.")
+        end = max(note.end, following.end)
+        resolved = track.notes.resolved()
+        if any(n not in (note, following) and n.pitch == note.pitch
+               and n.start < end and note.start < n.end for n in resolved):
+            raise ValueError("Joining would overlap another note of the same pitch.")
+        lyric = None
+        if track.role == "vocals" and (note.lyric is not None or following.lyric is not None):
+            labels = note_words(resolved, self.project.grid, track.settings.get("vocal_words"))
+            lyric = " ".join(text for n in (note, following) if (text := labels.get(note_key(n))))
+        self._checkpoint()
+        for old in (note, following):
+            track.notes.reject(old.start, old.end, old.pitch)
+            if track.role == "drums":
+                record_drum(track, self.project, old.start, old.end, old.pitch, False)
+        joined = track.notes.author(note.start, end, note.pitch, note.velocity, lyric)
+        if not any(n not in (note, following) and n.start == following.start for n in resolved):
+            track.notes.onsets = [b for b in track.notes.onsets if b != following.start]
+            record_onset(track, following.start, False)
+        record_onset(track, note.start, True)
+        if track.role == "drums":
+            record_drum(track, self.project, note.start, end, note.pitch, True)
+        self._edited(track)
+        self._select_note(joined)
+
+    def _split_note(self, note: Note, beat: Fraction) -> None:
+        track = self._require_transcribable()
+        if note not in self._rows:
+            raise ValueError("The note changed before it could be split; try again.")
+        split = self.project.grid.snap(beat)
+        if not note.start < split < note.end:
+            raise ValueError("Right-click inside the note to split at an interior grid position.")
+        self._checkpoint()
+        track.notes.reject(note.start, note.end, note.pitch)
+        first = track.notes.author(note.start, split, note.pitch, note.velocity, note.lyric)
+        track.notes.author(split, note.end, note.pitch, note.velocity, "" if note.lyric is not None else None)
+        record_onset(track, note.start, True)
+        record_onset(track, split, True)
+        if track.role == "drums":
+            record_drum(track, self.project, note.start, note.end, note.pitch, False)
+            record_drum(track, self.project, note.start, split, note.pitch, True)
+            record_drum(track, self.project, split, note.end, note.pitch, True)
+        self._edited(track)
+        self._select_note(first)
+
+    def _edit_lyric(self, note: Note) -> None:
+        track = self._vocal_track()
+        if note not in self._rows:
+            raise ValueError("The note changed before its lyric could be edited; try again.")
+        current = self.timeline.word_labels.get(note_key(note), "")
+        text, accepted = QInputDialog.getText(self, "Edit lyric", "Lyric (leave empty to clear):", text=current)
+        if not accepted:
+            return
+        text = " ".join(text.split())
+        if text != current:
+            self._replace_note(note, note.start, note.end, note.pitch, note.velocity, lyric=text)
 
     def _rest(self) -> None:
         """Rest over the selected note's span (all pitches)."""
@@ -1573,13 +1743,25 @@ class ProjectWindow(QMainWindow):
     def _info_menu(self, seconds: float, note, at) -> None:
         menu = QMenu(self)
         if note is not None:
-            menu.addAction("Note details...", lambda: self._guard(lambda: self._note_info(note)))
-            menu.addAction("Delete note", lambda: self._guard(lambda: self._remove_note(note)))
+            if not self.active or note not in self._rows:
+                raise ValueError("The note changed; try again.")
+            split = self.project.grid.snap(self.project.grid.seconds_to_beat(seconds))
+            menu.addAction("Delete", lambda: self._guard(lambda: self._remove_note(note)))
+            menu.addAction("Info...", lambda: self._guard(lambda: self._note_info(note)))
+            join = menu.addAction("Join with next note", lambda: self._guard(lambda: self._join_note(note)))
+            join.setEnabled(self._next_note(note) is not None)
+            divide = menu.addAction("Split note", lambda: self._guard(lambda: self._split_note(note, split)))
+            divide.setEnabled(note.start < split < note.end)
+            if self.active.role == "vocals":
+                menu.addAction("Edit lyric...", lambda: self._guard(lambda: self._edit_lyric(note)))
             menu.addSeparator()
         if self.session is None:
             menu.addAction("Detect beats first (Edit > Detect tempo, meter, and key)").setEnabled(False)
         else:
             self._beat_menu(menu, seconds, tolerance=0.0, pin_here=True)
+        if note is None and self.active:
+            beat = self.project.grid.snap(self.project.grid.seconds_to_beat(seconds))
+            menu.addAction("Remove onset here", lambda: self._guard(lambda: self._onset(beat, False)))
         self._popup(menu, at)
 
     def _roll_menu(self, beat: Fraction, at) -> None:
@@ -1596,6 +1778,11 @@ class ProjectWindow(QMainWindow):
         menu = QMenu(self)
         menu.addAction("Rest for this beat", lambda: self._guard(lambda: self._rest_range(cell, cell + unit)))
         menu.addAction("Rest for this bar", lambda: self._guard(lambda: self._rest_range(bar_start, bar_start + bar)))
+        menu.addSeparator()
+        if self.session is None:
+            menu.addAction("Detect beats first (Edit > Detect tempo, meter, and key)").setEnabled(False)
+        else:
+            self._beat_menu(menu, grid.beat_to_seconds(beat), tolerance=0.0, pin_here=True)
         self._popup(menu, at)
 
     def _delete_key(self) -> None:
@@ -1670,6 +1857,7 @@ class ProjectWindow(QMainWindow):
             self._key_dialog = None
         self._key_chroma.clear()
         self._set_window(Fraction(0))
+        self._set_play_cursor(0.0)
         self._sync_tracks()
         self._saved_project = deepcopy(self.project)
 
@@ -1780,6 +1968,7 @@ class ProjectWindow(QMainWindow):
             track.revision += 1
         self.session, self.taps = None, []
         self._set_window(Fraction(0))
+        self._set_play_cursor(0.0)
         self._sync_tracks()
         self.tracks.setCurrentIndex(self.tracks.findData(MIX))
         self._detect()
@@ -2202,6 +2391,134 @@ class ProjectWindow(QMainWindow):
             self._play_toggle()
 
     # -- stems and chords ---------------------------------------------------
+    def _vocal_track(self) -> Track:
+        track = self.active
+        if track is None or track.role != "vocals":
+            raise ValueError("Choose a vocals track first.")
+        return track
+
+    def _word_match_summary(self, track: Track) -> str:
+        annotation = track.settings["vocal_words"]
+        notes = track.notes.resolved()
+        labels = note_words(notes, self.project.grid, annotation)
+        timed = [w for w in annotation["words"] if w["end"] > w["start"]]
+        summary = f"{len(labels)} notes labeled."
+        if labels:
+            return summary
+        if not timed:
+            return summary + " All word timings have zero duration and need review."
+        first = timed[0]["start"]
+        first_bar = bar_and_beat(
+            self.project.grid, max(Fraction(0), self.project.grid.seconds_to_beat(first)),
+        )[0]
+        word_hint = f" First detected word: {first:.2f} s (bar {first_bar})."
+        if not notes:
+            if track.notes.generated or track.notes.authored:
+                return summary + " No notes remain visible after filtering or edits; review the AI notes slider and rests." + word_hint
+            return summary + " No musical notes yet; choose a pitch model and Analyze visible bars." + word_hint
+        start = min(self.project.grid.beat_to_seconds(n.start) for n in notes)
+        end = max(self.project.grid.beat_to_seconds(n.end) for n in notes)
+        return (
+            summary + f" No note/word time overlap: existing notes span {start:.2f}-{end:.2f} s."
+            + word_hint + " Analyze visible bars where detected words occur; recognition may have skipped the intro."
+        )
+
+    def _word_publisher(self, track: Track):
+        project_id, track_id = self.project.id, track.id
+        source = media_identity(track.audio_path)
+        previous = deepcopy(track.settings.get("vocal_words"))
+
+        def accept(annotation):
+            current = next((t for t in self.project.tracks if t.id == track_id), None)
+            if (self.project.id != project_id or current is None or current.role != "vocals"
+                    or media_identity(current.audio_path) != source
+                    or current.settings.get("vocal_words") != previous):
+                self.status.setText("Vocal audio or words changed; discarded stale word results.")
+                return
+            from audio_to_midi.vocal_words import validate_words
+
+            validate_words(annotation, current.duration)
+            self._checkpoint(track_id)
+            current.settings["vocal_words"] = annotation
+            self.project.revision += 1
+            self._refresh()
+            timed = sum(w["end"] > w["start"] for w in annotation["words"])
+            mode = "Detected" if annotation["mode"] == "automatic_recognition" else "Aligned supplied"
+            self.status.setText(
+                f"{mode} {len(annotation['words'])} words ({annotation['model']}); "
+                f"{self._word_match_summary(current)} {timed} timed words retained for matching as notes change. "
+                f"{len(annotation['words']) - timed} zero-duration words need review. "
+                "Review text and timing; zoom in to read short notes. Save the project to keep words."
+            )
+        return accept
+
+    def _detect_words(self) -> None:
+        from audio_to_midi import provision
+        from audio_to_midi.lyrics import analyze_lyrics
+        from audio_to_midi.vocal_words import annotation_from_analysis
+
+        track = self._vocal_track()
+        model, ok = QInputDialog.getItem(
+            self, "Detect vocal words", "Local Whisper model (English)", ["small.en", "base.en"], 0, False,
+        )
+        if not ok:
+            return
+        needs = provision.missing("lyrics")
+        if QMessageBox.question(
+            self, "Detect vocal words",
+            f"Recognize words from the entire vocal stem using Whisper {model}? "
+            "Processing stays local and runs in the background. First use downloads model weights "
+            "(small.en about 461 MB; base.en about 139 MB). Singing may be misrecognized. "
+            "Words will be centered on matching notes, without changing notes or splitting syllables. "
+            + (f"\nInstall optional MIT-licensed packages: {', '.join(needs)}." if needs else "")
+            + ("\nThis replaces the track's existing word annotations (Undo restores them)."
+               if track.settings.get("vocal_words") else ""),
+        ) != QMessageBox.StandardButton.Yes:
+            return
+        path, duration = Path(track.audio_path), track.duration
+        accept = self._word_publisher(track)
+
+        def work(cancelled, report):
+            provision.ensure("lyrics", report, cancelled)
+            data = analyze_lyrics(path, model_name=model, report=report, cancelled=cancelled)
+            return annotation_from_analysis(data, "recognized", data["audio_sha256"], duration)
+
+        self._cancel(analysis_only=True)
+        self._run(work, accept, kind="lyrics", message="Recognizing vocal words:", reports=True)
+
+    def _import_words(self) -> None:
+        from audio_to_midi.evidence_cache import checksum
+        from audio_to_midi.vocal_words import annotation_from_analysis
+
+        track = self._vocal_track()
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import vocal word timings", filter="Vocal word analysis (*.json)",
+        )
+        if not path:
+            return
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(data, dict) or not isinstance(data.get("analyses"), dict):
+            raise ValueError("Choose a word-analysis JSON produced by the lyrics command.")
+        choices = [key for key in ("recognized", "aligned") if key in data["analyses"]]
+        if not choices:
+            raise ValueError("The file contains no recognized or aligned word analysis.")
+        analysis = choices[0]
+        if len(choices) > 1:
+            label, ok = QInputDialog.getItem(
+                self, "Word analysis", "Detected words or supplied-lyrics alignment?",
+                ["Detected words", "Supplied lyrics (alignment only)"], 0, False,
+            )
+            if not ok:
+                return
+            analysis = "recognized" if label == "Detected words" else "aligned"
+        audio, duration = Path(track.audio_path), track.duration
+        accept = self._word_publisher(track)
+        self._cancel(analysis_only=True)
+        self._run(
+            lambda cancelled: annotation_from_analysis(data, analysis, checksum(audio), duration),
+            accept, kind="lyrics", message="Checking vocal word analysis against this stem...",
+        )
+
     def _separate(self, then_detect_chords: bool = False) -> None:
         if not self.project.mix_path:
             raise ValueError("Import a mix first.")
@@ -2346,6 +2663,81 @@ class ProjectWindow(QMainWindow):
                   message=f"Detecting chords ({CHORD_MODELS[model]})...")
 
     # -- playback -----------------------------------------------------------
+    def _playback_path(self) -> str:
+        track = self.active
+        path = self.project.mix_path if self.view in (MIX, CHORDS) else (track.audio_path if track else None)
+        if not path:
+            raise ValueError("Import a mix or choose a track.")
+        return path
+
+    def _set_play_cursor(self, seconds: float, *, follow: bool = False) -> None:
+        self.play_cursor = max(0.0, seconds)
+        self.timeline.playhead = self.chord_view.playhead = self.play_cursor
+        beat = self.project.grid.seconds_to_beat(self.play_cursor)
+        if follow and not self.timeline.start <= beat < self.timeline.end:
+            self._cancel(analysis_only=True)
+            self._set_window((beat // self.project.grid.bar_beats) * self.project.grid.bar_beats)
+            self._load_envelope()
+            self._refresh()
+            self._queue_visible()
+        self.timeline.update()
+        self.chord_view.update()
+
+    def _seek_cursor(self, seconds: float) -> None:
+        if self.tapping:
+            raise ValueError("Finish downbeat tapping before repositioning the play cursor.")
+        duration = sf.info(self._playback_path()).duration
+        self._stop()
+        self._set_play_cursor(min(duration, max(0.0, seconds)))
+
+    def _stop_scrub_repeat(self) -> None:
+        self.scrub_repeat.stop()
+        self._scrub_direction = None
+
+    def _begin_scrub(self, direction: int) -> None:
+        self._stop_scrub_repeat()
+        if self._scrub(direction):
+            self._scrub_direction = direction
+            self.scrub_repeat.start()
+
+    def _repeat_scrub(self) -> None:
+        direction = self._scrub_direction
+        self._stop_scrub_repeat()
+        if direction is not None:
+            self._begin_scrub(direction)
+
+    def _scrub(self, direction: int) -> bool:
+        if self.tapping:
+            raise ValueError("Finish downbeat tapping before scrubbing.")
+        path = self._playback_path()
+        if self._clock is not None:
+            self._stop()
+        hop = HOP_LENGTH / SAMPLE_RATE
+        with sf.SoundFile(path) as audio:
+            rate = audio.samplerate
+            duration = len(audio) / rate
+            if not len(audio):
+                raise ValueError("No audio to scrub.")
+            current = min(duration, max(0.0, self.play_cursor))
+            target = min(duration, max(0.0, current + direction * hop))
+            if target == current:
+                self.status.setText("Start of audio." if direction < 0 else "End of audio.")
+                return False
+            first = max(0, round((target - SCRUB_WINDOW_SECONDS) * rate))
+            last = round(target * rate)
+            if last <= first:
+                self._set_play_cursor(target, follow=True)
+                self.status.setText("Start of audio.")
+                return False
+            audio.seek(first)
+            segment = audio.read(last - first, dtype="float32", always_2d=True).mean(axis=1)
+        if not len(segment):
+            raise ValueError("No audio in this scrub window.")
+        self._player().play_scrub(scrub_audio(segment, rate), rate)
+        self._set_play_cursor(target, follow=True)
+        self.status.setText(f"Scrub: {target:.4f} s; 80 ms before cursor at 100% speed.")
+        return True
+
     def _player(self):
         if self.preview is None:
             from audio_to_midi.preview import Preview
@@ -2383,15 +2775,15 @@ class ProjectWindow(QMainWindow):
             self._play(now)
 
     def _play(self, start_seconds: float | None = None, audition=None) -> None:
-        """Play from the window start (or `start_seconds`); `audition` plays just that note's span."""
+        """Play from the cursor (or `start_seconds`); auditions leave the cursor in place."""
         view, track = self.view, self.active
-        path = self.project.mix_path if view in (MIX, CHORDS) else (track.audio_path if track else None)
-        if not path:
-            raise ValueError("Import a mix or choose a track.")
+        path = self._playback_path()
         grid = self.project.grid
         if audition is not None:
             start_seconds = grid.beat_to_seconds(audition.start)
-        a = max(0.0, grid.beat_to_seconds(self.timeline.start) if start_seconds is None else start_seconds)
+        if start_seconds is None:
+            start_seconds = grid.beat_to_seconds(self.timeline.start) if self.tapping else self.play_cursor
+        a = max(0.0, start_seconds)
         with sf.SoundFile(path) as audio:
             rate = audio.samplerate
             audio.seek(min(len(audio), round(a * rate)))
@@ -2405,6 +2797,8 @@ class ProjectWindow(QMainWindow):
         b = a + len(segment) / rate
         speed = 1.0 if self.tapping else self.playback_speed
         self._stop()
+        if audition is None:
+            self._set_play_cursor(a, follow=True)
         segment = stretch_audio(segment, speed)
         clicks = audition is None and self.actions["metronome"].isChecked()
         extra = self._clicks(a, b, len(segment), rate, speed) if clicks else np.zeros_like(segment)
@@ -2464,21 +2858,15 @@ class ProjectWindow(QMainWindow):
         if now is None:
             self._clear_playhead()
             return
-        self.timeline.playhead = self.chord_view.playhead = now
-        if self.project.grid.seconds_to_beat(now) >= self.timeline.end:
-            self._set_window(self.timeline.end)
-            self._load_envelope()
-            self._refresh()
-        self.timeline.update()
-        self.chord_view.update()
+        self._set_play_cursor(now, follow=True)
 
     def _clear_playhead(self) -> None:
+        if self._clock is not None:
+            now = self._now()
+            self._set_play_cursor(self._clock[2] if now is None else now)
         self._clock = None
         self.clock.stop()
         self.rebalance.stop()
-        self.timeline.playhead = self.chord_view.playhead = None
-        self.timeline.update()
-        self.chord_view.update()
 
     def _play_toggle(self) -> None:
         if self._clock is not None:
@@ -2487,6 +2875,7 @@ class ProjectWindow(QMainWindow):
             self._play()
 
     def _stop(self) -> None:
+        self._stop_scrub_repeat()
         if self.preview:
             self.preview.stop()
         self._clear_playhead()

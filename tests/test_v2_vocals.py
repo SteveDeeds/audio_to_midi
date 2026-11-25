@@ -169,6 +169,46 @@ def test_pitch_batches_keep_context_inside_visible_crop():
     assert np.all(np.diff(times) > 0) and 0 <= times[0] < times[-1] < 3
 
 
+@pytest.mark.parametrize("model", ["madmom_cnn_fcpe", "madmom_brnn_fcpe"])
+def test_fcpe_keeps_unvoiced_frames_and_crop_boundaries(model):
+    torch = pytest.importorskip("torch")
+    from types import SimpleNamespace
+    import sys
+
+    calls = []
+
+    def infer(samples, **options):
+        calls.append((samples.shape, options))
+        f0 = torch.full((1, options["output_interp_target_length"], 1), 220.0)
+        f0[:, :10] = 0
+        return f0
+
+    provider = VocalTranscriber(np.ones(22050 * 3, dtype=np.float32), 22050, model, "")
+    fake = SimpleNamespace(spawn_bundled_infer_model=lambda **kwargs: SimpleNamespace(infer=infer))
+    with patch.dict(sys.modules, {"torchfcpe": fake}):
+        times, pitches = provider._pitch(provider.audio, lambda: False)
+    assert len(calls) == 2 and calls[0][0] == (1, 22050 * 2 + 5512, 1)
+    assert len(times) == len(pitches) == 300
+    assert np.all(np.diff(times) > 0) and times[0] == 0 and times[-1] < 3
+    assert np.isnan(pitches[:10]).all()
+    assert np.nanmedian(pitches) == pytest.approx(57)
+    assert all(not options["interp_uv"] for _, options in calls)
+
+
+def test_fcpe_cancellation_stops_before_loading_model():
+    pytest.importorskip("torch")
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import sys
+
+    load = Mock()
+    provider = VocalTranscriber(np.ones(22050, dtype=np.float32), 22050, "madmom_cnn_fcpe", "")
+    with patch.dict(sys.modules, {"torchfcpe": SimpleNamespace(spawn_bundled_infer_model=load)}):
+        with pytest.raises(Cancelled):
+            provider._pitch(provider.audio, lambda: True)
+    load.assert_not_called()
+
+
 def test_cancelling_after_first_pitch_batch_does_not_cache_partial_results():
     pytest.importorskip("torch")
     provider = VocalTranscriber(np.ones(22050 * 3), 22050, "madmom_cnn", "")

@@ -4,7 +4,8 @@ One part per transcribed track on the conventional staff for its role (bass and
 guitar written an octave up, piano on a grand staff, drums on a percussion staff
 with kit noteheads). Rhythm uses explicit export quantization, ties and beams;
 originally touching single-line notes get slurs; chord symbols ride on the top
-pitched part; one opening average tempo keeps the notation and playback steady.
+pitched part; vocal lyrics follow their source notes; one opening average tempo
+keeps the notation and playback steady.
 Only the exported copy is tidied: project notes are never changed.
 """
 
@@ -25,6 +26,7 @@ import zipfile
 
 from audio_to_midi.chords import MUSICXML_KINDS, parse
 from audio_to_midi.notation import key_fifths, spelling
+from audio_to_midi.vocal_words import note_key, note_words
 
 Q = Fraction
 
@@ -105,7 +107,6 @@ _DUPLE = sorted(
     [(v * Q(3, 2) if dots else v, name, dots, v / 2 if dots else v) for v, name in _TYPES for dots in (0, 1)],
     key=lambda value: value[0], reverse=True,
 )
-_VALUE = {length: (name, dots) for length, name, dots, _ in _DUPLE}
 # Triplet values (3 in the time of 2 eighths) by sounding length.
 _TRIPLET = ((Q(2, 3), "quarter", 0, Q(1, 3)), (Q(1, 3), "eighth", 0, Q(1, 3)), (Q(1, 6), "16th", 0, Q(1, 6)))
 QUANTIZATIONS = (
@@ -191,6 +192,7 @@ class _Part:
     drums: list = field(default_factory=list)
     slur_starts: set = field(default_factory=set)
     slur_stops: set = field(default_factory=set)
+    lyrics: dict[int, str] = field(default_factory=dict)
 
 
 def _snap(value: Fraction, step: Fraction) -> Fraction:
@@ -207,14 +209,6 @@ def _regularize(notes: list[_Note], meter: _Meter, ends: bool = True) -> list[_N
             end = start + meter.step
         out.append(_Note(start, end, note.pitch, note.key))
     return out
-
-
-def _close_short_gaps(notes: list[_Note], step: Fraction) -> None:
-    starts = sorted({n.start for n in notes})
-    for note in notes:
-        i = bisect_right(starts, note.start)
-        if i < len(starts) and 0 < starts[i] - note.end < step:
-            note.end = starts[i]
 
 
 def _trim(notes: list[_Note], mono: bool) -> list[_Note]:
@@ -309,11 +303,9 @@ def _values(p: Fraction, end: Fraction, bar_start: Fraction, meter: _Meter, trip
     while p < end:
         beat_start = bar_start + math.floor((p - bar_start) / unit) * unit
         if p == beat_start and end - p >= unit:
-            for count in range(int((end - p) // unit), 0, -1):
-                length = count * unit
-                if length not in _VALUE:
+            for length, name, dots, _ in _DUPLE:
+                if length < unit or length > end - p or length % unit:
                     continue
-                name, dots = _VALUE[length]
                 if rest and ((p - bar_start) % length or (dots and length != unit)):
                     continue
                 out.append((p, length, name, dots, False))
@@ -367,6 +359,41 @@ def _notate(spans: list[_Span], meter: _Meter, bars: int) -> list[list[_Piece]]:
         tied = {p for p, key in a.keys.items() if b.keys.get(p) == key}
         a.tie_start |= tied
         b.tie_stop |= tied
+    return out
+
+
+def _absorb_rests(spans: list[_Span], meter: _Meter) -> list[_Span]:
+    """Absorb short rests only when they complete a clean undotted note value."""
+    if meter.triplets:
+        return spans
+    out = []
+    for span in spans:
+        if not span.keys and out and out[-1].keys:
+            previous = out[-1]
+            while span.start < span.end:
+                bar_start = (math.ceil(previous.end / meter.bar) - 1) * meter.bar
+                stop = min(span.end, bar_start + meter.bar)
+                if span.start >= stop:
+                    break
+                rest = _values(span.start, stop, bar_start, meter, set(), True)[0]
+                if rest[1] >= 1:
+                    break
+                tail = _values(max(previous.start, bar_start), previous.end, bar_start, meter, set(), False)[-1]
+                limit = span.start + rest[1]
+                selected = None
+                for length, _ in _TYPES:
+                    end = tail[0] + length
+                    if not previous.end < end <= limit:
+                        continue
+                    values = _values(tail[0], end, bar_start, meter, set(), False)
+                    if len(values) == 1 and not values[0][3]:
+                        selected = end
+                        break
+                if selected is None:
+                    break
+                previous.end = span.start = selected
+        if span.start < span.end:
+            out.append(span)
     return out
 
 
@@ -428,7 +455,6 @@ def _build_parts(sources, meter: _Meter) -> list[_Part]:
             if role != "piano" and single_line:
                 part.slur_starts, part.slur_stops = _slurs(raw)
             trimmed = _trim(raw, mono)
-            _close_short_gaps(trimmed, meter.step)
             cleaned = _trim(_regularize(trimmed, meter), mono)
             if role == "piano":
                 part.voices = [
@@ -611,6 +637,10 @@ def _notes(measure, piece: _Piece, part: _Part, voice: _Voice, divisions: int, n
             element = _sub(note, "notations")
             for tag, attributes in notations:
                 _sub(element, tag, **attributes)
+        if not stop and (text := part.lyrics.get(piece.keys[pitch])):
+            lyric = _sub(note, "lyric", number=1, placement="below")
+            _sub(lyric, "syllabic", "single")
+            _sub(lyric, "text", text)
 
 
 def score_xml(
@@ -625,6 +655,13 @@ def score_xml(
     if not sources:
         raise ValueError("There are no transcribed notes to export.")
     parts = _build_parts(sources, meter)
+    for part, (track, notes) in zip(parts, sources):
+        if part.role == "vocals":
+            labels = note_words(notes, grid, track.settings.get("vocal_words"))
+            part.lyrics = {
+                i: labels[note_key(note)]
+                for i, note in enumerate(notes) if note_key(note) in labels
+            }
     chords = sorted(project.chords, key=lambda c: c.start) if include_chords else []
     last = max([n.end for p in parts for v in p.voices for n in v.notes] + [c.end for c in chords] + [meter.bar])
     bars = math.ceil(last / meter.bar)
@@ -634,6 +671,8 @@ def score_xml(
     for part in parts:
         for i, voice in enumerate(part.voices):
             spans = _chordify(voice.notes, total)
+            if part.role != "drums":
+                spans = _absorb_rests(spans, meter)
             if part is host and i == 0:
                 spans = _cut_rests(spans, chord_beats)
             voice.bars = _notate(spans, meter, bars)

@@ -20,6 +20,8 @@ RELEASE_SECONDS = 0.03
 HEADROOM = 0.95
 MIDI_PAN_LEFT = 16
 PLAYBACK_SPEEDS = (1.0, 0.9, 0.75, 0.5)
+SCRUB_WINDOW_SECONDS = 0.08
+SCRUB_FADE_SECONDS = 0.003
 
 
 def stretch_audio(audio: np.ndarray, speed: float) -> np.ndarray:
@@ -195,6 +197,17 @@ def midi_schedule(notes, latency_seconds: float) -> list[tuple[float, str, int, 
     return sorted(((max(0.0, t), kind, p, v) for t, kind, p, v in events), key=lambda e: (e[0], order[e[1]]))
 
 
+def scrub_audio(audio: np.ndarray, sample_rate: int) -> np.ndarray:
+    """Center source audio and fade grain boundaries to avoid abrupt cuts."""
+    stereo = mix(audio).astype(np.float32)
+    fade = min(round(SCRUB_FADE_SECONDS * sample_rate), len(stereo) // 2)
+    if fade:
+        ramp = np.linspace(0, 1, fade, dtype=np.float32)[:, None]
+        stereo[:fade] *= ramp
+        stereo[-fade:] *= ramp[::-1]
+    return np.rint(stereo).astype(np.int16)
+
+
 def midi_outputs() -> list[str]:
     import pygame.midi
 
@@ -216,6 +229,8 @@ class Preview:
         self._stop_event: threading.Event | None = None
         self._port = None
         self._port_name: str | None = None
+        self._scrub_channel = None
+        self._scrub_rate: int | None = None
 
     def _sound(self, stereo: np.ndarray, sample_rate: int):
         import pygame.mixer
@@ -232,6 +247,17 @@ class Preview:
     def play_audio(self, stereo: np.ndarray, sample_rate: int) -> None:
         self.stop()
         self._sound(stereo, sample_rate).play()
+
+    def play_scrub(self, stereo: np.ndarray, sample_rate: int) -> None:
+        if self._scrub_channel is None or self._scrub_rate != sample_rate:
+            self.stop()
+            channel = self._sound(stereo, sample_rate).play()
+            if channel is None:
+                raise RuntimeError("No audio playback channel is available for scrubbing.")
+            self._scrub_channel, self._scrub_rate = channel, sample_rate
+        else:
+            # queue replaces the one pending grain, so fast jogging cannot build up stale audio.
+            self._scrub_channel.queue(self._sound(stereo, sample_rate))
 
     def play_with_midi(self, stereo: np.ndarray, sample_rate: int, notes, device: str,
                        channel: int, latency_seconds: float, volume: int = 127) -> None:
@@ -291,6 +317,7 @@ class Preview:
                 port.note_off(pitch, 0, channel)
 
     def stop(self) -> None:
+        self._scrub_channel, self._scrub_rate = None, None
         if self._stop_event is not None:
             self._stop_event.set()
         if self._thread is not None:

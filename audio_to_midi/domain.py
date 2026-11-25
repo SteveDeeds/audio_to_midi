@@ -65,6 +65,7 @@ class Note:
     velocity: int = 100
     source: str = "generated"
     confidence: float | None = None
+    lyric: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.id, "note id")
@@ -72,6 +73,8 @@ class Note:
         _integer(self.pitch, "pitch", 0, 127)
         _integer(self.velocity, "velocity", 1, 127)
         _text(self.source, "source")
+        if self.lyric is not None:
+            _text(self.lyric, "note lyric", empty=True)
         if self.confidence is not None:
             finite_number(self.confidence, "note confidence")
             if not 0 <= self.confidence <= 1:
@@ -85,7 +88,7 @@ def _cut(note: Note, start: Fraction, end: Fraction) -> list[Note]:
     if note.start < start:
         parts.append(replace(note, end=start))
     if end < note.end:
-        parts.append(replace(note, start=end))
+        parts.append(replace(note, start=end, lyric="" if parts and note.lyric is not None else note.lyric))
     return parts
 
 
@@ -227,10 +230,12 @@ class NoteStore:
         self.authored.append(note)
         self.authored = _ordered(self.authored)
 
-    def author(self, start: Fraction, end: Fraction, pitch: int, velocity: int = 100) -> Note:
-        note = Note(uuid4().hex, start, end, pitch, velocity, "authored")
+    def author(self, start: Fraction, end: Fraction, pitch: int, velocity: int = 100,
+               lyric: str | None = None) -> Note:
+        note = Note(uuid4().hex, start, end, pitch, velocity, "authored", lyric=lyric)
         for existing in self.authored:
-            if (existing.start, existing.end, existing.pitch, existing.velocity) == (start, end, pitch, velocity):
+            if (existing.start, existing.end, existing.pitch, existing.velocity, existing.lyric) == (
+                    start, end, pitch, velocity, lyric):
                 return existing
         before = self._snapshot()
         self._put_authored(note)
@@ -379,6 +384,12 @@ class Track:
         input_source(self)
         if "vocal_parameters" in self.settings:
             VocalParameters.from_dict(self.settings["vocal_parameters"])
+        if "vocal_words" in self.settings:
+            from .vocal_words import validate_words
+
+            if self.role != "vocals":
+                raise ValueError("Vocal words belong on a vocals track.")
+            validate_words(self.settings["vocal_words"], self.duration)
         if "madmom_license_acknowledged" in self.settings and type(self.settings["madmom_license_acknowledged"]) is not bool:
             raise ValueError("MADMoM license acknowledgement must be true or false")
         if any(type(example) is not dict for example in self.training):

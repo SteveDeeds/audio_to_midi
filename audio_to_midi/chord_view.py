@@ -5,8 +5,8 @@ from __future__ import annotations
 from fractions import Fraction
 
 import numpy as np
-from PySide6.QtCore import QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QImage, QPainter, QPen
+from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtGui import QColor, QImage, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import QInputDialog, QMenu, QWidget
 
 from audio_to_midi import chords as chord_logic
@@ -21,6 +21,7 @@ class ChordView(QWidget):
 
     changed = Signal(object)
     selected_changed = Signal(object)
+    cursor_requested = Signal(float)
 
     LABELS = 44
     HEADER = 18
@@ -206,9 +207,15 @@ class ChordView(QWidget):
                 painter.setPen(QPen(QColor("#ffffff" if root else "#9ff0c0"), 2 if root else 1))
                 painter.drawRect(QRectF(left + 1, top + 1, max(2.0, right - left - 2), row - 2))
         if self.playhead is not None:
-            x = self._seconds_x(self.playhead)
-            painter.setPen(QPen(QColor("#ff5c5c"), 2))
-            painter.drawLine(round(x), self.HEADER, round(x), height)
+            x = round(self._seconds_x(self.playhead))
+            if self.LABELS <= x <= width:
+                color = QColor("#4ade80")
+                painter.setPen(QPen(color, 2))
+                painter.drawLine(x, self.HEADER, x, height)
+                painter.setBrush(color)
+                painter.drawPolygon(QPolygonF([
+                    QPointF(x, self.HEADER), QPointF(x - 6, self.HEADER + 9), QPointF(x + 6, self.HEADER + 9),
+                ]))
 
     # Interaction ----------------------------------------------------------
     def _pitch_class(self, y: float) -> int | None:
@@ -234,6 +241,9 @@ class ChordView(QWidget):
             return
         x, y = event.position().x(), event.position().y()
         if x < self.LABELS:
+            return
+        if event.button() == Qt.MouseButton.LeftButton and self.HEADER <= y < self.HEADER + 16:
+            self.cursor_requested.emit(self.project.grid.beat_to_seconds(self._beat(x)))
             return
         boundary = self._boundary(x, y)
         if event.button() == Qt.MouseButton.LeftButton and boundary is not None:

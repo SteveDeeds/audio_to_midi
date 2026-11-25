@@ -39,13 +39,16 @@ class EvidenceTests(unittest.TestCase):
     def valid(self, arrays):
         self.assertEqual(arrays["activation"].shape, (3, 2))
 
-    def test_exact_rankings_no_mrmt3_and_vocals_unchanged(self):
+    def test_exact_rankings_no_mrmt3_and_vocal_defaults_preserved(self):
         self.assertEqual(MODELS["bass"], ("madmom_cnn_full", "piano_hr", "madmom_brnn_full"))
         self.assertEqual(MODELS["guitar"], ("basic_pitch", "yourmt3", "madmom_cnn_full"))
         self.assertEqual(MODELS["piano"], ("piano_hr", "yourmt3", "basic_pitch"))
         self.assertEqual(MODELS["drums"], ("adtof", "yourmt3"))
         self.assertEqual(MODELS["other"], ("basic_pitch", "yourmt3", "piano_hr"))
-        self.assertEqual(MODELS["vocals"], ("pyin", "crepe_full", "crepe_tiny", "madmom_cnn", "madmom_brnn"))
+        self.assertEqual(MODELS["vocals"], (
+            "pyin", "crepe_full", "crepe_tiny", "madmom_cnn", "madmom_brnn",
+            "madmom_cnn_fcpe", "madmom_brnn_fcpe",
+        ))
         self.assertFalse(any("mr_mt3" in choices for choices in MODELS.values()))
 
     def test_cached_basic_pitch_preserves_note_confidence_for_slider(self):
@@ -439,6 +442,7 @@ class EvidenceTests(unittest.TestCase):
             for kind in ("generated", "authored"):
                 for note in track["notes"][kind]:
                     note.pop("confidence")
+                    note.pop("lyric")
         path.write_text(json.dumps(older))
         self.assertEqual(load_project(path.parent), project)
         path.write_text(json.dumps({**data, "schema_version": 2}))

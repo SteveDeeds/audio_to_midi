@@ -1,4 +1,5 @@
 from copy import deepcopy
+from dataclasses import replace
 from fractions import Fraction as F
 from pathlib import Path
 import tempfile
@@ -171,6 +172,79 @@ class MusicXMLTests(unittest.TestCase):
         project.tracks.append(track)
         return project
 
+    def test_timed_lyrics_match_before_quantization_and_do_not_repeat_on_ties(self):
+        project = self.vocal_project([
+            (F(1, 8), F(5), 60), (F(5), F(6), 62),
+        ], Grid(anchors=((0.5, F(0)), (2.5, F(4)), (3.5, F(8)))))
+        project.tracks[0].settings["vocal_words"] = dict(
+            mode="automatic_recognition", model="base.en", audio_sha256="a" * 64,
+            words=[
+                dict(word=" Amazing & grace ", start=0.563, end=0.61),
+                dict(word="how", start=2.8, end=2.85),
+                dict(word="sweet", start=2.85, end=2.9),
+                dict(word="unaligned", start=3.0, end=3.0),
+                dict(word="unmatched", start=3.6, end=3.8),
+            ],
+        )
+        before = deepcopy(project)
+        root = ET.fromstring(score_xml(project))
+        sounding = root.findall(".//note[pitch]")
+        self.assertEqual(sounding[0].findtext("lyric/text"), "Amazing & grace")
+        self.assertEqual(sounding[0].findtext("lyric/syllabic"), "single")
+        self.assertEqual(root.findtext(".//divisions"), "4")
+        self.assertEqual(root.findtext("part/measure/note[rest]/duration"), "1")
+        self.assertTrue(root.findall(".//tie"))
+        self.assertEqual(
+            [n.findtext("lyric/text") for n in sounding if n.find("lyric") is not None],
+            ["Amazing & grace", "how sweet"],
+        )
+        for note in sounding:
+            if note.find("tie[@type='stop']") is not None:
+                self.assertIsNone(note.find("lyric"))
+        self.assertFalse(root.findall(".//note[rest]/lyric"))
+        self.assertEqual(project, before)
+
+    def test_edited_and_cleared_lyrics_override_detected_words(self):
+        project = self.vocal_project([
+            (F(0), F(1), 60), (F(1), F(2), 62), (F(2), F(3), 64),
+        ])
+        track = project.tracks[0]
+        track.notes.authored = [
+            replace(note, lyric=lyric)
+            for note, lyric in zip(track.notes.authored, ("Corrected", "", None))
+        ]
+        track.settings["vocal_words"] = dict(
+            mode="known_lyrics_alignment", model="base.en", audio_sha256="a" * 64,
+            words=[
+                dict(word=text, start=start, end=start + 0.4)
+                for text, start in (("wrong", 0.0), ("hidden", 0.5), ("kept", 1.0))
+            ],
+        )
+        root = ET.fromstring(score_xml(project))
+        self.assertEqual(
+            [n.findtext("lyric/text") for n in root.findall(".//note[pitch]")],
+            ["Corrected", None, "kept"],
+        )
+
+    def test_compressed_export_keeps_lyrics_on_the_selected_vocal_part(self):
+        project = self.project()
+        project.tracks[0].notes.author(F(8), F(9), 64, lyric="First voice")
+        second = Track("voice2", "vocals", "", 4, 8000, "")
+        second.notes.author(F(0), F(5), 67, lyric="Second voice")
+        project.tracks.append(second)
+        project.tracks[1].notes.author(F(8), F(9), 40, lyric="Not vocal")
+        root = ET.fromstring(score_xml(project))
+        self.assertEqual(
+            [p.findtext(".//lyric/text") for p in root.findall("part")],
+            ["First voice", "Second voice", None, None],
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "lyrics.mxl"
+            export_musicxml(project, path, [second], include_chords=False)
+            with zipfile.ZipFile(path) as archive:
+                root = ET.fromstring(archive.read("score.musicxml"))
+        self.assertEqual([e.text for e in root.findall(".//lyric/text")], ["Second voice"])
+
     def test_half_grid_releases_do_not_turn_straight_onsets_into_triplets(self):
         project = self.vocal_project([
             (F(2), F(19, 8), 60),
@@ -203,7 +277,7 @@ class MusicXMLTests(unittest.TestCase):
                     root = ET.fromstring(score_xml(project))
                     self.assertEqual(len(root.findall(".//slur")), 2 if gap == 0 else 0)
                     rests = root.findall(".//note[rest]")
-                    self.assertEqual(len(rests), 2 if gap == F(1, 4) else 1)
+                    self.assertEqual(len(rests), 1)
                     self.assertFalse(root.findall(".//tie"))
 
     def test_short_gap_across_barline_is_articulated_not_slurred(self):
@@ -229,7 +303,7 @@ class MusicXMLTests(unittest.TestCase):
         )
         self.assertFalse(root.findall(".//slur"))
 
-    def test_selected_quantization_controls_gap_threshold_and_compressed_export(self):
+    def test_clean_beat_absorption_is_independent_of_export_quantization(self):
         project = self.vocal_project([
             (F(0), F(3, 8), 60), (F(1, 2), F(1), 62),
         ])
@@ -238,8 +312,175 @@ class MusicXMLTests(unittest.TestCase):
             export_musicxml(project, path, quantization=F(1, 8))
             with zipfile.ZipFile(path) as archive:
                 root = ET.fromstring(archive.read("score.musicxml"))
-        self.assertEqual(root.findtext(".//note[rest]/type"), "32nd")
+        self.assertEqual(
+            [n.findtext("type") for n in root.findall(".//note[pitch]")],
+            ["eighth", "eighth"],
+        )
+        self.assertFalse(root.findall(".//note[rest][type='32nd']"))
         self.assertFalse(root.findall(".//slur"))
+
+    def test_short_rests_complete_clean_note_values_without_moving_attacks(self):
+        cases = [
+            (F(0), F(1, 4), F(1), "quarter"),
+            (F(0), F(1, 2), F(1), "quarter"),
+            (F(0), F(3, 4), F(1), "quarter"),
+            (F(0), F(3, 2), F(2), "half"),
+            (F(0), F(13, 4), F(4), "whole"),
+            (F(1, 2), F(3, 4), F(1), "eighth"),
+            (F(3, 4), F(7, 8), F(1), "16th"),
+        ]
+        for role in ("vocals", "other", "guitar", "bass", "piano"):
+            for start, end, following, expected_type in cases:
+                with self.subTest(role=role, start=start, end=end, following=following):
+                    project = self.vocal_project([
+                        (start, end, 64), (following, following + 1, 67),
+                    ])
+                    project.tracks[0].role = role
+                    before = deepcopy(project)
+                    root = ET.fromstring(score_xml(project, quantization=F(1, 8)))
+                    pitched = root.findall(".//note[pitch]")
+                    self.assertEqual(pitched[0].findtext("type"), expected_type)
+                    self.assertIsNone(pitched[0].find("dot"))
+                    self.assertFalse(root.findall(".//tie"))
+                    divisions = int(root.findtext(".//divisions"))
+                    attacks = []
+                    for bar, measure in enumerate(root.findall("part/measure")):
+                        cursor = bar * project.grid.bar_beats
+                        for element in measure:
+                            if element.tag == "backup":
+                                cursor -= F(int(element.findtext("duration")), divisions)
+                            elif element.tag == "note":
+                                if element.find("pitch") is not None:
+                                    attacks.append(cursor)
+                                if element.find("chord") is None:
+                                    cursor += F(int(element.findtext("duration")), divisions)
+                    self.assertEqual(attacks, [start, following])
+                    self.assertEqual(project, before)
+
+    def test_quarter_note_rests_remain_and_required_dots_are_not_removed(self):
+        for gap in (F(1), F(3, 2), F(2)):
+            for step in (F(1), F(1, 4), F(1, 8)):
+                with self.subTest(gap=gap, step=step):
+                    project = self.vocal_project([
+                        (F(0), F(1), 60), (F(1) + gap, F(2) + gap, 62),
+                    ])
+                    root = ET.fromstring(score_xml(project, quantization=step))
+                    divisions = int(root.findtext(".//divisions"))
+                    first = root.find(".//note[pitch]")
+                    self.assertEqual(F(int(first.findtext("duration")), divisions), F(1))
+        project = self.vocal_project([
+            (F(0), F(3, 4), 60), (F(3, 4), F(1), 62),
+        ])
+        root = ET.fromstring(score_xml(project))
+        self.assertIsNotNone(root.find(".//note[pitch]/dot"))
+
+    def test_short_rest_is_absorbed_even_when_followed_by_a_quarter_rest(self):
+        for end, following, expected_type, remaining in (
+            (F(1, 2), F(2), "quarter", F(1)),
+            (F(1, 4), F(2), "quarter", F(1)),
+            (F(3, 2), F(3), "half", F(1)),
+        ):
+            with self.subTest(end=end, following=following):
+                project = self.vocal_project([
+                    (F(0), end, 60), (following, following + 1, 62),
+                ])
+                project.tracks[0].role = "other"
+                before = deepcopy(project)
+                root = ET.fromstring(score_xml(project))
+                notes = root.findall("part/measure/note")
+                self.assertEqual(notes[0].findtext("type"), expected_type)
+                self.assertIsNone(notes[0].find("dot"))
+                self.assertIsNotNone(notes[1].find("rest"))
+                divisions = int(root.findtext(".//divisions"))
+                self.assertEqual(F(int(notes[1].findtext("duration")), divisions), remaining)
+                self.assertEqual(
+                    sum(F(int(n.findtext("duration")), divisions) for n in notes[:2]),
+                    following,
+                )
+                self.assertEqual(project, before)
+
+    def test_last_note_completes_beat_without_absorbing_the_trailing_phrase_rest(self):
+        project = self.vocal_project([(F(0), F(1, 2), 60)])
+        root = ET.fromstring(score_xml(project))
+        first = root.find(".//note[pitch]")
+        self.assertEqual(first.findtext("type"), "quarter")
+        divisions = int(root.findtext(".//divisions"))
+        self.assertEqual(
+            sum(F(int(n.findtext("duration")), divisions) for n in root.findall(".//note[rest]")),
+            F(3),
+        )
+
+    def test_clean_blocks_keep_eighth_rest_instead_of_creating_dotted_quarter(self):
+        for end in (F(1, 4), F(1, 2), F(1)):
+            with self.subTest(end=end):
+                project = self.vocal_project([
+                    (F(0), end, 64), (F(3, 2), F(2), 64),
+                    (F(2), F(3), 67),
+                ])
+                project.tracks[0].role = "other"
+                before = deepcopy(project)
+                root = ET.fromstring(score_xml(project))
+                notes = root.findall("part/measure/note")
+                self.assertEqual(
+                    [n.findtext("type") for n in notes[:3]],
+                    ["quarter", "eighth", "eighth"],
+                )
+                self.assertFalse(root.findall(".//note/dot"))
+                divisions = int(root.findtext(".//divisions"))
+                self.assertEqual(
+                    [F(int(n.findtext("duration")), divisions) for n in notes[:3]],
+                    [F(1), F(1, 2), F(1, 2)],
+                )
+                self.assertIsNotNone(notes[1].find("rest"))
+                self.assertIsNotNone(notes[2].find("pitch"))
+                self.assertFalse(root.findall(".//tie"))
+                self.assertEqual(project, before)
+
+    def test_rest_absorption_extends_the_last_segment_of_a_tied_note(self):
+        for start, end, following, bar, expected_rests in (
+            (F(11, 4), F(13, 4), F(4), 0, []),
+            (F(15, 4), F(17, 4), F(6), 1, [F(1)]),
+        ):
+            with self.subTest(start=start, end=end):
+                project = self.vocal_project([
+                    (start, end, 69), (following, following + 1, 71),
+                ])
+                project.tracks[0].role = "other"
+                before = deepcopy(project)
+                root = ET.fromstring(score_xml(project))
+                measure = root.findall("part/measure")[bar]
+                divisions = int(root.findtext(".//divisions"))
+                notes = measure.findall("note")
+                continuation = next(
+                    n for n in notes
+                    if n.find("tie[@type='stop']") is not None
+                )
+                self.assertEqual(continuation.findtext("type"), "quarter")
+                self.assertIsNone(continuation.find("dot"))
+                after = notes[notes.index(continuation) + 1:]
+                next_attack = next((i for i, n in enumerate(after) if n.find("pitch") is not None), len(after))
+                self.assertEqual(
+                    [F(int(n.findtext("duration")), divisions)
+                     for n in after[:next_attack] if n.find("rest") is not None],
+                    expected_rests,
+                )
+                self.assertEqual(len(root.findall(".//tie[@type='start']")), 1)
+                self.assertEqual(len(root.findall(".//tie[@type='stop']")), 1)
+                self.assertEqual(project, before)
+
+    def test_absorbing_rests_does_not_sustain_released_chord_tones(self):
+        project = self.vocal_project([
+            (F(0), F(1, 2), 60), (F(0), F(3, 4), 64),
+            (F(1), F(2), 67),
+        ])
+        project.tracks[0].role = "other"
+        root = ET.fromstring(score_xml(project))
+        divisions = int(root.findtext(".//divisions"))
+        durations = {}
+        for note in root.findall(".//note[pitch]"):
+            step = note.findtext("pitch/step")
+            durations[step] = durations.get(step, F(0)) + F(int(note.findtext("duration")), divisions)
+        self.assertEqual(durations, {"C": F(1, 2), "E": F(1), "G": F(1)})
 
     def test_export_grid_applies_to_every_instrument_and_measures_stay_full(self):
         for numerator, denominator in ((4, 4), (3, 4), (6, 8), (7, 8)):

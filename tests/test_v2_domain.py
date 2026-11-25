@@ -101,6 +101,18 @@ class GridTests(unittest.TestCase):
 
 
 class NoteTests(unittest.TestCase):
+    def test_cutting_an_authored_lyric_keeps_text_on_only_the_first_remaining_part(self):
+        store = NoteStore()
+        authored = store.author(F(0), F(4), 60, lyric="once")
+        store.reject(F(1), F(2), None)
+        self.assertEqual([(n.start, n.end, n.lyric) for n in store.resolved()],
+                         [(F(0), F(1), "once"), (F(2), F(4), "")])
+        store.undo()
+        self.assertEqual(store.resolved(), [authored])
+        store.reject(F(0), F(1), None)
+        self.assertEqual([(n.start, n.end, n.lyric) for n in store.resolved()],
+                         [(F(1), F(4), "once")])
+
     def test_confidence_filter_endpoints_thresholds_and_authored_notes(self):
         generated = [
             Note("high", F(0), F(4), 60, confidence=.995),
@@ -446,12 +458,31 @@ class StorageTests(unittest.TestCase):
             for kind in ("generated", "authored"):
                 for value in track["notes"][kind]:
                     value.pop("confidence")
+                    value.pop("lyric")
         self.write_manifest(data)
         loaded = load_project(self.folder)
         self.assertEqual(loaded.tracks[0].notes.detection_level, 100)
         self.assertTrue(all(n.confidence is None for n in loaded.tracks[0].notes.generated))
         save_project(loaded, self.folder)
-        self.assertEqual(self.manifest()["schema_version"], 4)
+        self.assertEqual(self.manifest()["schema_version"], SCHEMA_VERSION)
+
+    def test_lyrics_round_trip_and_schema_four_upgrade(self):
+        from dataclasses import replace
+
+        store = self.project.tracks[0].notes
+        store.authored[0] = replace(store.authored[0], lyric="edited lyric")
+        save_project(self.project, self.folder)
+        self.assertEqual(load_project(self.folder), self.project)
+        data = self.manifest()
+        data["schema_version"] = 4
+        for track in data["tracks"]:
+            for kind in ("generated", "authored"):
+                for value in track["notes"][kind]:
+                    value.pop("lyric")
+        self.write_manifest(data)
+        loaded = load_project(self.folder)
+        self.assertTrue(all(n.lyric is None for n in loaded.tracks[0].notes.resolved()))
+        self.assertEqual(loaded.tracks[0].notes.authored[0].start, store.authored[0].start)
 
     def test_schema_exact_fractions_and_relative_managed_paths(self):
         save_project(self.project, self.folder)
