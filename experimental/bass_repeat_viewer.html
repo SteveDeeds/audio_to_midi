@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bass repeat visualizer</title>
+<style>
+  :root { color-scheme: dark; --seed: #ffce70; --extension: #53d9c8; }
+  body { margin: 24px auto; padding: 0 20px; max-width: 1280px; background: #10131b;
+         color: #eef0f6; font: 16px/1.5 system-ui, sans-serif; }
+  a { color: #a5cbff; }
+  h1, h2, p { margin: 0 0 .65rem; }
+  .muted { color: #b5bdce; }
+  .controls, main { display: grid; gap: 20px; }
+  .controls { grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); margin: 22px 0; }
+  .controls label { display: block; font-weight: bold; }
+  .control { background: #1b2230; padding: 12px 16px; border-radius: 8px; }
+  input[type=range] { width: 100%; margin: 6px 0; }
+  #seed { accent-color: var(--seed); }
+  #extension { accent-color: var(--extension); }
+  output { margin-left: .5em; font-variant-numeric: tabular-nums; }
+  main { grid-template-columns: minmax(0, 3fr) minmax(290px, 2fr); align-items: start; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  canvas { width: 100%; height: auto; display: block; cursor: crosshair; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; }
+  .seed { color: var(--seed); }
+  .extension { color: var(--extension); }
+  #cell { min-height: 1.5em; margin-top: 8px; }
+  #runs { display: grid; gap: 6px; max-height: 460px; overflow: auto; margin: 12px 0; }
+  button { padding: 8px; text-align: left; background: #1b2230; color: inherit;
+           border: 1px solid #49546a; border-radius: 5px; cursor: pointer; }
+  button[aria-pressed=true] { border-color: white; }
+  #details { min-height: 4.5em; }
+  #scores { display: flex; flex-wrap: wrap; gap: 6px; font-size: .85rem; }
+  #scores span { background: #1b2230; border-radius: 4px; padding: 2px 6px; }
+  #cqt-section { margin: 20px 0; }
+  .cqt-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 10px 0; }
+  .cqt-grid { display: grid; grid-template-columns: 2.8rem minmax(0, 1fr); }
+  .octaves { display: grid; grid-template-rows: repeat(3, 1fr); height: 288px; margin-top: 24px; }
+  .octaves span { align-self: end; padding-bottom: 3px; }
+  #cqt-scroll { container-type: inline-size; overflow-x: auto; overflow-y: hidden; }
+  #cqt-track { width: calc(var(--bar-count) * 25cqw); }
+  #cqt-plot { position: sticky; left: 0; width: 100cqw; height: 312px; cursor: default; }
+  #cqt-matches { position: relative; }
+  .cqt-match { position: absolute; box-sizing: border-box; height: 26px; padding: 2px 6px;
+               white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: .85rem; }
+  .cqt-match[aria-pressed=true] { background: #614018; border-color: var(--seed); color: #ffe4af; }
+</style>
+</head>
+<body>
+<p><a href="index.html">Back to stem similarity report</a></p>
+<h1>Bass repeat visualizer</h1>
+<p>Start with a strong bar pair, then follow its diagonal in both directions while adjacent pairs
+  meet the extension threshold. A weak bar breaks the phrase; a run with no starting match is ignored.</p>
+<div class="controls">
+  <div class="control">
+    <label for="seed">Start match <output id="seed-value" for="seed"></output></label>
+    <input id="seed" type="range" min="0" max="1" step="0.001" value="0.95">
+    <div class="muted">How similar must a bar pair be to start a repeat?</div>
+  </div>
+  <div class="control">
+    <label for="extension">Extend match <output id="extension-value" for="extension"></output></label>
+    <input id="extension" type="range" min="0" max="0.95" step="0.001" value="0.85">
+    <div class="muted">How similar must the next (or previous) pair be to keep going?</div>
+  </div>
+  <div class="control">
+    <label for="feature">Bass feature</label>
+    <select id="feature"><option value="cqt">CQT</option><option value="mel">Mel</option></select>
+    <label for="nonoverlap"><input id="nonoverlap" type="checkbox" checked> Hide overlapping ranges</label>
+  </div>
+</div>
+<section id="cqt-section" aria-labelledby="cqt-heading">
+  <h2 id="cqt-heading">Bass CQT overlay</h2>
+  <p class="muted">Scroll the timeline or select a repeat below to jump to it. Click a rectangle under
+    the CQT to add or remove that matching passage for both occurrences.</p>
+  <div class="cqt-controls">
+    <label for="cqt-mode">Display</label>
+    <select id="cqt-mode">
+      <option value="overlay">Overlay</option>
+      <option value="average">Average</option>
+      <option value="median">Median</option>
+      <option value="original">Original only</option>
+    </select>
+    <button id="cqt-prev" type="button" aria-label="Scroll one bar back">&larr; 1 bar</button>
+    <button id="cqt-next" type="button" aria-label="Scroll one bar forward">1 bar &rarr;</button>
+    <span id="cqt-range" class="muted"></span>
+  </div>
+  <div class="cqt-grid">
+    <div class="octaves muted" aria-hidden="true"><span>C3</span><span>C2</span><span>C1</span></div>
+    <div id="cqt-scroll" tabindex="0" aria-label="Scrollable CQT timeline">
+      <div id="cqt-track">
+        <canvas id="cqt-plot" aria-label="Bass CQT from C1 through B3, four bars wide"></canvas>
+        <div id="cqt-matches" aria-label="Toggle matching passages"></div>
+      </div>
+    </div>
+  </div>
+  <p id="cqt-caption" class="muted"></p>
+</section>
+<main>
+  <section aria-label="Bass similarity matrix">
+    <div class="legend">
+      <span class="seed">&#9632; Starting match</span>
+      <span class="extension">&#9632; Extension only</span>
+      <span class="muted">&#9632; Other pairs (brighter = more similar)</span>
+    </div>
+    <canvas id="heatmap" width="680" height="680" aria-label="Bar-by-bar heatmap; all matched runs are available in the list"></canvas>
+    <p id="cell" class="muted">Hover over any cell for its score. Click a colored cell to inspect the phrase.</p>
+  </section>
+  <section aria-labelledby="run-heading">
+    <h2 id="run-heading">Repeat candidates</h2>
+    <p id="summary" class="muted" aria-live="polite"></p>
+    <div id="runs"></div>
+    <div id="details" aria-live="polite"></div>
+    <div id="scores"></div>
+  </section>
+</main>
+<script id="report" type="application/json">__REPORT_DATA__</script>
+<script>
+"use strict";
+const {firstBar, matrices, slicesPerBar, cqt} = JSON.parse(document.getElementById("report").textContent);
+const $ = id => document.getElementById(id);
+const seed = $("seed"), extension = $("extension"), feature = $("feature"), nonoverlap = $("nonoverlap");
+const canvas = $("heatmap"), ctx = canvas.getContext("2d");
+const left = 51, plotTop = 14, size = 614;
+const seedColor = "#ffce70", extensionColor = "#53d9c8";
+const hoverHint = $("cell").textContent;
+let matrix, runs, selected, matches;
+const cqtScroll = $("cqt-scroll"), cqtPlot = $("cqt-plot"), cqtMode = $("cqt-mode");
+const cqtContext = cqtPlot.getContext("2d");
+const cqtBars = cqt.length / slicesPerBar, cqtBins = cqt[0].length;
+const activeRuns = new Set();
+const cqtPower = cqt.map(slice => slice.map(value => Math.expm1(value)));
+const cqtPeak = Math.max(...cqt.map(slice => Math.max(...slice))) || 1;
+const runKey = run => `${run.i}:${run.j}:${run.scores.length}`;
+let sourceBars = [], overlayInitialized = false;
+$("cqt-track").style.setProperty("--bar-count", cqtBars);
+
+function findRuns(matrix, startThreshold, extendThreshold, hideOverlaps) {
+  const found = [];
+  for (let lag = 1; lag < matrix.length; lag++) {
+    let scores = [], i = 0, peak = 0;
+    for (let row = 0; row <= matrix.length - lag; row++) {
+      const score = row === matrix.length - lag ? -1 : matrix[row][row + lag];
+      if (score >= extendThreshold) {
+        if (!scores.length) i = row;
+        scores.push(score);
+        peak = Math.max(peak, score);
+      } else {
+        if (scores.length && peak >= startThreshold && (!hideOverlaps || scores.length <= lag)) {
+          const mean = scores.reduce((sum, score) => sum + score, 0) / scores.length;
+          found.push({i, j: i + lag, scores, mean, peak});
+        }
+        scores = [];
+        peak = 0;
+      }
+    }
+  }
+  return found.sort((a, b) => b.scores.length - a.scores.length || b.mean - a.mean || a.i - b.i || a.j - b.j);
+}
+
+function rebuild() {
+  extension.max = seed.value;
+  $("seed-value").textContent = Number(seed.value).toFixed(3);
+  $("extension-value").textContent = Number(extension.value).toFixed(3);
+  matrix = matrices[feature.value];
+  const previous = selected;
+  runs = findRuns(matrix, Number(seed.value), Number(extension.value), nonoverlap.checked);
+  matches = new Map();
+  for (const run of runs) {
+    run.scores.forEach((_, k) => matches.set((run.i + k) * matrix.length + run.j + k, run));
+  }
+  selected = previous ? runs.find(run => run.j - run.i === previous.j - previous.i &&
+    run.i < previous.i + previous.scores.length && previous.i < run.i + run.scores.length) : null;
+  selected ??= runs[0];
+  const singles = runs.filter(run => run.scores.length === 1).length;
+  $("summary").textContent = `${runs.length} candidates: ${runs.length - singles} multi-bar, ${singles} single-bar. Longest first.`;
+  $("cell").textContent = hoverHint;
+  $("runs").replaceChildren(...runs.map(run => {
+    const button = document.createElement("button");
+    const count = run.scores.length;
+    button.textContent = `${range(run.i, count)} \u2194 ${range(run.j, count)} | ${count} bar${count === 1 ? "" : "s"} | mean ${run.mean.toFixed(3)}`;
+    button.addEventListener("click", () => select(run, run.i));
+    return button;
+  }));
+  select(selected);
+  const keys = new Set(runs.map(runKey));
+  for (const key of activeRuns) if (!keys.has(key)) activeRuns.delete(key);
+  if (!overlayInitialized && selected) {
+    overlayInitialized = true;
+    activeRuns.add(runKey(selected));
+    scrollCqtTo(selected.i);
+  }
+  buildCqtMatches();
+}
+
+function range(start, count) {
+  const bar = start + firstBar;
+  return count === 1 ? `Bar ${bar}` : `Bars ${bar}\u2013${bar + count - 1}`;
+}
+
+function select(run, jumpBar) {
+  selected = run;
+  Array.from($("runs").children).forEach((button, index) => {
+    button.setAttribute("aria-pressed", String(runs[index] === run));
+  });
+  $("details").textContent = run
+    ? `${range(run.i, run.scores.length)} \u2194 ${range(run.j, run.scores.length)}. Strongest pair: ${run.peak.toFixed(3)}.`
+      + (run.scores.length > run.j - run.i ? " These ranges overlap." : "")
+    : "No candidates at these settings.";
+  $("scores").replaceChildren(...(run?.scores ?? []).map((score, k) => {
+    const label = document.createElement("span");
+    label.className = score >= Number(seed.value) ? "seed" : "extension";
+    label.textContent = `${firstBar + run.i + k} \u2194 ${firstBar + run.j + k}: ${score.toFixed(3)}`;
+    return label;
+  }));
+  draw();
+  if (jumpBar !== undefined) scrollCqtTo(jumpBar);
+}
+
+function scrollCqtTo(bar) {
+  cqtScroll.scrollLeft = bar * cqtScroll.clientWidth / 4;
+  drawCqt();
+}
+
+function combinedCqt(values, mode) {
+  if (mode === "average" || values.length <= 2) {
+    return values.reduce((sum, value) => sum + value, 0) / values.length;
+  }
+  values.sort((a, b) => a - b);
+  const middle = Math.floor(values.length / 2);
+  return values.length % 2 ? values[middle] : (values[middle - 1] + values[middle]) / 2;
+}
+
+function updateCqtSources() {
+  sourceBars = Array.from({length: cqtBars}, (_, bar) => new Set([bar]));
+  for (const run of runs) {
+    if (!activeRuns.has(runKey(run))) continue;
+    for (let k = 0; k < run.scores.length; k++) {
+      sourceBars[run.i + k].add(run.j + k);
+      sourceBars[run.j + k].add(run.i + k);
+    }
+  }
+  for (const button of $("cqt-matches").children) {
+    button.setAttribute("aria-pressed", String(activeRuns.has(button.dataset.run)));
+  }
+  drawCqt();
+}
+
+function buildCqtMatches() {
+  const laneEnds = [];
+  const intervals = runs.flatMap(run => [
+    {run, start: run.i, target: run.j}, {run, start: run.j, target: run.i},
+  ]).sort((a, b) => a.start - b.start || b.run.scores.length - a.run.scores.length);
+  const buttons = intervals.map(({run, start, target}) => {
+    const count = run.scores.length;
+    let lane = laneEnds.findIndex(end => end <= start);
+    if (lane === -1) lane = laneEnds.length;
+    laneEnds[lane] = start + count;
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "cqt-match";
+    button.dataset.run = runKey(run);
+    button.style.left = `${100 * start / cqtBars}%`;
+    button.style.width = `${100 * count / cqtBars}%`;
+    button.style.top = `${lane * 28}px`;
+    button.textContent = `Match: ${range(target, count)}`;
+    button.title = `${range(start, count)} \u2194 ${range(target, count)}`;
+    button.setAttribute("aria-label", `Toggle ${button.title}`);
+    button.addEventListener("click", () => {
+      const key = runKey(run);
+      if (activeRuns.has(key)) activeRuns.delete(key);
+      else activeRuns.add(key);
+      select(run);
+      updateCqtSources();
+    });
+    return button;
+  });
+  const lanes = $("cqt-matches");
+  lanes.replaceChildren(...buttons);
+  lanes.style.height = `${laneEnds.length * 28}px`;
+  updateCqtSources();
+}
+
+function drawCqt() {
+  const width = cqtScroll.clientWidth, height = 312, header = 24;
+  if (!width || !sourceBars.length) return;
+  const dpr = devicePixelRatio;
+  cqtPlot.width = Math.round(width * dpr);
+  cqtPlot.height = Math.round(height * dpr);
+  cqtContext.setTransform(dpr, 0, 0, dpr, 0, 0);
+  const barWidth = width / 4, sliceWidth = barWidth / slicesPerBar;
+  const binHeight = (height - header) / cqtBins;
+  const offset = cqtScroll.scrollLeft;
+  const firstSlice = Math.floor(offset / sliceWidth);
+  const endSlice = Math.min(cqt.length, Math.ceil((offset + width) / sliceWidth));
+  const mode = cqtMode.value;
+  cqtContext.fillStyle = "#141a26";
+  cqtContext.fillRect(0, 0, width, height);
+  for (let slice = firstSlice; slice < endSlice; slice++) {
+    const bar = Math.floor(slice / slicesPerBar), within = slice % slicesPerBar;
+    const sources = [...sourceBars[bar]].filter(source => source !== bar)
+      .map(source => source * slicesPerBar + within);
+    const x = slice * sliceWidth - offset;
+    for (let bin = 0; bin < cqtBins; bin++) {
+      const original = cqt[slice][bin] / cqtPeak;
+      if (mode === "overlay") {
+        const matched = sources.reduce((peak, source) => Math.max(peak, cqt[source][bin]), 0) / cqtPeak;
+        cqtContext.fillStyle = `rgb(${12 + 235 * matched}, ${17 + 125 * original + 92 * matched}, ${28 + 215 * original})`;
+      } else {
+        const power = sources.length && mode !== "original"
+          ? combinedCqt([cqtPower[slice][bin], ...sources.map(source => cqtPower[source][bin])], mode)
+          : cqtPower[slice][bin];
+        const level = Math.log1p(power) / cqtPeak;
+        cqtContext.fillStyle = `rgb(${12 + 210 * level}, ${17 + 220 * level}, ${28 + 215 * level})`;
+      }
+      cqtContext.fillRect(Math.floor(x), header + (cqtBins - bin - 1) * binHeight,
+        Math.ceil(x + sliceWidth) - Math.floor(x), binHeight);
+    }
+  }
+  const first = Math.floor(firstSlice / slicesPerBar);
+  const last = Math.ceil(endSlice / slicesPerBar) - 1;
+  cqtContext.font = "13px system-ui";
+  for (let bar = first; bar <= last; bar++) {
+    const x = bar * barWidth - offset;
+    cqtContext.fillStyle = "#eef0f6";
+    if (x >= -1) cqtContext.fillText(`Bar ${firstBar + bar}`, Math.max(0, x) + 5, 17);
+    cqtContext.fillStyle = "#eef0f66b";
+    cqtContext.fillRect(x, header, 1, height - header);
+  }
+  cqtContext.fillStyle = "#eef0f64d";
+  for (let octave = 1; octave < 3; octave++) {
+    cqtContext.fillRect(0, header + octave * 12 * binHeight, width, 1);
+  }
+  $("cqt-range").textContent = `Visible: ${range(first, last - first + 1)}`;
+  $("cqt-caption").textContent = mode === "overlay"
+    ? "Blue = original; amber = strongest enabled match at each time/pitch bin; light = overlap."
+    : mode === "original" ? "Original bass CQT, with no matches mixed in."
+    : "Combines aligned CQT power at each bin, including the original and each enabled match once. With two contributing passages, Median equals Average.";
+}
+
+function draw() {
+  const n = matrix.length, step = size / n;
+  const x = col => left + col * step, y = row => plotTop + (n - row - 1) * step;
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  for (let row = 0; row < n; row++) {
+    for (let col = 0; col < n; col++) {
+      const score = matrix[row][col];
+      const matched = matches.has(Math.min(row, col) * n + Math.max(row, col));
+      ctx.fillStyle = row === col ? "#252c39" : matched
+        ? (score >= Number(seed.value) ? seedColor : extensionColor)
+        : `hsl(220 23% ${13 + 36 * score}%)`;
+      ctx.fillRect(Math.round(x(col)), Math.round(y(row)),
+        Math.round(x(col + 1)) - Math.round(x(col)), Math.round(y(row - 1)) - Math.round(y(row)));
+    }
+  }
+  if (selected) {
+    ctx.strokeStyle = "#fff";
+    ctx.lineWidth = 1.3;
+    selected.scores.forEach((_, k) => {
+      ctx.strokeRect(x(selected.j + k), y(selected.i + k), step, step);
+      ctx.strokeRect(x(selected.i + k), y(selected.j + k), step, step);
+    });
+  }
+  ctx.font = "13px system-ui";
+  ctx.fillStyle = "#b5bdce";
+  ctx.textAlign = "center";
+  for (let k = 0; k < n; k++) {
+    if (k === 0 || (firstBar + k) % 10 === 0) {
+      ctx.fillText(firstBar + k, x(k) + step / 2, plotTop + size + 17);
+      ctx.fillText(firstBar + k, left - 16, y(k) + step / 2 + 4);
+    }
+  }
+  ctx.fillText("Bar", left + size / 2, plotTop + size + 39);
+}
+
+function locate(event) {
+  const rect = canvas.getBoundingClientRect();
+  const x = (event.clientX - rect.left) * canvas.width / rect.width - left;
+  const y = (event.clientY - rect.top) * canvas.height / rect.height - plotTop;
+  if (x < 0 || y < 0 || x >= size || y >= size) return null;
+  const n = matrix.length;
+  const col = Math.floor(x * n / size), row = n - 1 - Math.floor(y * n / size);
+  return [Math.min(row, col), Math.max(row, col)];
+}
+
+canvas.addEventListener("pointermove", event => {
+  const pair = locate(event);
+  if (!pair) {
+    $("cell").textContent = hoverHint;
+    return;
+  }
+  const [i, j] = pair;
+  const score = matrix[i][j];
+  const matched = matches.has(i * matrix.length + j);
+  const status = i === j ? "self-match ignored" :
+    matched ? (score >= Number(seed.value) ? "starting match" : "extension only") : "not in a shown repeat";
+  $("cell").textContent = `Bars ${firstBar + i} \u2194 ${firstBar + j}: ${score.toFixed(3)} (${status})`;
+});
+canvas.addEventListener("pointerleave", () => { $("cell").textContent = hoverHint; });
+canvas.addEventListener("click", event => {
+  const pair = locate(event);
+  if (!pair) return;
+  const run = matches.get(pair[0] * matrix.length + pair[1]);
+  if (run) select(run, run.i);
+});
+cqtMode.addEventListener("change", drawCqt);
+$("cqt-prev").addEventListener("click", () => scrollCqtTo(cqtScroll.scrollLeft * 4 / cqtScroll.clientWidth - 1));
+$("cqt-next").addEventListener("click", () => scrollCqtTo(cqtScroll.scrollLeft * 4 / cqtScroll.clientWidth + 1));
+cqtScroll.addEventListener("scroll", drawCqt);
+new ResizeObserver(drawCqt).observe(cqtScroll);
+for (const control of [seed, extension, feature, nonoverlap]) control.addEventListener("input", rebuild);
+rebuild();
+</script>
+</body>
+</html>

@@ -14,6 +14,58 @@ application updates into the experiments, first commit the research changes
 Do not merge the entire experimental branch back into `main`; promote only
 reviewed application changes with their focused tests.
 
+## Stem self-similarity report
+
+Render all WAV stems against the saved project's sixteenth-note grid:
+
+```powershell
+.\experimental\.venv\Scripts\python.exe -m experimental.stem_similarity `
+  --stems "C:\Users\steve\Downloads\peanut butter\preparation\ff0e0f8850894afba735b342d6eb04df\demucs" `
+  --project "C:\Users\steve\Downloads\peanut butter\project.json"
+Start-Process ".\experimental\outputs\stem_similarity\index.html"
+```
+
+The local HTML report includes CQT and Mel spectrograms, sixteenth-note SSMs,
+1-bar SSMs, and 4-bar SSMs for every stem, plus all-stem overview images.
+Images link to full-resolution PNGs; NPZ downloads contain exact features,
+slice boundaries, RMS levels, normalized vectors, all three matrices, and
+the four-bar window start bars.
+`metadata.json` records timing, dimensions, and analysis settings.
+
+Features average short-time spectral power within each sixteenth note, apply
+`log1p(1000 * power / stem_peak_power)`, then normalize each slice for cosine
+similarity. CQT uses 96 semitones from C1, fixed tuning; Mel uses 128 bins from
+30 Hz to 11025 Hz. Both use 22050 Hz mono audio and a 256-sample hop.
+The 1-bar and 4-bar windows compare **corresponding sixteenth-note positions**,
+averaging their cosine scores. Four-bar windows advance one bar at a time
+(bars 1-4, 2-5, 3-6, and so on); the axes show the window's starting bar.
+Neither view pools a bar into one spectrum or ignores slice order.
+There is no chroma folding or time warping.
+
+The project grid supplies meter, downbeat, tempo, and optional timing anchors;
+the saved display subdivision does not override the sixteenth-note spacing.
+Pickup audio before the first nonnegative downbeat and incomplete trailing
+slices/blocks are excluded. Silence below -60 dB RMS relative to each stem's
+peak contributes zero, including silence against itself. This deliberately
+keeps silence from looking like a repeated musical phrase; partly silent block
+diagonals may be below one. All SSM panels share a fixed 0-1 color scale.
+Generated reports stay under ignored `experimental/outputs/`, not on `main`.
+
+The report links to a standalone **Bass repeat visualizer** with separate
+start-match and extension sliders (initially 0.950 and 0.850). It highlights
+contiguous diagonal runs of bar pairs at or above the extension threshold,
+provided at least one pair meets the start threshold. The main diagonal is
+ignored. Runs whose two ranges overlap are hidden by default and can be shown
+for inspection. Click a colored cell or a candidate to inspect the bar scores.
+The bass CQT viewport is four bars wide and covers C1 through B3. Click the
+match rectangles below it to enable or disable aligned passages. Overlay
+distinguishes the original from the strongest match at each bin; Average and
+Median combine the original with the enabled matches per sixteenth note and
+pitch bin in linear power before applying the fixed log display scale. With
+only one enabled counterpart the average and median are the same.
+To rebuild just the visualizer from saved matrices, run
+`.\experimental\.venv\Scripts\python.exe -m experimental.bass_repeat_viewer`.
+
 ## Interactive parameter GUI
 
 From the repository root:
