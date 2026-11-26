@@ -18,7 +18,9 @@ from audio_to_midi.vocal_words import note_key
 from audio_to_midi.notation import (
     bar_and_beat, beat_length, format_number, note_value, pitch_name, scale_pitch_classes,
 )
-from audio_to_midi.spectrogram import HIGH_PITCH, LOW_PITCH
+from audio_to_midi.spectrogram import HIGH_PITCH, LOW_PITCH, colorize
+from audio_to_midi.timebase import TimeAxis
+from audio_to_midi.view_theme import view_theme
 from core.adtof_drums import CLASS_MIDI, drum_class
 
 PITCH_RANGES = {
@@ -76,7 +78,7 @@ class Timeline(QWidget):
     zoom_requested = Signal(int)
     overview_requested = Signal(float)
 
-    KEYS = 44
+    KEYS = TimeAxis.LEFT
     OVERVIEW_TOP = 22
     AMPLITUDE_HEIGHT = 62
     LANE_TOP = OVERVIEW_TOP + AMPLITUDE_HEIGHT
@@ -93,6 +95,8 @@ class Timeline(QWidget):
         self.track: Track | None = None
         self.mode = "notes"
         self.notes: list = []
+        self.note_preview: tuple[Note, Note] | None = None
+        self.theme = view_theme("dark")
         self.word_labels: dict[tuple, str] = {}
         self.selected = None
         self.start = Fraction(0)
@@ -101,9 +105,13 @@ class Timeline(QWidget):
         self.audio_span = (0.0, 0.0)
         self.overview_cqt: QImage | None = None
         self._overview_buffer = None
+        self._overview_display_buffer = None
+        self._overview_levels: np.ndarray | None = None
         self.overview_duration = 0.0
         self.cqt: QImage | None = None
         self._cqt_buffer = None
+        self._cqt_display_buffer = None
+        self._cqt_levels: np.ndarray | None = None
         self.low, self.high = 36, 96
         self.beats: list[tuple[float, str, str]] = []
         self.selected_beat: float | None = None
@@ -129,20 +137,47 @@ class Timeline(QWidget):
         return sorted({note.start for note in self.notes})
 
     def set_cqt(self, rgb: np.ndarray | None) -> None:
-        if rgb is None or rgb.size == 0:
-            self.cqt, self._cqt_buffer = None, None
-            return
+        self._cqt_levels = None
         self._cqt_buffer = rgb
-        height, width, _ = rgb.shape
-        self.cqt = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
+        self.cqt, self._cqt_display_buffer = self._themed_image(rgb)
 
     def set_overview_cqt(self, rgb: np.ndarray | None) -> None:
-        if rgb is None or rgb.size == 0:
-            self.overview_cqt, self._overview_buffer = None, None
-            return
+        self._overview_levels = None
         self._overview_buffer = rgb
-        height, width, _ = rgb.shape
-        self.overview_cqt = QImage(rgb.data, width, height, width * 3, QImage.Format.Format_RGB888)
+        self.overview_cqt, self._overview_display_buffer = self._themed_image(rgb)
+
+    def _themed_image(self, rgb: np.ndarray | None) -> tuple[QImage | None, np.ndarray | None]:
+        display = np.ascontiguousarray(255 - rgb) if rgb is not None and self.theme.is_light else rgb
+        return self._rgb_image(display)
+
+    def _rgb_image(self, rgb: np.ndarray | None) -> tuple[QImage | None, np.ndarray | None]:
+        if rgb is None or rgb.size == 0:
+            return None, None
+        display = np.ascontiguousarray(rgb)
+        height, width, _ = display.shape
+        return QImage(display.data, width, height, width * 3, QImage.Format.Format_RGB888), display
+
+    def set_cqt_levels(self, levels: np.ndarray | None) -> None:
+        self._cqt_levels = levels
+        self._cqt_buffer = colorize(levels, self.theme.name) if levels is not None else None
+        self.cqt, self._cqt_display_buffer = self._rgb_image(self._cqt_buffer)
+
+    def set_overview_levels(self, levels: np.ndarray | None) -> None:
+        self._overview_levels = levels
+        self._overview_buffer = colorize(levels, self.theme.name) if levels is not None else None
+        self.overview_cqt, self._overview_display_buffer = self._rgb_image(self._overview_buffer)
+
+    def set_theme(self, name: str) -> None:
+        self.theme = view_theme(name)
+        if self._cqt_levels is not None:
+            self.set_cqt_levels(self._cqt_levels)
+        else:
+            self.set_cqt(self._cqt_buffer)
+        if self._overview_levels is not None:
+            self.set_overview_levels(self._overview_levels)
+        else:
+            self.set_overview_cqt(self._overview_buffer)
+        self.update()
 
     def _roll_bottom(self) -> int:
         return max(self.ROLL_TOP + 12, self.height() - self.FOOTER)
@@ -165,16 +200,18 @@ class Timeline(QWidget):
 
     def _x_seconds(self, seconds: float) -> float:
         """The x axis is linear in the original audio's time; bar lines follow the tempo map."""
-        width = max(1, self.width() - self.KEYS)
-        s0, s1 = self._span()
-        return self.KEYS + (seconds - s0) / max(1e-9, s1 - s0) * width
+        return self._axis().x_seconds(seconds)
 
     def _x(self, beat: Fraction) -> float:
-        return self._x_seconds(self.project.grid.beat_to_seconds(Fraction(beat)))
+        return self._axis().x(Fraction(beat))
 
     def _seconds(self, x: float) -> float:
-        s0, s1 = self._span()
-        return s0 + (x - self.KEYS) / max(1, self.width() - self.KEYS) * (s1 - s0)
+        return self._axis().seconds(x)
+
+    def _axis(self) -> TimeAxis:
+        if self.project is None:
+            raise ValueError("Choose a project before positioning notes.")
+        return TimeAxis(self.project.grid, self.start, self.end, self.width())
 
     def _raw_beat(self, x: float) -> Fraction:
         return self.project.grid.seconds_to_beat(self._seconds(x)).limit_denominator(1_000_000)
@@ -241,7 +278,7 @@ class Timeline(QWidget):
 
     def _paint_envelope(self, painter: QPainter, envelope: np.ndarray,
                         left: float, right: float, top: int) -> None:
-        painter.setPen(QColor("#42657c"))
+        painter.setPen(QColor(self.theme.envelope))
         middle = top + self.AMPLITUDE_HEIGHT // 2 + 6
         for i, value in enumerate(envelope):
             x = round(left + i / len(envelope) * (right - left))
@@ -250,22 +287,24 @@ class Timeline(QWidget):
     def _paint_overview(self, painter: QPainter) -> None:
         rect = QRectF(self.KEYS, self.OVERVIEW_TOP,
                       max(1, self.width() - self.KEYS), self.AMPLITUDE_HEIGHT)
-        painter.fillRect(rect, QColor("#101620"))
+        painter.fillRect(rect, QColor(self.theme.overview))
         if self.overview_cqt is not None:
             painter.drawImage(rect, self.overview_cqt)
         selection = self._overview_selection()
         if selection is not None and selection.width() > 0:
-            painter.fillRect(selection, QColor(79, 195, 217, 25))
-            painter.setPen(QPen(QColor("#4fc3d9"), 2))
+            tint = QColor(self.theme.selection)
+            tint.setAlpha(25)
+            painter.fillRect(selection, tint)
+            painter.setPen(QPen(QColor(self.theme.selection), 2))
             painter.drawRect(selection)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#171d28"))
+        painter.fillRect(self.rect(), QColor(self.theme.background))
         width, height = self.width(), self.height()
         bottom = self._roll_bottom()
         row_height = self._row_height()
-        painter.setPen(QColor("#8994a7"))
+        painter.setPen(QColor(self.theme.muted))
         if self.mode == "mix":
             hint = ("Overview: click to view section | Beat lane: click to select, right-click to pin / remove | "
                     "Right-click roll: beat and bar actions | Ctrl+wheel: zoom")
@@ -287,7 +326,8 @@ class Timeline(QWidget):
             elif self.cqt is not None:
                 low, high = max(self.low, LOW_PITCH), min(self.high, HIGH_PITCH)
                 if low <= high:
-                    source = QRectF(0, HIGH_PITCH - high, self.cqt.width(), high - low + 1)
+                    bins = self.cqt.height() / (HIGH_PITCH - LOW_PITCH + 1)
+                    source = QRectF(0, (HIGH_PITCH - high) * bins, self.cqt.width(), (high - low + 1) * bins)
                     target = QRectF(audio_left, self._y(high), audio_right - audio_left, (high - low + 1) * row_height)
                     painter.drawImage(target, self.cqt, source)
         if self.drums:
@@ -297,9 +337,9 @@ class Timeline(QWidget):
             black = pitch % 12 in _BLACK_KEYS
             painter.fillRect(QRectF(0, top, self.KEYS - 2, row_height), QColor("#2b2f38" if black else "#d9dde4"))
             if black:
-                painter.fillRect(QRectF(self.KEYS, top, width - self.KEYS, row_height), QColor(0, 0, 0, 45))
+                painter.fillRect(QRectF(self.KEYS, top, width - self.KEYS, row_height), QColor(*self.theme.row_overlay))
             if pitch % 12 == 0:
-                painter.setPen(QColor(150, 165, 195, 60))
+                painter.setPen(QColor(*self.theme.pitch_line))
                 painter.drawLine(self.KEYS, round(top + row_height), width, round(top + row_height))
                 if row_height >= 6:
                     painter.setPen(QColor("#20242c"))
@@ -310,12 +350,12 @@ class Timeline(QWidget):
         grid = self.project.grid
         for beat, x in self._grid_lines():
             if beat % grid.bar_beats == 0:
-                painter.setPen(QColor("#ffffff"))
+                painter.setPen(QColor(self.theme.bar_line))
                 painter.drawText(x + 3, height - 3, f"Bar {int(beat / grid.bar_beats) + 1}")
             elif beat % beat_length(grid) == 0:
-                painter.setPen(QColor("#b09a82"))
+                painter.setPen(QColor(self.theme.beat_grid))
             else:
-                painter.setPen(QColor("#4c607a"))
+                painter.setPen(QColor(self.theme.grid))
             painter.drawLine(x, self.LANE_TOP + 8, x, bottom)
         if self.mode == "mix":
             self._paint_beats(painter)
@@ -323,12 +363,19 @@ class Timeline(QWidget):
             for beat in self.onsets:
                 if self.start <= beat <= self.end:
                     x = round(self._x(beat))
-                    painter.setPen(QPen(QColor("#f7b554"), 2))
+                    painter.setPen(QPen(QColor(self.theme.accent), 2))
                     painter.drawLine(x, self.LANE_TOP + 4, x, self.ROLL_TOP - 2)
             self._paint_beats(painter)
             drag = self._drag
             hidden = 0
             for note in self.notes:
+                if self.note_preview is not None and self.note_preview[0] == note:
+                    preview = self.note_preview[1]
+                    if self.drums and drum_lane(preview.pitch) is None:
+                        hidden += 1
+                    else:
+                        self._paint_note(painter, preview, None, True, label_note=note)
+                    continue
                 if self.drums and drum_lane(note.pitch) is None:
                     hidden += 1
                     continue
@@ -340,7 +387,7 @@ class Timeline(QWidget):
                 end = drag["end"] if drag and drag["kind"] == "resize" and drag["note"] == note else None
                 self._paint_note(painter, note, end, note == self.selected)
             if hidden:
-                painter.setPen(QColor("#f7b554"))
+                painter.setPen(QColor(self.theme.accent))
                 painter.drawText(self.KEYS + 4, self.ROLL_TOP + 14,
                                  f"{hidden} hit(s) on kit pieces ADTOF does not model are hidden here (still exported).")
             if drag and drag["kind"] == "create":
@@ -348,7 +395,7 @@ class Timeline(QWidget):
         if self.playhead is not None:
             x = round(self._x_seconds(self.playhead))
             if self.KEYS <= x <= width:
-                color = QColor("#4ade80")
+                color = QColor(self.theme.cursor)
                 painter.setPen(QPen(color, 2))
                 painter.drawLine(x, self.LANE_TOP, x, bottom)
                 painter.setBrush(color)
@@ -377,7 +424,7 @@ class Timeline(QWidget):
             y = top + lane * height
             painter.fillRect(QRectF(0, y, self.KEYS - 2, height), QColor("#d9dde4" if lane % 2 else "#c4c9d2"))
             if lane % 2:
-                painter.fillRect(QRectF(self.KEYS, y, width - self.KEYS, height), QColor(0, 0, 0, 45))
+                painter.fillRect(QRectF(self.KEYS, y, width - self.KEYS, height), QColor(*self.theme.row_overlay))
             painter.setPen(QColor(150, 165, 195, 90))
             painter.drawLine(0, round(y), width, round(y))
             painter.setPen(QColor("#20242c"))
@@ -390,6 +437,9 @@ class Timeline(QWidget):
             if not left <= x <= right:
                 continue
             color = QColor(BEAT_COLORS.get(kind, "#7d8796"))
+            if self.theme.is_light:
+                color = QColor({"uncounted": self.theme.muted, "counted": self.theme.selection,
+                                "downbeat": self.theme.accent, "pin": "#9d6b00"}.get(kind, self.theme.muted))
             strong = kind in ("downbeat", "pin")
             painter.setPen(QPen(color, 3 if strong else 2))
             painter.drawLine(round(x), self.LANE_TOP + 6, round(x), self.ROLL_TOP - 2)
@@ -404,7 +454,7 @@ class Timeline(QWidget):
                 painter.setPen(color)
                 painter.drawText(round(x) + 4, self.ROLL_TOP - 6, label)
             if self.selected_beat is not None and abs(seconds - self.selected_beat) < 1e-6:
-                painter.setPen(QPen(QColor("#ffffff"), 1, Qt.PenStyle.DashLine))
+                painter.setPen(QPen(QColor(self.theme.selected_edge), 1, Qt.PenStyle.DashLine))
                 painter.drawRect(QRectF(x - 6, self.LANE_TOP + 2, 12, self.ROLL_TOP - self.LANE_TOP - 4))
         painter.setBrush(QColor("#ff4d4d"))
         painter.setPen(Qt.PenStyle.NoPen)
@@ -419,7 +469,7 @@ class Timeline(QWidget):
     def _paint_note(self, painter: QPainter, note, end, selected: bool, *, label_note=None) -> None:
         rect = self._note_rect(note, end)
         outside = not self._visible(note)
-        color = QColor("#84dba7" if note.source != "generated" else "#6b9fe8")
+        color = QColor(self.theme.authored if note.source != "generated" else self.theme.generated)
         scale = scale_pitch_classes(self.project.key) if not self.drums else None
         if scale is not None and note.pitch % 12 not in scale:
             gray = color.lightness()
@@ -428,7 +478,7 @@ class Timeline(QWidget):
             color.setAlpha(110)
             rect.setHeight(3)
         painter.fillRect(rect, color)
-        painter.setPen(QPen(QColor("#ffffff" if selected else "#0d1118"), 2 if selected else 1))
+        painter.setPen(QPen(QColor(self.theme.selected_edge if selected else self.theme.note_edge), 2 if selected else 1))
         painter.drawRect(rect)
         if not outside and rect.width() > 10:
             painter.fillRect(QRectF(rect.right() - 3, rect.top() + 1, 2, rect.height() - 2), QColor(255, 255, 255, 120))
@@ -442,7 +492,7 @@ class Timeline(QWidget):
             font = painter.font()
             font.setPixelSize(max(6, min(12, int(rect.height()) - 2)))
             painter.setFont(font)
-            painter.setPen(QColor("#101820"))
+            painter.setPen(QColor(self.theme.lyric))
             painter.drawText(rect, Qt.AlignmentFlag.AlignCenter | Qt.TextFlag.TextSingleLine, text)
             painter.restore()
 

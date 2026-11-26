@@ -1,0 +1,8 @@
+{
+  "schema_version": 3,
+  "stops": [0, 0.35, 0.65, 0.85, 1],
+  "colors": ["#f6f8f8", "#80a1ce", "#1d32a7", "#090762", "#060024"],
+  "sharpness": 0,
+  "bins_per_semitone": 3,
+  "interpolation": "hsl"
+}

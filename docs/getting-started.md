@@ -574,6 +574,92 @@ with the application.
 There are no editing modes: left-click adds or selects; right-click opens
 a context menu with note information and timing controls.
 
+### Time-aligned standard notation
+
+Track views show an editable staff below the CQT. Drag the divider to resize
+or collapse it. Piano uses a grand staff; drums use the exported percussion
+positions and noteheads, including kit pieces hidden in the five-lane roll.
+Scroll over the staff to see lower staves; Ctrl+wheel changes the shared
+visible bar window.
+
+The staff and CQT share an audio-linear horizontal axis, including counted
+tempo changes. A notehead is centered directly under its original CQT note
+attack, even when that attack is off the export grid. Tied continuations
+appear at their score boundaries. **Export rhythm** controls the notation
+quantization and is also the default in **File > Export score (MusicXML)**.
+Changing that export selection updates the staff as well.
+
+Note values, rests, ties, beams, clefs, octave conventions, drum mappings,
+chord symbols and lyrics come from the same full-score generator as MusicXML
+export. Displaying a window does not regenerate its rhythm in isolation.
+The active track shows its part of the full score; chord symbols appear on
+the top pitched part, as in the full-score export. A differently scoped export
+can place chord symbols on a different part.
+When a sustained duration fits a single dotted note within a measure, both
+the staff and export prefer that dot over equivalent tied fragments, including
+offbeat attacks. Ties remain where necessary, especially across bar lines.
+This does not create dotted notes just to absorb silence.
+
+Export cleanup can extend a short release or snap an onset without changing
+project notes. Consequently, the displayed note value can differ from the
+CQT rectangle's exact length; hover a notehead to see its source timing and
+exported fragment value. Conventional notation programs use engraved spacing,
+so MuseScore will show the same musical notation, not this audio-linear layout.
+At wide zooms symbols may overlap rather than shifting noteheads away from
+their true attack positions; zoom in to inspect them.
+
+Click a notehead to select and audition its source note. A click alone does
+not confirm an AI detection. Drag a notehead left/right to move its start on
+the editor grid, or up/down to change pitch by staff lines/spaces, following
+the key signature. Hold Shift while dragging vertically to move chromatically,
+one semitone per staff step. Bass/guitar written octaves are converted back
+to sounding MIDI pitches; piano uses the destination clef and conventional
+treble/bass split. Drum heads move between exported kit positions; horizontal
+drags retain the original GM hit, including open hi-hats.
+
+Both views preview the move without changing project notes. Releasing applies
+one undoable correction and refreshes the CQT, notation and export source.
+Moving a tied continuation moves the entire source note, not just that
+fragment. Duration, velocity and lyric are retained; release is clipped at
+the audio end or next same-pitch attack, as in CQT editing. Pure vertical
+drags retain an unsnapped original onset. Esc cancels a drag. Changing tracks
+or navigating cancels it too; a score update during dragging reports that
+the drag was cancelled rather than editing a stale note.
+
+Right-click a notehead for the existing note menu, including **Info...** to
+edit duration and other properties, plus delete/join/split and vocal lyric
+actions. **Delete** and Undo/Redo work through the shared editor. Clicking
+blank staff space seeks the shared playback cursor. CQT edits update notation
+and staff edits update the CQT; there is no separate editable score.
+
+Use **View > CQT / notation theme > Dark / Light** to change both displays.
+Each submenu contains four palettes: Dark has **Classic**, **Blue to indigo**,
+**Mint to teal**, and **Amber to crimson**; Light has **Saved gradient** plus
+the same three hue paths. The saved light gradient runs through cream,
+yellow-green, green, blue and black. The HSL light palettes increase saturation
+and darken with energy; their dark counterparts increase saturation and brighten.
+Staff ink, note colors, grid lines, selection and playback indicators match the
+chosen light or dark appearance. The choice is remembered between launches.
+
+Every display theme uses three CQT bins per half step (36 per octave) by default.
+Theme switching recolors the cached spectrum without recomputing it. Model and
+chord-analysis CQT inputs retain their existing resolution.
+There is no extra sharpness/suppression filter. Theme changes do not rerun
+transcription, modify project notes, or change MIDI/MusicXML exports.
+
+Music glyphs are bundled locally from
+[Steinberg's Bravura](https://github.com/steinbergmedia/bravura), revision
+`37b194378b710cc40e406ab6c4b07608bb9548ae`, under the
+[SIL Open Font License](../audio_to_midi/assets/OFL.txt). Rendering needs no
+browser, extra dependency, network connection or installed music font.
+Notation text uses bundled
+[Adobe Source Sans 3](https://github.com/adobe-fonts/source-sans), revision
+`87b37a2daaed80fcb8e8ccb0085c4d72ddade12e`, also under the
+[SIL Open Font License](../audio_to_midi/assets/SourceSans3-OFL.txt), so lyrics
+and labels remain readable on systems without available desktop fonts.
+
+### CQT note editing
+
 | Action | Result |
 |---|---|
 | Click an empty cell | Add a note using the **New note** dropdown length |

@@ -4,6 +4,7 @@ import bisect
 from dataclasses import dataclass
 from fractions import Fraction
 import math
+from typing import ClassVar
 
 
 def finite_number(value: object, name: str, *, positive: bool = False) -> None:
@@ -116,3 +117,27 @@ class Grid:
     def snap_end(self, beat: Fraction) -> Fraction:
         """Snap a note release to half-grid intervals, using the same tie rule."""
         return self.snap(beat * 2) / 2
+
+
+@dataclass(frozen=True)
+class TimeAxis:
+    """Shared audio-linear horizontal geometry for the CQT and notation."""
+
+    LEFT: ClassVar[int] = 112
+    grid: Grid
+    start: Fraction
+    end: Fraction
+    width: int
+
+    def x_seconds(self, seconds: float) -> float:
+        first = self.grid.beat_to_seconds(self.start)
+        last = self.grid.beat_to_seconds(self.end)
+        return self.LEFT + (seconds - first) / max(1e-9, last - first) * max(1, self.width - self.LEFT)
+
+    def x(self, beat: Fraction) -> float:
+        return self.x_seconds(self.grid.beat_to_seconds(beat))
+
+    def seconds(self, x: float) -> float:
+        first = self.grid.beat_to_seconds(self.start)
+        last = self.grid.beat_to_seconds(self.end)
+        return first + (x - self.LEFT) / max(1, self.width - self.LEFT) * (last - first)

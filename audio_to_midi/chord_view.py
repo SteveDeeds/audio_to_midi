@@ -13,6 +13,7 @@ from audio_to_midi import chords as chord_logic
 from audio_to_midi.domain import ChordSegment
 from audio_to_midi.notation import spelling
 from audio_to_midi.spectrogram import LOW_PITCH
+from audio_to_midi.timebase import TimeAxis
 
 
 
@@ -23,7 +24,7 @@ class ChordView(QWidget):
     selected_changed = Signal(object)
     cursor_requested = Signal(float)
 
-    LABELS = 44
+    LABELS = TimeAxis.LEFT
     HEADER = 18
     AMPLITUDE = 56
     LANE = 34
@@ -68,18 +69,20 @@ class ChordView(QWidget):
 
     def _seconds_x(self, seconds: float) -> float:
         """The x axis is linear in the original audio's time, like the timeline."""
-        grid = self.project.grid
-        s0, s1 = grid.beat_to_seconds(self.start), grid.beat_to_seconds(self.end)
-        return self.LABELS + (seconds - s0) / max(1e-9, s1 - s0) * max(1, self.width() - self.LABELS)
+        return self._axis().x_seconds(seconds)
 
     def _x(self, beat) -> float:
-        return self._seconds_x(self.project.grid.beat_to_seconds(Fraction(beat)))
+        return self._axis().x(Fraction(beat))
 
     def _beat(self, x: float) -> Fraction:
         grid = self.project.grid
-        s0, s1 = grid.beat_to_seconds(self.start), grid.beat_to_seconds(self.end)
-        seconds = s0 + (x - self.LABELS) / max(1, self.width() - self.LABELS) * (s1 - s0)
+        seconds = self._axis().seconds(x)
         return grid.seconds_to_beat(seconds).limit_denominator(1_000_000)
+
+    def _axis(self) -> TimeAxis:
+        if self.project is None:
+            raise ValueError("Choose a project before positioning chords.")
+        return TimeAxis(self.project.grid, self.start, self.end, self.width())
 
     def _snap(self, x: float) -> Fraction:
         unit = Fraction(4, self.project.grid.denominator)

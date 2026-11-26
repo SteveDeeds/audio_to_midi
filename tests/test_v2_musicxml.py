@@ -245,6 +245,44 @@ class MusicXMLTests(unittest.TestCase):
                 root = ET.fromstring(archive.read("score.musicxml"))
         self.assertEqual([e.text for e in root.findall(".//lyric/text")], ["Second voice"])
 
+    def test_dotted_values_replace_equivalent_ties_without_moving_attacks(self):
+        for start, length, expected_type in (
+            (F(0), F(3, 2), "quarter"),
+            (F(1, 2), F(3, 4), "eighth"),
+            (F(1, 4), F(3, 2), "quarter"),
+            (F(1, 2), F(3), "half"),
+        ):
+            with self.subTest(start=start, length=length):
+                end = start + length
+                project = self.vocal_project([(start, end, 60), (end, end + F(1, 4), 62)])
+                before = deepcopy(project)
+                root = ET.fromstring(score_xml(project))
+                notes = root.findall(".//note[pitch]")
+                divisions = int(root.findtext(".//divisions"))
+                self.assertEqual(len(notes), 2)
+                self.assertEqual(notes[0].findtext("type"), expected_type)
+                self.assertEqual(len(notes[0].findall("dot")), 1)
+                self.assertEqual(F(int(notes[0].findtext("duration")), divisions), length)
+                self.assertFalse(root.findall(".//tie"))
+                cursor, attacks = F(0), []
+                for note in root.findall("part/measure/note"):
+                    if note.find("pitch") is not None:
+                        attacks.append(cursor)
+                    cursor += F(int(note.findtext("duration")), divisions)
+                self.assertEqual(attacks, [start, end])
+                self.assertEqual(project, before)
+
+    def test_dotted_note_preference_keeps_required_barline_ties(self):
+        project = self.vocal_project([(F(7, 2), F(5), 60), (F(5), F(6), 62)])
+        root = ET.fromstring(score_xml(project))
+        first = root.find("part/measure/note[pitch]")
+        continuation = root.findall("part/measure")[1].find("note[pitch]")
+        self.assertEqual(first.findtext("type"), "eighth")
+        self.assertIsNotNone(first.find("tie[@type='start']"))
+        self.assertEqual(continuation.findtext("type"), "quarter")
+        self.assertIsNotNone(continuation.find("tie[@type='stop']"))
+        self.assertFalse(root.findall(".//note/dot"))
+
     def test_half_grid_releases_do_not_turn_straight_onsets_into_triplets(self):
         project = self.vocal_project([
             (F(2), F(19, 8), 60),

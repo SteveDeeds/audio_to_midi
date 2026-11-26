@@ -3,7 +3,9 @@ from unittest.mock import patch
 
 import numpy as np
 
-from audio_to_midi.spectrogram import HIGH_PITCH, LOW_PITCH, colorize, cqt_image, song_overview
+from audio_to_midi.spectrogram import (
+    HIGH_PITCH, LOW_PITCH, colorize, cqt_image, song_overview, song_overview_levels,
+)
 
 
 class SpectrogramTests(unittest.TestCase):
@@ -67,6 +69,46 @@ class SpectrogramTests(unittest.TestCase):
         self.assertGreater(int(rgb[77, 0].sum()), 600)
         self.assertGreater(int(rgb[17, -1].sum()), 600)
         self.assertLess(int(rgb[77, -1].sum()), 100)
+
+    def test_three_bin_overview_and_empty_windows_keep_full_pitch_resolution(self):
+        self.assertEqual(cqt_image(np.zeros(0), 22050, bins_per_semitone=3).shape, (264, 0))
+        magnitude = np.zeros((264, 1603), dtype=np.float32)
+        magnitude[100, 1] = 2
+        magnitude[200, -1] = 2
+        with patch("audio_to_midi.spectrogram._song_magnitude", return_value=(magnitude, 60)) as load:
+            peak, levels, duration = song_overview_levels("song.wav", bins_per_semitone=3)
+        load.assert_called_once_with("song.wav", 3)
+        self.assertEqual((peak, duration), (2, 60))
+        self.assertEqual(levels.shape, (264, 800))
+        self.assertEqual(float(levels[100, 0]), 1)
+        self.assertEqual(float(levels[200, -1]), 1)
+
+    def test_light_palette_darkens_with_energy_and_dark_palette_remains_unchanged(self):
+        levels = np.linspace(0, 1, 301)[None, :]
+        rgb = colorize(levels, "light")[0]
+        self.assertGreater(int(rgb[0].sum()), int(rgb[-1].sum()))
+        self.assertEqual(tuple(rgb[0]), (243, 239, 229))
+        self.assertEqual(tuple(rgb[-1]), (0, 0, 0))
+        dark = colorize(np.array([[0, 1]], dtype=np.float32))[0]
+        np.testing.assert_array_equal(dark, [[12, 16, 26], [252, 240, 160]])
+
+    def test_hsl_theme_counterparts_have_opposite_brightness_and_match_light_presets(self):
+        import colorsys
+        from pathlib import Path
+        from experimental.gradient_lab import GradientSettings, gradient_rgb
+
+        levels = np.linspace(0, 1, 201, dtype=np.float32)[None, :]
+        for name in ("blue", "mint", "amber"):
+            light = colorize(levels, f"light-{name}")[0]
+            dark = colorize(levels, f"dark-{name}")[0]
+            for rgb, direction in ((light, -1), (dark, 1)):
+                hls = np.array([colorsys.rgb_to_hls(*(c / 255)) for c in rgb])
+                self.assertTrue(np.all(np.diff(hls[:, 1]) * direction >= -.004))
+                self.assertGreater(hls[-1, 2], .95)
+                self.assertLess(hls[0, 2], .3)
+            filename = {"blue": "blue-indigo.json", "mint": "mint-teal.json", "amber": "amber-crimson.json"}[name]
+            preset = GradientSettings.load(Path(__file__).resolve().parents[1] / "experimental" / "gradients" / filename)
+            np.testing.assert_array_equal(light, gradient_rgb(levels, preset)[0])
 
 
 if __name__ == "__main__":

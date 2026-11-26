@@ -25,10 +25,33 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 from audio_to_midi.chords import MUSICXML_KINDS, parse
+from audio_to_midi.domain import Note
 from audio_to_midi.notation import key_fifths, spelling
 from audio_to_midi.vocal_words import note_key, note_words
 
 Q = Fraction
+
+
+@dataclass(frozen=True)
+class ScoreSource:
+    track_id: str
+    note: Note
+
+
+@dataclass
+class ScoreDocument:
+    root: ET.Element
+    sources: dict[str, ScoreSource]
+    part_tracks: dict[str, str]
+
+    def xml(self) -> str:
+        ET.indent(self.root, space="  ")
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
+            '"http://www.musicxml.org/dtds/partwise.dtd">\n'
+            + ET.tostring(self.root, encoding="unicode") + "\n"
+        )
 
 
 @dataclass(frozen=True)
@@ -297,10 +320,15 @@ def _cut_rests(spans: list[_Span], cuts) -> list[_Span]:
 
 
 def _values(p: Fraction, end: Fraction, bar_start: Fraction, meter: _Meter, triplets: set, rest: bool):
-    """Notatable pieces for [p, end) inside one bar: whole beats where possible, else within the beat."""
+    """Prefer one dotted note inside the bar; otherwise expose beat boundaries."""
     unit = meter.unit
     out = []
     while p < end:
+        if not rest and math.floor(p / unit) not in triplets:
+            for length, name, dots, _ in _DUPLE:
+                if dots and length == end - p:
+                    out.append((p, length, name, dots, False))
+                    return out
         beat_start = bar_start + math.floor((p - bar_start) / unit) * unit
         if p == beat_start and end - p >= unit:
             for length, name, dots, _ in _DUPLE:
@@ -542,7 +570,8 @@ def _attributes(measure: ET.Element, part: _Part, divisions: int, fifths: int, g
         _sub(transpose, "octave-change", -part.instrument.octave)
 
 
-def _notes(measure, piece: _Piece, part: _Part, voice: _Voice, divisions: int, names) -> None:
+def _notes(measure, piece: _Piece, part: _Part, voice: _Voice, divisions: int, names,
+           sources: list[ScoreSource], source_map: dict[str, ScoreSource]) -> None:
     duration = int(piece.length * divisions)
     staves = len(part.clefs) > 1
 
@@ -587,6 +616,9 @@ def _notes(measure, piece: _Piece, part: _Part, voice: _Voice, divisions: int, n
     for index, pitch in enumerate(sorted(piece.keys)):
         first = index == 0
         note = _sub(measure, "note")
+        identifier = f"{part.id}-N{len(source_map) + 1}"
+        note.set("id", identifier)
+        source_map[identifier] = sources[piece.keys[pitch]]
         if not first:
             _sub(note, "chord")
         if part.role == "drums":
@@ -643,11 +675,11 @@ def _notes(measure, piece: _Piece, part: _Part, voice: _Voice, divisions: int, n
             _sub(lyric, "text", text)
 
 
-def score_xml(
+def score_document(
     project, tracks=None, include_chords: bool = True, *,
     quantization: Fraction = Q(1, 4),
-) -> str:
-    """MusicXML 4.0 partwise score for the given tracks (default: all with notes)."""
+) -> ScoreDocument:
+    """Build the export score and retain source links for every pitched/drum fragment."""
     grid, meter = project.grid, _meter(project.grid, quantization)
     chosen = [t for t in (project.tracks if tracks is None else tracks) if t.role in INSTRUMENTS]
     chosen.sort(key=lambda t: ROLE_ORDER.index(t.role))
@@ -724,7 +756,11 @@ def score_xml(
             _sub(midi, "midi-program", part.instrument.program)
 
     names, fifths = spelling(project.key), key_fifths(project.key)
-    for part in parts:
+    source_map: dict[str, ScoreSource] = {}
+    part_tracks = {}
+    for part, (track, original) in zip(parts, sources):
+        part_tracks[part.id] = track.id
+        note_sources = [ScoreSource(track.id, note) for note in original]
         element = _sub(root, "part", id=part.id)
         for bar in range(bars):
             measure = _sub(element, "measure", number=bar + 1)
@@ -743,18 +779,20 @@ def score_xml(
                     if part is host and i == 0:
                         for offset, symbol in harmonies.get((bar, index), ()):
                             _harmony(measure, symbol, names, int(offset * divisions))
-                    _notes(measure, piece, part, voice, divisions, names)
+                    _notes(measure, piece, part, voice, divisions, names, note_sources, source_map)
                 written = True
             if bar == bars - 1:
                 barline = _sub(measure, "barline", location="right")
                 _sub(barline, "bar-style", "light-heavy")
-    ET.indent(root, space="  ")
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?>\n'
-        '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 4.0 Partwise//EN" '
-        '"http://www.musicxml.org/dtds/partwise.dtd">\n'
-        + ET.tostring(root, encoding="unicode") + "\n"
-    )
+    return ScoreDocument(root, source_map, part_tracks)
+
+
+def score_xml(
+    project, tracks=None, include_chords: bool = True, *,
+    quantization: Fraction = Q(1, 4),
+) -> str:
+    """MusicXML 4.0 partwise score for the given tracks (default: all with notes)."""
+    return score_document(project, tracks, include_chords, quantization=quantization).xml()
 
 
 _CONTAINER = (

@@ -21,7 +21,7 @@ from PySide6.QtCore import QEvent, QSettings, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QActionGroup, QCursor, QKeyEvent, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
-    QPushButton, QSizePolicy, QSlider, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
+    QPushButton, QSizePolicy, QSlider, QSplitter, QStackedWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from audio_to_midi import beats as beat_logic
@@ -45,13 +45,17 @@ from audio_to_midi.preview import (
     PLAYBACK_SPEEDS, SCRUB_WINDOW_SECONDS, SYNC_TEST_PITCH, balance_gains, click_track, midi_outputs,
     midi_volume, mix, render_notes, scrub_audio, stretch_audio,
 )
-from audio_to_midi.spectrogram import HOP_LENGTH, SAMPLE_RATE, colorize, cqt_image, song_overview
+from audio_to_midi.spectrogram import (
+    DISPLAY_BINS_PER_SEMITONE, HOP_LENGTH, SAMPLE_RATE, cqt_image, song_overview_levels,
+)
 from audio_to_midi.storage import import_media, load_project, save_project
+from audio_to_midi.staff import StaffView
 from audio_to_midi.timebase import Grid, beat_bpm
 from audio_to_midi.timeline import PITCH_RANGES, Timeline
 from audio_to_midi.timing import BeatSession
 from audio_to_midi.vocal_settings import CONTROLS as VOCAL_CONTROLS, MODEL_DESCRIPTIONS, VOCAL_MODELS, VocalParameters
 from audio_to_midi.vocal_words import note_key, note_words
+from audio_to_midi.view_theme import THEMES, view_theme
 
 MIX, CHORDS = "__mix__", "__chords__"
 GRIDS = (
@@ -166,7 +170,7 @@ class ProjectWindow(QMainWindow):
         self._rows = []
         self._building = False
         self._cqt_cache: dict[tuple, tuple] = {}
-        self._references: dict[tuple, float] = {}  # (path, mtime) -> whole-song CQT peak
+        self._references: dict[tuple, float] = {}  # (path, mtime, bins per semitone) -> CQT peak
         self._overviews: dict[tuple, tuple[np.ndarray, float]] = {}
         self._reference_jobs: set[tuple] = set()
         self.reference_ready.connect(self._reference_ready)
@@ -178,10 +182,12 @@ class ProjectWindow(QMainWindow):
         self.session: BeatSession | None = None
         self.taps: list[float] = []
         self.bars = 2
+        self.score_quantization = Fraction(1, 4)
         self._clock: tuple[float, float, float, float] | None = None  # (monotonic start, from, until, speed)
         self.actions: dict[str, QAction] = {}
         self.tool_buttons: dict[str, QToolButton] = {}
         self._build()
+        self._set_display_theme(str(self.settings.value("view/theme", "dark")))
         self._set_play_cursor(0.0)
         self._sync_tracks()
         self._saved_project = deepcopy(self.project)
@@ -270,6 +276,20 @@ class ProjectWindow(QMainWindow):
         self._act(view, "scrub_left", "Scrub left one CQT bin", lambda: self._scrub(-1), "[").setAutoRepeat(False)
         self._act(view, "scrub_right", "Scrub right one CQT bin", lambda: self._scrub(1), "]").setAutoRepeat(False)
         self._act(view, "metronome", "&Metronome click", lambda checked: None, checkable=True)
+        view.addSeparator()
+        themes = view.addMenu("CQT / notation theme")
+        self.theme_group = QActionGroup(self)
+        for light, label in ((False, "Dark"), (True, "Light")):
+            submenu = themes.addMenu(label)
+            for theme in THEMES.values():
+                if theme.is_light != light:
+                    continue
+                action = self._act(
+                    submenu, f"theme_{theme.name}", theme.label,
+                    lambda checked, n=theme.name: self._set_display_theme(n) if checked else None,
+                    checkable=True,
+                )
+                self.theme_group.addAction(action)
 
         model = bar.addMenu("&Model")
         self._act(model, "analyze", "Analyze &visible bars", lambda: self._analyze(False))
@@ -507,9 +527,46 @@ class ProjectWindow(QMainWindow):
         self.pages = QStackedWidget()
         self.pages.addWidget(self.timeline)
         self.pages.addWidget(self.chord_view)
-        root.addWidget(self.pages, 1)
+        self.staff_panel = QWidget()
+        staff_layout = QVBoxLayout(self.staff_panel)
+        staff_layout.setContentsMargins(0, 0, 0, 0)
+        staff_layout.setSpacing(0)
+        staff_toolbar = QHBoxLayout()
+        staff_toolbar.addWidget(QLabel("Notation (drag noteheads)"))
+        staff_toolbar.addStretch()
+        staff_toolbar.addWidget(QLabel("Export rhythm"))
+        self.score_grid_choice = QComboBox()
+        for label, step in QUANTIZATIONS:
+            self.score_grid_choice.addItem(label, step)
+        self.score_grid_choice.setCurrentIndex(self.score_grid_choice.findText(
+            next(label for label, step in QUANTIZATIONS if step == self.score_quantization)))
+        self.score_grid_choice.setToolTip(
+            "Shared with MusicXML export. Noteheads stay aligned to the original CQT attacks; "
+            "note values, ties and rests come from the export score.")
+        self.score_grid_choice.currentIndexChanged.connect(lambda: self._guard(self._score_grid_changed))
+        staff_toolbar.addWidget(self.score_grid_choice)
+        staff_layout.addLayout(staff_toolbar)
+        self.staff = StaffView()
+        self.staff.note_selected.connect(self._select_note)
+        self.staff.note_clicked.connect(lambda note: self._audition(note.start, note.pitch))
+        self.staff.note_moved.connect(
+            lambda note, start, pitch: self._guard(lambda: self._move_note(note, start, pitch)))
+        self.staff.note_previewed.connect(self._preview_staff_note)
+        self.staff.info_context_requested.connect(
+            lambda seconds, note, at: self._guard(lambda: self._info_menu(seconds, note, at)))
+        self.staff.cursor_requested.connect(lambda seconds: self._guard(lambda: self._seek_cursor(seconds)))
+        self.staff.zoom_requested.connect(lambda steps: self._guard(lambda: self._zoom(-steps)))
+        staff_layout.addWidget(self.staff, 1)
+        self.track_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.track_splitter.addWidget(self.pages)
+        self.track_splitter.addWidget(self.staff_panel)
+        self.track_splitter.setCollapsible(0, False)
+        self.track_splitter.setStretchFactor(0, 3)
+        self.track_splitter.setStretchFactor(1, 2)
+        root.addWidget(self.track_splitter, 1)
 
         self.status = StatusLabel()
+        self.staff.edit_cancelled.connect(self.status.setText)
         self.statusBar().addWidget(self.status, 1)
         self.cancel_button = QPushButton("Cancel")
         self.cancel_button.clicked.connect(self._cancel)
@@ -545,7 +602,7 @@ class ProjectWindow(QMainWindow):
         self.scrub_repeat.setSingleShot(True)
         self.scrub_repeat.setInterval(round(SCRUB_WINDOW_SECONDS * 1000 * .75))
         self.scrub_repeat.timeout.connect(lambda: self._guard(self._repeat_scrub))
-        for widget in (self, self.timeline, self.chord_view):
+        for widget in (self, self.timeline, self.chord_view, self.staff):
             widget.installEventFilter(self)
 
     def eventFilter(self, watched, event) -> bool:
@@ -576,6 +633,17 @@ class ProjectWindow(QMainWindow):
             # Qt callback boundary: include backend/device exceptions in the UI.
             self.status.setText(f"Error: {exc}")
             QMessageBox.warning(self, "Audio to MIDI", str(exc))
+
+    def _set_display_theme(self, name: str) -> None:
+        theme = view_theme(name)
+        self.timeline.set_theme(theme.name)
+        self.staff.set_theme(theme.name)
+        self.actions[f"theme_{theme.name}"].setChecked(True)
+        self.settings.setValue("view/theme", theme.name)
+
+    def _preview_staff_note(self, notes: tuple[Note, Note] | None) -> None:
+        self.timeline.note_preview = notes
+        self.timeline.update()
 
     # -- refresh ----------------------------------------------------------
     def _refresh(self) -> None:
@@ -608,6 +676,11 @@ class ProjectWindow(QMainWindow):
         self.timeline.beats = self._lane_beats() if show_beats else []
         self.timeline.taps = list(self.taps) if show_beats else []
         self.timeline.update()
+        self.staff_panel.setVisible(track is not None)
+        self.staff.start, self.staff.end = self.timeline.start, self.timeline.end
+        self.staff.selected = self.timeline.selected
+        self._sync_score_grid()
+        self.staff.set_project(self.project, track, self.score_quantization)
         self.chord_view.start, self.chord_view.end = self.timeline.start, self.timeline.end
         self.chord_view.update()
         first = bar_and_beat(grid, self.timeline.start)[0]
@@ -796,6 +869,9 @@ class ProjectWindow(QMainWindow):
             return self.project.mix_path
         return None
 
+    def _cqt_identity(self, path: str) -> tuple:
+        return path, Path(path).stat().st_mtime_ns, DISPLAY_BINS_PER_SEMITONE
+
     def _load_envelope(self) -> None:
         self.timeline.envelope = np.zeros(0)
         self.timeline.audio_span = (0.0, 0.0)
@@ -806,11 +882,11 @@ class ProjectWindow(QMainWindow):
         if not path or not Path(path).exists():
             return
         grid = self.project.grid
-        ident = (path, Path(path).stat().st_mtime_ns)
+        ident = self._cqt_identity(path)
         overview = self._overviews.get(ident)
         if overview is not None:
-            rgb, self.timeline.overview_duration = overview
-            self.timeline.set_overview_cqt(rgb)
+            levels, self.timeline.overview_duration = overview
+            self.timeline.set_overview_levels(levels)
         reference = self._references.get(ident)
         if reference is None:
             self._request_reference(ident)
@@ -824,7 +900,7 @@ class ProjectWindow(QMainWindow):
                 audio.seek(min(start, len(audio)))
                 segment = audio.read(max(0, end - start), dtype="float32", always_2d=True)
             envelope = np.zeros(0)
-            rgb = None
+            levels = None
             if len(segment):
                 stride = max(1, len(segment) // 800)
                 envelope = np.array([
@@ -832,13 +908,13 @@ class ProjectWindow(QMainWindow):
                 ])
                 # Until the whole-song level is known, show no spectrum rather than a self-normalized one.
                 if reference is not None:
-                    rgb = colorize(cqt_image(segment, rate, reference))
+                    levels = cqt_image(segment, rate, reference, bins_per_semitone=ident[2])
             if len(self._cqt_cache) >= 24:
                 self._cqt_cache.pop(next(iter(self._cqt_cache)))
-            self._cqt_cache[key] = envelope, (start / rate, (start + len(segment)) / rate), rgb
-        envelope, span, rgb = self._cqt_cache[key]
+            self._cqt_cache[key] = envelope, (start / rate, (start + len(segment)) / rate), levels
+        envelope, span, levels = self._cqt_cache[key]
         self.timeline.envelope, self.timeline.audio_span = envelope, span
-        self.timeline.set_cqt(rgb)
+        self.timeline.set_cqt_levels(levels)
 
     def _request_reference(self, ident: tuple) -> None:
         """Load the whole-song overview and CQT peak once, off the UI thread."""
@@ -847,8 +923,8 @@ class ProjectWindow(QMainWindow):
         self._reference_jobs.add(ident)
         def work():
             try:
-                value, rgb, duration = song_overview(ident[0])
-                self.overview_ready.emit(ident, rgb, duration)
+                value, levels, duration = song_overview_levels(ident[0], bins_per_semitone=ident[2])
+                self.overview_ready.emit(ident, levels, duration)
             except Exception as error:
                 try:
                     self.reference_failed.emit(ident, f"{type(error).__name__}: {error}")
@@ -866,11 +942,11 @@ class ProjectWindow(QMainWindow):
         self._reference_jobs.discard(ident)
         self.status.setText(f"CQT overview / spectrogram reference failed for {ident[0]}: {message}")
 
-    def _overview_ready(self, ident: tuple, rgb: np.ndarray, duration: float) -> None:
-        self._overviews[ident] = rgb, duration
+    def _overview_ready(self, ident: tuple, levels: np.ndarray, duration: float) -> None:
+        self._overviews[ident] = levels, duration
         path = self._audio_path()
-        if path and Path(path).exists() and (path, Path(path).stat().st_mtime_ns) == ident:
-            self.timeline.set_overview_cqt(rgb)
+        if path and Path(path).exists() and self._cqt_identity(path) == ident:
+            self.timeline.set_overview_levels(levels)
             self.timeline.overview_duration = duration
             self.timeline.update()
 
@@ -878,7 +954,7 @@ class ProjectWindow(QMainWindow):
         self._reference_jobs.discard(ident)
         self._references[ident] = value
         path = self._audio_path()
-        if path and Path(path).exists() and (path, Path(path).stat().st_mtime_ns) == ident:
+        if path and Path(path).exists() and self._cqt_identity(path) == ident:
             self._load_envelope()
             self.timeline.update()
 
@@ -1573,6 +1649,8 @@ class ProjectWindow(QMainWindow):
     def _select_note(self, note) -> None:
         self.timeline.selected = note
         self.timeline.update()
+        self.staff.selected = note
+        self.staff.update()
 
     def _confirm_note(self, note: Note) -> None:
         track = self._require_transcribable()
@@ -2076,10 +2154,14 @@ class ProjectWindow(QMainWindow):
         quarter_beats = grid.denominator <= 4
         choices = [label for label, _ in QUANTIZATIONS if quarter_beats or "triplet" not in label]
         quantization, accepted = QInputDialog.getItem(
-            self, "Export score", "Quantization", choices, choices.index("1/16"), editable=False,
+            self, "Export score", "Quantization", choices,
+            choices.index(dict((step, label) for label, step in QUANTIZATIONS)[self.score_quantization]),
+            editable=False,
         )
         if not accepted:
             return
+        self.score_quantization = dict(QUANTIZATIONS)[quantization]
+        self._refresh()
         path, _ = QFileDialog.getSaveFileName(
             self, "Export score", f"{self.project.name}.musicxml",
             "MusicXML (*.musicxml *.xml);;Compressed MusicXML (*.mxl)",
@@ -2090,6 +2172,29 @@ class ProjectWindow(QMainWindow):
                 quantization=dict(QUANTIZATIONS)[quantization],
             )
             self.status.setText(f"{'PARTIAL' if partial else 'Complete'} score exported: {path}")
+
+    def _sync_score_grid(self) -> None:
+        quarter_beats = self.project.grid.denominator <= 4
+        choices = [(label, step) for label, step in QUANTIZATIONS if quarter_beats or "triplet" not in label]
+        if self.score_quantization not in {step for _, step in choices}:
+            self.score_quantization = Fraction(1, 4)
+        self.score_grid_choice.blockSignals(True)
+        if [self.score_grid_choice.itemText(i) for i in range(self.score_grid_choice.count())] != [
+            label for label, _ in choices
+        ]:
+            self.score_grid_choice.clear()
+            for label, step in choices:
+                self.score_grid_choice.addItem(label, step)
+        self.score_grid_choice.setCurrentIndex(self.score_grid_choice.findText(
+            next(label for label, step in choices if step == self.score_quantization)))
+        self.score_grid_choice.blockSignals(False)
+
+    def _score_grid_changed(self) -> None:
+        value = self.score_grid_choice.currentData()
+        if not isinstance(value, Fraction):
+            raise ValueError("Choose a valid notation quantization.")
+        self.score_quantization = value
+        self._refresh()
 
     def _profile(self) -> None:
         if not self.active:
@@ -2672,7 +2777,7 @@ class ProjectWindow(QMainWindow):
 
     def _set_play_cursor(self, seconds: float, *, follow: bool = False) -> None:
         self.play_cursor = max(0.0, seconds)
-        self.timeline.playhead = self.chord_view.playhead = self.play_cursor
+        self.timeline.playhead = self.chord_view.playhead = self.staff.playhead = self.play_cursor
         beat = self.project.grid.seconds_to_beat(self.play_cursor)
         if follow and not self.timeline.start <= beat < self.timeline.end:
             self._cancel(analysis_only=True)
@@ -2682,6 +2787,7 @@ class ProjectWindow(QMainWindow):
             self._queue_visible()
         self.timeline.update()
         self.chord_view.update()
+        self.staff.update()
 
     def _seek_cursor(self, seconds: float) -> None:
         if self.tapping:

@@ -1,6 +1,60 @@
-# Vocal audio-to-MIDI experiment
+# Experimental tools
 
-## Interactive parameter GUI
+## Light-theme gradient and sharpness lab
+
+Run from the repository root with the app's environment (no additional dependencies):
+
+```powershell
+.\.venv\Scripts\python.exe -m experimental.gradient_lab "C:\Users\steve\Music\2026-11-15 Glowing Glass Project\Flux Dark"
+```
+
+The default is the **guitar part, bar 48**. The tool loads the project read-only,
+uses its exact tempo/offset/anchor mapping, and computes the whole-song CQT
+brightness reference just like the app. Initial analysis can take a little time.
+Use `--bar 49` or `--role bass` to inspect another bar or part.
+
+- Compare the main app's light theme (your saved gradient, three CQT bins per half
+  step, no extra suppression) on the left with your experiment on the right.
+- Choose **Blue to indigo**, **Mint to teal**, or **Amber to crimson** in the
+  gradient selector. Each follows a continuous hue path, increasing saturation
+  and decreasing lightness. Their near-black endpoints stay saturated rather
+  than ending at neutral black. **HSL interpolation** preserves this trajectory
+  between stops; RGB interpolation remains available for existing/custom presets.
+  Loadable presets are in [gradients](gradients/).
+- Click any of the five color buttons to edit a gradient color. Move the three
+  interior stop positions (0-1) to control where colors transition; endpoints stay
+  at 0 and 1. Positions use 0.001 increments. The strip runs from weakest to
+  strongest CQT energy.
+- **Vertical sharpness** (0-3) compares each CQT bin with the bins exactly one
+  half step above and below it. Strong pitches become stronger and suppress their
+  weaker half-step neighbors. It never mixes time columns or sharpens attacks
+  horizontally. The slider uses 0.01 increments; zero is off. Larger amounts can
+  exaggerate noise or harmonics; this is not pitch detection or an audio filter.
+- Toggle **3 CQT bins per half step** to switch the right preview between 12 and
+  36 bins per octave. These are separately computed CQT transforms, not interpolated
+  pixels. The fine bins are centered at each pitch and one-third of a half step
+  above/below it, keeping the same piano-key/note alignment. Each resolution uses
+  its own whole-song peak reference. Both sides start at 3 bins; the right can
+  switch to 1 bin for comparison.
+- Uncheck **Show note boxes** to inspect the spectral shapes without overlays.
+- **Save/Load preset** persists colors, positions, sharpness, resolution and
+  interpolation as JSON. Older presets retain their saved settings and RGB
+  interpolation; schema-1 presets use 1 bin per half step.
+  `--preset "gradient.json"` restores a saved preset at launch.
+- **Export comparison PNG** saves both previews and the current control values.
+  **Reset to current light theme** exactly restores the app's current inverted
+  saved gradient with suppression off and 3 bins per half step.
+
+Changes stay in this standalone experiment. It never saves the source project,
+edits notes, or changes the production theme from its controls. The saved gradient
+has been adopted in the main app's light theme. All three alternatives are also
+available under **View > CQT / notation theme > Light**, with matching palettes
+under **Dark**. Every main-app display theme uses three bins per half step.
+Close the window to stop the tool.
+
+## Vocal audio-to-MIDI experiment
+
+### Interactive parameter GUI
 
 From the repository root:
 

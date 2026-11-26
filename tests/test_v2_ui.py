@@ -229,6 +229,7 @@ class EditorTests(unittest.TestCase):
     def test_score_export_quantization_default_selection_and_cancel(self):
         from audio_to_midi.musicxml import QUANTIZATIONS
 
+        expected_default = "1/16"
         for label in ("1/16", "1/32", None):
             with self.subTest(label=label), \
                     patch.object(self.window, "_export_scope",
@@ -240,7 +241,7 @@ class EditorTests(unittest.TestCase):
                     patch("audio_to_midi.ui.export_musicxml") as export:
                 self.window._export_score()
                 args = choose.call_args.args
-                self.assertEqual(args[3][args[4]], "1/16")
+                self.assertEqual(args[3][args[4]], expected_default)
                 if label is None:
                     save.assert_not_called()
                     export.assert_not_called()
@@ -249,6 +250,172 @@ class EditorTests(unittest.TestCase):
                         self.window.project, self.root / "score.musicxml", [self.track],
                         include_chords=True, quantization=dict(QUANTIZATIONS)[label],
                     )
+                    expected_default = label
+                    self.assertEqual(self.window.score_grid_choice.currentText(), label)
+
+    def test_staff_tracks_source_edits_undo_playback_and_shared_export_rhythm(self):
+        window = self.window
+        window._add_note(F(1, 4), 40, F(1, 2))
+        self.assertFalse(window.staff_panel.isHidden())
+        self.assertEqual((window.staff.start, window.staff.end), (window.timeline.start, window.timeline.end))
+        fragment = next(n for n in window.staff.score.notes if not n.rest)
+        self.assertEqual(fragment.source.note, window.timeline.selected)
+        window._set_play_cursor(.3)
+        self.assertEqual(window.staff.playhead, window.timeline.playhead)
+        window.score_grid_choice.setCurrentIndex(window.score_grid_choice.findText("1/32"))
+        self.assertEqual(window.score_quantization, F(1, 8))
+        old = window.timeline.selected
+        window._move_note(old, F(1, 2), 42)
+        fragment = next(n for n in window.staff.score.notes if not n.rest)
+        self.assertEqual((fragment.attack, fragment.source.note.pitch), (F(1, 2), 42))
+        window._undo()
+        fragment = next(n for n in window.staff.score.notes if not n.rest)
+        self.assertEqual((fragment.attack, fragment.source.note.pitch), (F(1, 4), 40))
+        window._set_window(F(1))
+        window._refresh()
+        self.assertEqual((window.staff.start, window.staff.end), (window.timeline.start, window.timeline.end))
+        window.tracks.setCurrentIndex(window.tracks.findData("__mix__"))
+        self.assertTrue(window.staff_panel.isHidden())
+
+    def test_staff_and_cqt_have_identical_pixel_positions_after_splitter_resize(self):
+        window = self.window
+        window._add_note(F(1, 4), 40, F(1, 2))
+        window.show()
+        self.app.processEvents()
+        for sizes in ([350, 180], [240, 290]):
+            window.track_splitter.setSizes(sizes)
+            self.app.processEvents()
+            self.assertEqual(window.staff.width(), window.timeline.width())
+            fragment = next(n for n in window.staff.score.notes if not n.rest)
+            self.assertAlmostEqual(window.staff.note_rect(fragment).center().x(), window.timeline._x(F(1, 4)))
+
+    def test_staff_triplet_quantization_resets_when_meter_cannot_export_it(self):
+        window = self.window
+        window.score_grid_choice.setCurrentIndex(window.score_grid_choice.findText("1/8 triplet"))
+        self.assertEqual(window.score_quantization, F(1, 3))
+        window.project.grid = window.project.grid.__class__(numerator=6, denominator=8)
+        window._refresh()
+        self.assertEqual(window.score_quantization, F(1, 4))
+        self.assertFalse(any("triplet" in window.score_grid_choice.itemText(i)
+                             for i in range(window.score_grid_choice.count())))
+
+    def test_staff_drag_updates_cqt_and_export_source_with_one_undoable_correction(self):
+        from PySide6.QtCore import QPointF
+
+        window = self.window
+        old = Note("ai", F(1), F(2), 40, 83, lyric="word")
+        self.track.notes.generated = [old]
+        window._refresh()
+        window.show()
+        window.activateWindow()
+        self.app.processEvents()
+        fragment = next(n for n in window.staff.score.notes if not n.rest)
+        at = window.staff.note_rect(fragment).center()
+        target = QPointF(window.timeline._x(F(3, 2)), at.y() - window.staff.SPACE / 2)
+        event = lambda p: SimpleNamespace(position=lambda: p, button=lambda: Qt.MouseButton.LeftButton,
+                                          modifiers=lambda: Qt.KeyboardModifier.NoModifier)
+        before = deepcopy(window.project)
+        window.staff.mousePressEvent(event(at))
+        window.staff.mouseMoveEvent(event(target))
+        self.assertEqual(window.project, before)
+        self.assertEqual(window.timeline.notes, [old])
+        self.assertEqual((window.timeline.note_preview[1].start, window.timeline.note_preview[1].pitch), (F(3, 2), 41))
+        window.staff.mouseReleaseEvent(event(target))
+        self.assertIsNone(window.timeline.note_preview)
+        moved = self.track.notes.resolved()[0]
+        self.assertEqual((moved.start, moved.end, moved.pitch, moved.velocity, moved.lyric, moved.source),
+                         (F(3, 2), F(5, 2), 41, 83, "word", "authored"))
+        self.assertEqual(window.timeline.notes, [moved])
+        self.assertEqual(len(window._history[self.track.id]), 1)
+        self.assertEqual(next(n for n in window.staff.score.notes if not n.rest).source.note, moved)
+        window._undo()
+        self.assertEqual(window.timeline.notes, [old])
+        window._redo()
+        self.assertEqual(window.timeline.notes, [moved])
+
+    def test_escape_cancels_staff_drag_and_cqt_preview_without_cancelling_analysis(self):
+        from PySide6.QtCore import QPointF
+        from PySide6.QtTest import QTest
+
+        window = self.window
+        window._add_note(F(1), 40, F(2))
+        window._stop()
+        window.show()
+        window.activateWindow()
+        self.app.processEvents()
+        fragment = next(n for n in window.staff.score.notes if not n.rest)
+        at = window.staff.note_rect(fragment).center()
+        event = lambda p: SimpleNamespace(position=lambda: p, button=lambda: Qt.MouseButton.LeftButton,
+                                          modifiers=lambda: Qt.KeyboardModifier.NoModifier)
+        before = deepcopy(window.project)
+        window.staff.mousePressEvent(event(at))
+        window.staff.mouseMoveEvent(event(QPointF(at.x() + 40, at.y())))
+        self.assertIsNotNone(window.timeline.note_preview)
+        with patch.object(window, "_cancel") as cancel:
+            QTest.keyClick(window.staff, Qt.Key.Key_Escape)
+            cancel.assert_not_called()
+        self.assertIsNone(window.staff._drag)
+        self.assertIsNone(window.timeline.note_preview)
+        self.assertEqual(window.project, before)
+
+    def test_display_theme_menu_is_exclusive_saved_and_does_not_rebuild_audio_or_score(self):
+        window = self.window
+        self.track.notes.author(F(1), F(2), 40)
+        window._refresh()
+        before, document = deepcopy(window.project), window.staff.document
+        with patch.object(window, "_load_envelope") as reload_audio:
+            window.actions["theme_light-blue"].trigger()
+            reload_audio.assert_not_called()
+        self.assertEqual((window.timeline.theme.name, window.staff.theme.name), ("light-blue", "light-blue"))
+        self.assertTrue(window.actions["theme_light-blue"].isChecked())
+        self.assertFalse(window.actions["theme_dark"].isChecked())
+        self.assertIs(window.staff.document, document)
+        self.assertEqual(window.project, before)
+        window.settings.sync()
+        restored = ProjectWindow()
+        self.addCleanup(restored.deleteLater)
+        self.addCleanup(restored.close)
+        self.assertEqual((restored.timeline.theme.name, restored.staff.theme.name), ("light-blue", "light-blue"))
+        window.actions["theme_dark"].trigger()
+        self.assertEqual((window.timeline.theme.name, window.staff.theme.name), ("dark", "dark"))
+
+    def test_all_eight_themes_use_three_bins_and_recolor_one_cache_without_transcription(self):
+        from audio_to_midi.spectrogram import colorize
+        from audio_to_midi.view_theme import THEMES
+
+        window = self.window
+        self.wait_cqt()
+        ident = window._cqt_identity(str(self.wav))
+        self.assertEqual(window.timeline.cqt.height(), 264)
+        self.assertEqual(window.timeline.overview_cqt.height(), 264)
+        self.assertEqual(sum(t.is_light for t in THEMES.values()), 4)
+        self.assertEqual(sum(not t.is_light for t in THEMES.values()), 4)
+        self.assertEqual(len(window.theme_group.actions()), 8)
+        levels = np.linspace(0, 1, 264 * 40).reshape(264, 40)
+        window.timeline.set_cqt_levels(levels)
+        window.timeline.set_overview_levels(levels)
+        before, document = deepcopy(window.project), window.staff.document
+        with patch.object(window, "_run") as transcribe, patch.object(window, "_request_reference") as reference:
+            for name, theme in THEMES.items():
+                with self.subTest(theme=name):
+                    window.actions[f"theme_{name}"].trigger()
+                    self.assertEqual(window._cqt_identity(str(self.wav)), ident)
+                    self.assertIs(window.timeline._cqt_levels, levels)
+                    np.testing.assert_array_equal(window.timeline._cqt_display_buffer, colorize(levels, name))
+                    np.testing.assert_array_equal(window.timeline._overview_display_buffer, colorize(levels, name))
+                    self.assertEqual(window.staff.theme.name, name)
+                    self.assertEqual(window.staff.theme.is_light, theme.is_light)
+                    self.assertEqual(sum(a.isChecked() for a in window.theme_group.actions()), 1)
+            stale = (*ident[:2], 1)
+            window._overview_ready(stale, np.ones((88, 20)), 2)
+            self.assertIs(window.timeline._overview_levels, levels)
+            with patch.object(window, "_load_envelope") as reload_audio:
+                window._reference_ready(stale, 0)
+                reload_audio.assert_not_called()
+            reference.assert_not_called()
+            transcribe.assert_not_called()
+        self.assertIs(window.staff.document, document)
+        self.assertEqual(window.project, before)
 
     def wait_yourmt3(self):
         timeout = time.monotonic() + 10
@@ -631,10 +798,10 @@ class EditorTests(unittest.TestCase):
         self.assertFalse(drums.training)
 
     def test_reference_failure_is_visible_and_does_not_cache_a_success(self):
-        ident = (str(self.wav), self.wav.stat().st_mtime_ns)
+        ident = self.window._cqt_identity(str(self.wav))
         self.window._references.clear()
         self.window._reference_jobs.clear()
-        with patch("audio_to_midi.ui.song_overview", side_effect=ValueError("invalid audio")), \
+        with patch("audio_to_midi.ui.song_overview_levels", side_effect=ValueError("invalid audio")), \
                 patch("audio_to_midi.ui.threading.Thread") as thread:
             thread.side_effect = lambda **kwargs: SimpleNamespace(start=kwargs["target"])
             self.window._request_reference(ident)
@@ -644,19 +811,19 @@ class EditorTests(unittest.TestCase):
 
     def test_overview_cached_across_navigation_and_ignores_late_other_source(self):
         window, timeline = self.window, self.window.timeline
-        ident = (str(self.wav), self.wav.stat().st_mtime_ns)
-        rgb = np.full((88, 800, 3), 80, dtype=np.uint8)
-        window._overview_ready(ident, rgb, 2)
-        self.assertIs(timeline._overview_buffer, rgb)
+        ident = window._cqt_identity(str(self.wav))
+        levels = np.full((88, 800), .4, dtype=np.float32)
+        window._overview_ready(ident, levels, 2)
+        self.assertIs(timeline._overview_levels, levels)
         self.assertEqual(timeline.overview_duration, 2)
         window._references[ident] = 1
         with patch.object(window, "_queue_visible"), patch.object(window, "_request_reference") as request:
             window._navigate(1)
-            self.assertIs(timeline._overview_buffer, rgb)
+            self.assertIs(timeline._overview_levels, levels)
             self.assertEqual(timeline.overview_duration, 2)
             request.assert_not_called()
-        window._overview_ready(("other.wav", 1), np.ones((88, 3, 3), dtype=np.uint8), 3)
-        self.assertIs(timeline._overview_buffer, rgb)
+        window._overview_ready(("other.wav", 1, 1), np.ones((88, 3), dtype=np.float32), 3)
+        self.assertIs(timeline._overview_levels, levels)
         window.tracks.clear()
         window._load_envelope()
         self.assertIsNone(timeline.overview_cqt)
@@ -664,8 +831,8 @@ class EditorTests(unittest.TestCase):
 
     def test_overview_click_shows_clicked_section_at_current_zoom_without_seeking(self):
         window, timeline = self.window, self.window.timeline
-        ident = (str(self.wav), self.wav.stat().st_mtime_ns)
-        window._overview_ready(ident, np.ones((88, 800, 3), dtype=np.uint8), 40)
+        ident = window._cqt_identity(str(self.wav))
+        window._overview_ready(ident, np.ones((88, 800), dtype=np.float32), 40)
         window._references[ident] = 1
         with patch.object(window, "_queue_visible") as queue:
             for fraction in (0, .5, 1):
@@ -2055,7 +2222,7 @@ class EditorTests(unittest.TestCase):
         self.app.processEvents()
         self.assertEqual((timeline.low, timeline.high), (28, 67))
         self.wait_cqt()
-        self.assertEqual(timeline.cqt.height(), 88)
+        self.assertEqual(timeline.cqt.height(), 264)
 
         def point(beat, pitch):
             return QPoint(round(timeline._x(F(beat))), round(timeline._y(pitch) + timeline._row_height() / 2))

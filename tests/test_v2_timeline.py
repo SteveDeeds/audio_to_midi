@@ -57,6 +57,60 @@ class TimelineGridTests(unittest.TestCase):
         self.assertEqual(image.pixelColor(x - 4, bottom + 7).name(), "#4ade80")
         self.assertNotEqual(image.pixelColor(x - 4, bottom + 1).name(), "#4ade80")
 
+    def test_light_theme_recolors_cqt_and_overview_without_modifying_source_images_or_positions(self):
+        timeline = self.timeline
+        rgb = np.full((88, 40, 3), [12, 16, 26], dtype=np.uint8)
+        original = rgb.copy()
+        timeline.set_cqt(rgb)
+        timeline.set_overview_cqt(rgb)
+        timeline.audio_span = (0, 4)
+        x = timeline._x(F(7, 10))
+        timeline.set_theme("light")
+        self.assertEqual(timeline.cqt.pixelColor(0, 0).getRgb()[:3], (243, 239, 229))
+        self.assertEqual(timeline.overview_cqt.pixelColor(0, 0), timeline.cqt.pixelColor(0, 0))
+        image = timeline.grab().toImage()
+        self.assertEqual(image.pixelColor(5, 20).name(), "#ffffff")
+        self.assertEqual(image.pixelColor(round(x), round(timeline._y(60) + timeline._row_height() / 2)).getRgb()[:3],
+                         (243, 239, 229))
+        self.assertEqual(timeline._x(F(7, 10)), x)
+        np.testing.assert_array_equal(rgb, original)
+        timeline.set_theme("dark")
+        self.assertEqual(timeline.cqt.pixelColor(0, 0).getRgb()[:3], (12, 16, 26))
+        np.testing.assert_array_equal(rgb, original)
+
+    def test_intensity_images_use_light_gradient_and_recolor_without_altering_bins(self):
+        from audio_to_midi.spectrogram import colorize
+
+        timeline = self.timeline
+        levels = np.linspace(0, 1, 264 * 40).reshape(264, 40)
+        original = levels.copy()
+        timeline.set_cqt_levels(levels)
+        timeline.set_overview_levels(levels)
+        timeline.set_theme("light")
+        np.testing.assert_array_equal(timeline._cqt_display_buffer, colorize(levels, "light"))
+        np.testing.assert_array_equal(timeline._overview_display_buffer, colorize(levels, "light"))
+        self.assertEqual(timeline.cqt.height(), 264)
+        timeline.set_theme("dark")
+        np.testing.assert_array_equal(timeline._cqt_display_buffer, colorize(levels))
+        np.testing.assert_array_equal(levels, original)
+
+    def test_external_staff_preview_draws_moved_cqt_note_without_changing_notes(self):
+        timeline = self.timeline
+        for role, original, target in (("bass", 60, 62), ("drums", 123, 38)):
+            with self.subTest(role=role):
+                timeline.track.role = role
+                old = Note("source", F(1), F(2), original)
+                preview = replace(old, start=F(3, 2), end=F(5, 2), pitch=target)
+                timeline.notes = [old]
+                timeline.note_preview = (old, preview)
+                painted = []
+                def paint(_painter, *args, **kwargs):
+                    painted.append((args, kwargs))
+                with patch.object(timeline, "_paint_note", new=paint):
+                    timeline.grab()
+                self.assertEqual(painted, [((preview, None, True), {"label_note": old})])
+                self.assertEqual(timeline.notes, [old])
+
     def test_overview_shows_whole_cqt_and_time_mapped_viewport_in_all_modes(self):
         timeline = self.timeline
         timeline.project.grid = Grid(offset_seconds=2)
